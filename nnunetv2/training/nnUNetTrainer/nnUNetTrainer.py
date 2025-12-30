@@ -66,6 +66,7 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
+import json
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -1381,3 +1382,164 @@ class nnUNetTrainer(object):
             self.on_epoch_end()
 
         self.on_train_end()
+
+def main():
+
+    print("Using customized nnUNetTrainer")
+    # Path to your plans file
+    plan_config_path = "/home/qying/monailabel_mas/plans/kits23_plan.json"
+    
+    # Load the plans
+    with open(plan_config_path, 'r') as f:
+        plans = json.load(f)
+    
+    # Create a minimal dataset_json for KiTS23
+    # This is required for label_manager initialization
+    dataset_json = {
+        "labels": {
+            "background": 0,
+            "kidney": 1,
+            "tumor": 2,
+            "cyst": 3
+        },
+        "numTraining": 489,
+        "file_ending": ".nii.gz"
+    }
+    
+    # Configuration to use (options: "2d", "3d_lowres", "3d_fullres", "3d_cascade_fullres")
+    configuration = "3d_fullres"
+    
+    # Select device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create PlansManager to access configuration
+    plans_manager = PlansManager(plans)
+    config_manager = plans_manager.get_configuration(configuration)
+    label_manager = plans_manager.get_label_manager(dataset_json)
+    
+    # Get configuration details
+    patch_size = config_manager.patch_size
+    print(f"\nConfiguration: {configuration}")
+    print(f"Patch size: {patch_size}")
+    print(f"Batch size: {config_manager.batch_size}")
+    print(f"Network class: {config_manager.network_arch_class_name}")
+    
+    # Set up input/output channels
+    num_input_channels = 1  # CT has 1 channel
+    num_output_channels = label_manager.num_segmentation_heads
+    print(f"\nNum input channels: {num_input_channels}")
+    print(f"Num output channels (segmentation heads): {num_output_channels}")
+    
+    # Build the network architecture using get_network_from_plans
+    print("\nBuilding network...")
+    network = get_network_from_plans(
+        arch_class_name=config_manager.network_arch_class_name,
+        arch_kwargs=config_manager.network_arch_init_kwargs,
+        arch_kwargs_req_import=config_manager.network_arch_init_kwargs_req_import,
+        input_channels=num_input_channels,
+        output_channels=num_output_channels,
+        allow_init=True,
+        deep_supervision=False  # Disable for simple inference
+    ).to(device)
+    
+    print(f"Network architecture built successfully!")
+    print(f"Network type: {type(network).__name__}")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in network.parameters())
+    trainable_params = sum(p.numel() for p in network.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Create dummy input tensor
+    # Shape: (batch_size, channels, *patch_size)
+    batch_size = 1
+    dummy_input = torch.randn(batch_size, num_input_channels, *patch_size, device=device)
+    print(f"\nDummy input shape: {dummy_input.shape}")
+    
+    # Run dummy inference
+    network.eval()
+    with torch.no_grad():
+        print("Running dummy inference...")
+        output = network(dummy_input)
+        
+        if isinstance(output, (list, tuple)):
+            # Deep supervision enabled - multiple outputs
+            print(f"Output is a list/tuple with {len(output)} elements (deep supervision)")
+            for i, o in enumerate(output):
+                print(f"  Output[{i}] shape: {o.shape}")
+        else:
+            print(f"Output shape: {output.shape}")
+    
+    print("\n✓ Dummy inference test completed successfully!")
+    
+    # Show network architecture summary
+    print("\n" + "="*60)
+    print("Network Architecture Summary:")
+    print("="*60)
+    arch_kwargs = config_manager.network_arch_init_kwargs
+    print(f"Encoder stages: {arch_kwargs.get('n_stages', 'N/A')}")
+    print(f"Features per stage: {arch_kwargs.get('features_per_stage', 'N/A')}")
+    print(f"Strides: {arch_kwargs.get('strides', 'N/A')}")
+    print(f"Kernel sizes: {arch_kwargs.get('kernel_sizes', 'N/A')}")
+    print(f"Conv per stage (encoder): {arch_kwargs.get('n_conv_per_stage', 'N/A')}")
+    print(f"Conv per stage (decoder): {arch_kwargs.get('n_conv_per_stage_decoder', 'N/A')}")
+    
+    # Return the network for further use
+    return network, config_manager, label_manager
+
+
+def test_with_deep_supervision():
+    """Test with deep supervision enabled (for training)"""
+    plan_config_path = "/home/qying/monailabel_mas/plans/kits23_plan.json"
+    
+    with open(plan_config_path, 'r') as f:
+        plans = json.load(f)
+    
+    dataset_json = {
+        "labels": {"background": 0, "kidney": 1, "tumor": 2, "cyst": 3}
+    }
+    
+    configuration = "3d_fullres"
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    plans_manager = PlansManager(plans)
+    config_manager = plans_manager.get_configuration(configuration)
+    label_manager = plans_manager.get_label_manager(dataset_json)
+    
+    # Build with deep supervision enabled
+    network = get_network_from_plans(
+        arch_class_name=config_manager.network_arch_class_name,
+        arch_kwargs=config_manager.network_arch_init_kwargs,
+        arch_kwargs_req_import=config_manager.network_arch_init_kwargs_req_import,
+        input_channels=1,
+        output_channels=label_manager.num_segmentation_heads,
+        allow_init=True,
+        deep_supervision=True  # Enable for training
+    ).to(device)
+    
+    print("\n" + "="*60)
+    print("Testing with Deep Supervision ENABLED:")
+    print("="*60)
+    
+    patch_size = config_manager.patch_size
+    dummy_input = torch.randn(1, 1, *patch_size, device=device)
+    
+    network.eval()
+    with torch.no_grad():
+        outputs = network(dummy_input)
+        print(f"Number of outputs: {len(outputs)}")
+        for i, o in enumerate(outputs):
+            print(f"  Output[{i}] shape: {o.shape}")
+    
+    return network
+
+
+if __name__ == "__main__":
+    # Run main test
+    network, config_manager, label_manager = main()
+    
+    # Optionally test with deep supervision
+    print("\n")
+    network_ds = test_with_deep_supervision()

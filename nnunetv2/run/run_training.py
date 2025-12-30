@@ -134,18 +134,21 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     cleanup_ddp()
 
 
-def run_training(dataset_name_or_id: Union[str, int],
-                 configuration: str, fold: Union[int, str],
-                 trainer_class_name: str = 'nnUNetTrainer',
-                 plans_identifier: str = 'nnUNetPlans',
-                 pretrained_weights: Optional[str] = None,
-                 num_gpus: int = 1,
-                 export_validation_probabilities: bool = False,
-                 continue_training: bool = False,
-                 only_run_validation: bool = False,
-                 disable_checkpointing: bool = False,
-                 val_with_best: bool = False,
-                 device: torch.device = torch.device('cuda')):
+def run_training(
+    dataset_name_or_id: Union[str, int],             # args.dataset_name_or_id
+    configuration: str,                              # args.configuration
+    fold: Union[int, str],                           # args.fold
+    trainer_class_name: str = 'nnUNetTrainer',       # args.tr
+    plans_identifier: str = 'nnUNetPlans',           # args.p
+    pretrained_weights: Optional[str] = None,        # args.pretrained_weights
+    num_gpus: int = 1,                              # args.num_gpus
+    export_validation_probabilities: bool = False,   # args.npz
+    continue_training: bool = False,                 # args.c
+    only_run_validation: bool = False,              # args.val
+    disable_checkpointing: bool = False,             # args.disable_checkpointing
+    val_with_best: bool = False,                    # args.val_best
+    device: torch.device = torch.device('cuda')      # args.device
+):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
               "INFO: You are using the old nnU-Net default plans. We have updated our recommendations. "
