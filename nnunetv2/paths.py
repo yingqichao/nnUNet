@@ -28,19 +28,19 @@ if nnUNet_raw is None:
           "are already present on your system. nnU-Net cannot be used for experiment planning and preprocessing like "
           "this. If this is not intended, please read documentation/setting_up_paths.md for information on how to set "
           "this up properly.")
-    print(f"Using default paths: nnUNet_raw = {nnUNet_raw}")
     nnUNet_raw = "/raid/datasets/nnUNet_raw"
+    print(f"Using default paths: nnUNet_raw = {nnUNet_raw}")
 
 if nnUNet_preprocessed is None:
     print("nnUNet_preprocessed is not defined and nnU-Net can not be used for preprocessing "
           "or training. If this is not intended, please read documentation/setting_up_paths.md for information on how "
           "to set this up.")
-    print(f"Using default paths: nnUNet_preprocessed = {nnUNet_preprocessed}")
     nnUNet_preprocessed = "/raid/datasets/nnUNet_preprocessed"
+    print(f"Using default paths: nnUNet_preprocessed = {nnUNet_preprocessed}")
 
 if nnUNet_results is None:
     print("nnUNet_results is not defined and nnU-Net cannot be used for training or "
           "inference. If this is not intended behavior, please read documentation/setting_up_paths.md for information "
           "on how to set this up.")
-    print(f"Using default paths: nnUNet_results = {nnUNet_results}")
     nnUNet_results = "/raid/datasets/nnUNet_results"
+    print(f"Using default paths: nnUNet_results = {nnUNet_results}")

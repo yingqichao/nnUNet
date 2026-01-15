@@ -70,7 +70,8 @@ import json
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
-                 device: torch.device = torch.device('cuda')):
+                 device: torch.device = torch.device('cuda'), 
+                 checkpoint_signature: str = None):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
         # apex predator of grug is complexity
@@ -187,6 +188,7 @@ class nnUNetTrainer(object):
         ### checkpoint saving stuff
         self.save_every = 50
         self.disable_checkpointing = False
+        self.checkpoint_signature = checkpoint_signature
 
         self.was_initialized = False
 
@@ -939,12 +941,13 @@ class nnUNetTrainer(object):
         # dirty hack because on_epoch_end increments the epoch counter and this is executed afterwards.
         # This will lead to the wrong current epoch to be stored
         self.current_epoch -= 1
-        self.save_checkpoint(join(self.output_folder, "checkpoint_final.pth"))
+        self.save_checkpoint(join(self.output_folder, self.get_checkpoint_filename("checkpoint_final")))
         self.current_epoch += 1
 
         # now we can delete latest
-        if self.local_rank == 0 and isfile(join(self.output_folder, "checkpoint_latest.pth")):
-            os.remove(join(self.output_folder, "checkpoint_latest.pth"))
+        latest_checkpoint = join(self.output_folder, self.get_checkpoint_filename("checkpoint_latest"))
+        if self.local_rank == 0 and isfile(latest_checkpoint):
+            os.remove(latest_checkpoint)
 
         # shut down dataloaders
         old_stdout = sys.stdout
@@ -1134,18 +1137,67 @@ class nnUNetTrainer(object):
         # handling periodic checkpointing
         current_epoch = self.current_epoch
         if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
+            self.save_checkpoint(join(self.output_folder, self.get_checkpoint_filename('checkpoint_latest')))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
-            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+        current_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+        if self._best_ema is None or current_ema > self._best_ema:
+            # Use the new method that checks existing checkpoint before overwriting
+            if self.save_best_checkpoint_if_improved(current_ema):
+                self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
 
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
 
         self.current_epoch += 1
+
+    def get_checkpoint_filename(self, base_name: str) -> str:
+        """
+        Generate checkpoint filename with plan name and optional signature.
+        
+        Args:
+            base_name: Base checkpoint name (e.g., 'checkpoint_best', 'checkpoint_latest', 'checkpoint_final')
+        
+        Returns:
+            Full filename like 'checkpoint_best_nnUNetPlans_mysignature.pth' or 'checkpoint_best_nnUNetPlans.pth'
+        """
+        plans_name = self.plans_manager.plans_name
+        if self.checkpoint_signature:
+            return f"{base_name}_{plans_name}_{self.checkpoint_signature}.pth"
+        else:
+            return f"{base_name}_{plans_name}.pth"
+
+    def save_best_checkpoint_if_improved(self, current_ema: float) -> bool:
+        """
+        Save best checkpoint only if current EMA is better than existing checkpoint's EMA.
+        
+        Args:
+            current_ema: Current EMA pseudo Dice score
+        
+        Returns:
+            True if checkpoint was saved, False otherwise
+        """
+        best_checkpoint_path = join(self.output_folder, self.get_checkpoint_filename('checkpoint_best'))
+        
+        # Check if existing checkpoint has better EMA
+        if isfile(best_checkpoint_path):
+            try:
+                existing_checkpoint = torch.load(best_checkpoint_path, map_location='cpu', weights_only=False)
+                existing_ema = existing_checkpoint.get('_best_ema', None)
+                if existing_ema is not None and existing_ema >= current_ema:
+                    self.print_to_log_file(f"Existing checkpoint has EMA {np.round(existing_ema, decimals=4)} >= "
+                                          f"current {np.round(current_ema, decimals=4)}. Not overwriting.")
+                    return False
+                else:
+                    self.print_to_log_file(f"Current EMA {np.round(current_ema, decimals=4)} > "
+                                          f"existing {np.round(existing_ema, decimals=4) if existing_ema else 'None'}. Overwriting checkpoint.")
+            except Exception as e:
+                self.print_to_log_file(f"Could not load existing checkpoint for comparison: {e}. Will overwrite.")
+        
+        # Save the checkpoint
+        self._best_ema = current_ema
+        self.save_checkpoint(best_checkpoint_path)
+        return True
 
     def save_checkpoint(self, filename: str) -> None:
         if self.local_rank == 0:

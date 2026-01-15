@@ -34,7 +34,8 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                           fold: int,
                           trainer_name: str = 'nnUNetTrainer',
                           plans_identifier: str = 'nnUNetPlans',
-                          device: torch.device = torch.device('cuda')):
+                          device: torch.device = torch.device('cuda'),
+                          checkpoint_signature: str = None):
     # load nnunet class and do sanity checks
     nnunet_trainer = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
                                                 trainer_name, 'nnunetv2.training.nnUNetTrainer')
@@ -63,7 +64,8 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
     plans = load_json(plans_file)
     dataset_json = load_json(join(preprocessed_dataset_folder_base, 'dataset.json'))
     nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
-                                    dataset_json=dataset_json, device=device)
+                                    dataset_json=dataset_json, device=device,
+                                    checkpoint_signature=checkpoint_signature)
     return nnunet_trainer
 
 
@@ -73,20 +75,46 @@ def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool
         raise RuntimeError('Cannot both continue a training AND load pretrained weights. Pretrained weights can only '
                            'be used at the beginning of the training.')
     if continue_training:
-        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
-        if not isfile(expected_checkpoint_file):
-            expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_latest.pth')
-        # special case where --c is used to run a previously aborted validation
-        if not isfile(expected_checkpoint_file):
-            expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_best.pth')
-        if not isfile(expected_checkpoint_file):
+        # Try new naming convention first, then fall back to old naming
+        checkpoint_candidates = [
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_latest')),
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
+            # Fallback to old naming convention
+            join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
+            join(nnunet_trainer.output_folder, 'checkpoint_latest.pth'),
+            join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
+        ]
+        expected_checkpoint_file = None
+        for candidate in checkpoint_candidates:
+            if isfile(candidate):
+                expected_checkpoint_file = candidate
+                print(f"Found checkpoint for continue training: {expected_checkpoint_file}")
+                break
+        if expected_checkpoint_file is None:
             print(f"WARNING: Cannot continue training because there seems to be no checkpoint available to "
                                f"continue from. Starting a new training...")
-            expected_checkpoint_file = None
     elif validation_only:
-        expected_checkpoint_file = join(nnunet_trainer.output_folder, 'checkpoint_final.pth')
-        if not isfile(expected_checkpoint_file):
-            raise RuntimeError(f"Cannot run validation because the training is not finished yet!")
+        # Try new naming convention first, then fall back to old naming
+        checkpoint_candidates = [
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_latest')),
+            # Fallback to old naming convention
+            join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
+            join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
+            join(nnunet_trainer.output_folder, 'checkpoint_latest.pth'),
+        ]
+        expected_checkpoint_file = None
+        for candidate in checkpoint_candidates:
+            if isfile(candidate):
+                expected_checkpoint_file = candidate
+                print(f"Found checkpoint file: {expected_checkpoint_file}. Beginning validation...")
+                break
+            else:
+                print(f"Checkpoint not found: {candidate}")
+        if expected_checkpoint_file is None:
+            raise RuntimeError(f"Cannot run validation because the training is not finished yet! Candidates tried: {checkpoint_candidates}")
     else:
         if pretrained_weights_file is not None:
             if not nnunet_trainer.was_initialized:
@@ -108,11 +136,12 @@ def cleanup_ddp():
 
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size):
+            pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
-    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p)
+    nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p,
+                                           checkpoint_signature=checkpoint_signature)
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -129,7 +158,8 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
         nnunet_trainer.run_training()
 
     if val_with_best:
-        nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
+        best_checkpoint = join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best'))
+        nnunet_trainer.load_checkpoint(best_checkpoint)
     nnunet_trainer.perform_actual_validation(npz)
     cleanup_ddp()
 
@@ -147,7 +177,8 @@ def run_training(
     only_run_validation: bool = False,              # args.val
     disable_checkpointing: bool = False,             # args.disable_checkpointing
     val_with_best: bool = False,                    # args.val_best
-    device: torch.device = torch.device('cuda')      # args.device
+    device: torch.device = torch.device('cuda'),     # args.device
+    checkpoint_signature: Optional[str] = None       # args.signature
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -188,12 +219,14 @@ def run_training(
                      pretrained_weights,
                      export_validation_probabilities,
                      val_with_best,
-                     num_gpus),
+                     num_gpus,
+                     checkpoint_signature),
                  nprocs=num_gpus,
                  join=True)
     else:
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
-                                               plans_identifier, device=device)
+                                               plans_identifier, device=device,
+                                               checkpoint_signature=checkpoint_signature)
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -210,7 +243,8 @@ def run_training(
             nnunet_trainer.run_training()
 
         if val_with_best:
-            nnunet_trainer.load_checkpoint(join(nnunet_trainer.output_folder, 'checkpoint_best.pth'))
+            best_checkpoint = join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best'))
+            nnunet_trainer.load_checkpoint(best_checkpoint)
         nnunet_trainer.perform_actual_validation(export_validation_probabilities)
 
 
@@ -247,6 +281,10 @@ def run_training_entry():
     parser.add_argument('--disable_checkpointing', action='store_true', required=False,
                         help='[OPTIONAL] Set this flag to disable checkpointing. Ideal for testing things out and '
                              'you dont want to flood your hard drive with checkpoints.')
+    parser.add_argument('-signature', type=str, required=False, default=None,
+                        help='[OPTIONAL] Custom signature to append to checkpoint filenames. '
+                             'Checkpoints will be named: checkpoint_<type>_<plans_name>_<signature>.pth. '
+                             'If not specified, only plans_name is appended.')
     parser.add_argument('-device', type=str, default='cuda', required=False,
                     help="Use this to set the device the training should run with. Available options are 'cuda' "
                          "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
@@ -268,7 +306,7 @@ def run_training_entry():
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 device=device)
+                 device=device, checkpoint_signature=args.signature)
 
 
 if __name__ == '__main__':
