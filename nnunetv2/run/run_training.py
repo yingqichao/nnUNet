@@ -72,30 +72,38 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
 
 
 def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool, validation_only: bool,
-                          pretrained_weights_file: str = None):
+                          pretrained_weights_file: str = None, checkpoint_path: str = None):
     if continue_training and pretrained_weights_file is not None:
         raise RuntimeError('Cannot both continue a training AND load pretrained weights. Pretrained weights can only '
                            'be used at the beginning of the training.')
     if continue_training:
-        # Try new naming convention first, then fall back to old naming
-        checkpoint_candidates = [
-            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
-            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_latest')),
-            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
-            # Fallback to old naming convention
-            join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
-            join(nnunet_trainer.output_folder, 'checkpoint_latest.pth'),
-            join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
-        ]
-        expected_checkpoint_file = None
-        for candidate in checkpoint_candidates:
-            if isfile(candidate):
-                expected_checkpoint_file = candidate
-                print(f"Found checkpoint for continue training: {expected_checkpoint_file}")
-                break
-        if expected_checkpoint_file is None:
-            print(f"WARNING: Cannot continue training because there seems to be no checkpoint available to "
-                               f"continue from. Starting a new training...")
+        # If checkpoint_path is specified, use it directly
+        if checkpoint_path is not None:
+            if isfile(checkpoint_path):
+                expected_checkpoint_file = checkpoint_path
+                print(f"Using specified checkpoint for continue training: {expected_checkpoint_file}")
+            else:
+                raise FileNotFoundError(f"Specified checkpoint file not found: {checkpoint_path}")
+        else:
+            # Try new naming convention first, then fall back to old naming
+            checkpoint_candidates = [
+                join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
+                join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_latest')),
+                join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
+                # Fallback to old naming convention
+                join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
+                join(nnunet_trainer.output_folder, 'checkpoint_latest.pth'),
+                join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
+            ]
+            expected_checkpoint_file = None
+            for candidate in checkpoint_candidates:
+                if isfile(candidate):
+                    expected_checkpoint_file = candidate
+                    print(f"Found checkpoint for continue training: {expected_checkpoint_file}")
+                    break
+            if expected_checkpoint_file is None:
+                print(f"WARNING: Cannot continue training because there seems to be no checkpoint available to "
+                                   f"continue from. Starting a new training...")
     elif validation_only:
         # Try new naming convention first, then fall back to old naming
         checkpoint_candidates = [
@@ -138,7 +146,8 @@ def cleanup_ddp():
 
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None):
+            pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
+            checkpoint_path=None):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -151,7 +160,7 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
 
-    maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights)
+    maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights, checkpoint_path=checkpoint_path)
 
     if torch.cuda.is_available():
         cudnn.deterministic = False
@@ -182,7 +191,8 @@ def run_training(
     val_with_best: bool = False,                    # args.val_best
     device: torch.device = torch.device('cuda'),     # args.device
     checkpoint_signature: Optional[str] = None,      # args.signature
-    splits_file: Optional[str] = None                # args.split
+    splits_file: Optional[str] = None,               # args.split
+    checkpoint_path: Optional[str] = None            # args.checkpoint_path
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -225,7 +235,8 @@ def run_training(
                      val_with_best,
                      num_gpus,
                      checkpoint_signature,
-                     splits_file),
+                     splits_file,
+                     checkpoint_path),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -239,7 +250,8 @@ def run_training(
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
-        maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights)
+        maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights,
+                              checkpoint_path=checkpoint_path)
 
         if torch.cuda.is_available():
             cudnn.deterministic = False
@@ -299,6 +311,9 @@ def run_training_entry():
                         help='[OPTIONAL] Custom splits file name (e.g., splits_mix.json). '
                              'File should be in the preprocessed dataset folder. '
                              'If not specified, uses splits_final.json (default nnUNet behavior).')
+    parser.add_argument('--checkpoint_path', type=str, required=False, default=None,
+                        help='[OPTIONAL] Absolute path to a specific checkpoint file to load when using --c. '
+                             'If not specified, searches for checkpoint_final/latest/best in output folder.')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -316,7 +331,8 @@ def run_training_entry():
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 device=device, checkpoint_signature=args.signature, splits_file=args.split)
+                 device=device, checkpoint_signature=args.signature, splits_file=args.split,
+                 checkpoint_path=args.checkpoint_path)
 
 
 if __name__ == '__main__':
