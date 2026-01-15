@@ -71,7 +71,8 @@ import json
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda'), 
-                 checkpoint_signature: str = None):
+                 checkpoint_signature: str = None,
+                 splits_file: str = None):
         # From https://grugbrain.dev/. Worth a read ya big brains ;-)
 
         # apex predator of grug is complexity
@@ -189,6 +190,9 @@ class nnUNetTrainer(object):
         self.save_every = 50
         self.disable_checkpointing = False
         self.checkpoint_signature = checkpoint_signature
+
+        ### custom splits file
+        self.splits_file = splits_file  # if None, uses default splits_final.json
 
         self.was_initialized = False
 
@@ -560,6 +564,8 @@ class nnUNetTrainer(object):
         it. You can create as many splits in this file as you want. Note that if you define only 4 splits (fold 0-3)
         and then set fold=4 when training (that would be the fifth split), nnU-Net will print a warning and proceed to
         use a random 80:20 data split.
+        
+        You can also specify a custom splits file via --split argument (e.g., --split splits_mix.json).
         :return:
         """
         if self.dataset_class is None:
@@ -571,12 +577,21 @@ class nnUNetTrainer(object):
             tr_keys = case_identifiers
             val_keys = tr_keys
         else:
-            splits_file = join(self.preprocessed_dataset_folder_base, "splits_final.json")
+            # Use custom splits file if specified, otherwise default to splits_final.json
+            if self.splits_file is not None:
+                splits_file = join(self.preprocessed_dataset_folder_base, self.splits_file)
+                self.print_to_log_file(f"Using custom splits file: {self.splits_file}")
+            else:
+                splits_file = join(self.preprocessed_dataset_folder_base, "splits_final.json")
+            
             dataset = self.dataset_class(self.preprocessed_dataset_folder,
                                          identifiers=None,
                                          folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage)
-            # if the split file does not exist we need to create it
+            # if the split file does not exist we need to create it (only for default splits_final.json,
+            # otherwise we raise error.)
             if not isfile(splits_file):
+                if self.splits_file is not None:
+                    raise FileNotFoundError(f"Custom splits file not found: {splits_file}")
                 self.print_to_log_file("Creating new 5-fold cross-validation split...")
                 all_keys_sorted = list(np.sort(list(dataset.identifiers)))
                 splits = generate_crossval_split(all_keys_sorted, seed=12345, n_splits=5)

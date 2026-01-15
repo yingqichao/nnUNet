@@ -35,7 +35,8 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                           trainer_name: str = 'nnUNetTrainer',
                           plans_identifier: str = 'nnUNetPlans',
                           device: torch.device = torch.device('cuda'),
-                          checkpoint_signature: str = None):
+                          checkpoint_signature: str = None,
+                          splits_file: str = None):
     # load nnunet class and do sanity checks
     nnunet_trainer = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
                                                 trainer_name, 'nnunetv2.training.nnUNetTrainer')
@@ -65,7 +66,8 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
     dataset_json = load_json(join(preprocessed_dataset_folder_base, 'dataset.json'))
     nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
                                     dataset_json=dataset_json, device=device,
-                                    checkpoint_signature=checkpoint_signature)
+                                    checkpoint_signature=checkpoint_signature,
+                                    splits_file=splits_file)
     return nnunet_trainer
 
 
@@ -136,12 +138,13 @@ def cleanup_ddp():
 
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
-            pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None):
+            pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
     nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, tr, p,
-                                           checkpoint_signature=checkpoint_signature)
+                                           checkpoint_signature=checkpoint_signature,
+                                           splits_file=splits_file)
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -178,7 +181,8 @@ def run_training(
     disable_checkpointing: bool = False,             # args.disable_checkpointing
     val_with_best: bool = False,                    # args.val_best
     device: torch.device = torch.device('cuda'),     # args.device
-    checkpoint_signature: Optional[str] = None       # args.signature
+    checkpoint_signature: Optional[str] = None,      # args.signature
+    splits_file: Optional[str] = None                # args.split
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -220,13 +224,15 @@ def run_training(
                      export_validation_probabilities,
                      val_with_best,
                      num_gpus,
-                     checkpoint_signature),
+                     checkpoint_signature,
+                     splits_file),
                  nprocs=num_gpus,
                  join=True)
     else:
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
                                                plans_identifier, device=device,
-                                               checkpoint_signature=checkpoint_signature)
+                                               checkpoint_signature=checkpoint_signature,
+                                               splits_file=splits_file)
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
@@ -289,6 +295,10 @@ def run_training_entry():
                     help="Use this to set the device the training should run with. Available options are 'cuda' "
                          "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
                          "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_train [...] instead!")
+    parser.add_argument('--split', type=str, required=False, default=None,
+                        help='[OPTIONAL] Custom splits file name (e.g., splits_mix.json). '
+                             'File should be in the preprocessed dataset folder. '
+                             'If not specified, uses splits_final.json (default nnUNet behavior).')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -306,7 +316,7 @@ def run_training_entry():
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 device=device, checkpoint_signature=args.signature)
+                 device=device, checkpoint_signature=args.signature, splits_file=args.split)
 
 
 if __name__ == '__main__':
