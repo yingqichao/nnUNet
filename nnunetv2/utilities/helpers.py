@@ -1,6 +1,20 @@
 import torch
 
 
+def check_if_proceed(info_to_confirm: str):
+    """Prompt user for confirmation before proceeding."""
+    print(f"Please confirm the following information: \n{info_to_confirm}\n")
+    while True:
+        answer = input("Are you sure you want to proceed? (y/n): ").strip().lower()
+        if answer == "y":
+            print("Proceeding...")
+            break
+        elif answer == "n":
+            print("Cancelled.")
+            raise ValueError("User Cancelled.")
+        else:
+            print("Please enter y or n.")
+
 def softmax_helper_dim0(x: torch.Tensor) -> torch.Tensor:
     return torch.softmax(x, 0)
 

@@ -14,9 +14,10 @@ class nnUNetTrainer_250epochs(nnUNetTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, 
                  dataset_json: dict,
                  device: torch.device = torch.device('cuda'),
-                 checkpoint_signature: str = None):
+                 checkpoint_signature: str = None,
+                 splits_file: str = None):
         super().__init__(plans, configuration, fold, dataset_json,
-                        device, checkpoint_signature)
+                        device, checkpoint_signature, splits_file)
         # Override the number of epochs
         self.num_epochs = 250
         

@@ -14,6 +14,7 @@ from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.utilities.dataset_name_id_conversion import maybe_convert_to_dataset_name
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
 from torch.backends import cudnn
+from nnunetv2.utilities.helpers import check_if_proceed
 
 
 def find_free_network_port() -> int:
@@ -70,6 +71,83 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
                                     splits_file=splits_file)
     return nnunet_trainer
 
+
+def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm: bool = False):
+    """
+    Display training configuration and prompt user for confirmation before training starts.
+    This helps prevent accidentally training in the wrong folder and overwriting good checkpoints.
+    
+    Items shown to user for verification:
+        1. Dataset name - the dataset being trained on
+        2. Plans name - the nnUNet plans identifier being used
+        3. Configuration - the training configuration (e.g., 3d_fullres)
+        4. Fold - the cross-validation fold number
+        5. Output folder - where checkpoints and logs will be saved
+        6. Splits file - the JSON file defining train/val splits (default or custom)
+        7. Existing best checkpoint info (if found):
+           - Checkpoint file path
+           - Best EMA pseudo Dice score achieved
+           - Epoch when checkpoint was saved
+           - Note about checkpoint overwrite policy
+    
+    Args:
+        nnunet_trainer: The initialized nnUNetTrainer instance
+        skip_confirm: If True, show info but don't require user confirmation
+    """
+    # Try to find existing best checkpoint (new naming convention first, then old)
+    checkpoint_candidates = [
+        join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
+        join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
+    ]
+    
+    existing_checkpoint_path = None
+    for candidate in checkpoint_candidates:
+        if isfile(candidate):
+            existing_checkpoint_path = candidate
+            break
+    
+    # Determine the splits file path
+    if nnunet_trainer.splits_file is not None:
+        splits_file_path = join(nnunet_trainer.preprocessed_dataset_folder_base, nnunet_trainer.splits_file)
+    else:
+        splits_file_path = join(nnunet_trainer.preprocessed_dataset_folder_base, "splits_final.json") + " (default)"
+    
+    info_lines = [
+        f"Dataset: {nnunet_trainer.plans_manager.dataset_name}",
+        f"Plans: {nnunet_trainer.plans_manager.plans_name}",
+        f"Configuration: {nnunet_trainer.configuration_name}",
+        f"Fold: {nnunet_trainer.fold}",
+        f"Output folder: {nnunet_trainer.output_folder}",
+        f"Splits file: {splits_file_path}",
+    ]
+    
+    if existing_checkpoint_path is not None:
+        try:
+            checkpoint = torch.load(existing_checkpoint_path, map_location='cpu', weights_only=False)
+            existing_ema = checkpoint.get('_best_ema', None)
+            existing_epoch = checkpoint.get('current_epoch', 'unknown')
+            info_lines.append(f"\n*** EXISTING BEST CHECKPOINT FOUND ***")
+            info_lines.append(f"Checkpoint path: {existing_checkpoint_path}")
+            info_lines.append(f"Best EMA pseudo Dice: {existing_ema:.4f}" if existing_ema is not None else "Best EMA: Not recorded")
+            info_lines.append(f"Saved at epoch: {existing_epoch}")
+            info_lines.append(f"\nNOTE: New checkpoints will only be saved if they exceed this accuracy.")
+        except Exception as e:
+            info_lines.append(f"\n*** EXISTING BEST CHECKPOINT FOUND (but could not load) ***")
+            info_lines.append(f"Checkpoint path: {existing_checkpoint_path}")
+            info_lines.append(f"Error loading: {e}")
+    else:
+        info_lines.append(f"\nNo existing best checkpoint found in output folder.")
+    
+    info_str = "\n".join(info_lines)
+    
+    if skip_confirm:
+        print("=" * 60)
+        print("Training Configuration (--skip_manual_confirm is set):")
+        print("=" * 60)
+        print(info_str)
+        print("=" * 60)
+    else:
+        check_if_proceed(info_str)
 
 def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool, validation_only: bool,
                           pretrained_weights_file: str = None, checkpoint_path: str = None):
@@ -147,7 +225,7 @@ def cleanup_ddp():
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
-            checkpoint_path=None):
+            checkpoint_path=None, skip_manual_confirm=False):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -159,6 +237,12 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
         nnunet_trainer.disable_checkpointing = disable_checkpointing
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
+
+    # Show existing best checkpoint info and ask for confirmation (only on rank 0, unless validation only)
+    if rank == 0 and not val:
+        check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm)
+    # Synchronize all ranks after confirmation
+    dist.barrier()
 
     maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights, checkpoint_path=checkpoint_path)
 
@@ -192,7 +276,8 @@ def run_training(
     device: torch.device = torch.device('cuda'),     # args.device
     checkpoint_signature: Optional[str] = None,      # args.signature
     splits_file: Optional[str] = None,               # args.split
-    checkpoint_path: Optional[str] = None            # args.checkpoint_path
+    checkpoint_path: Optional[str] = None,           # args.checkpoint_path
+    skip_manual_confirm: bool = False                # args.skip_manual_confirm
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -236,7 +321,8 @@ def run_training(
                      num_gpus,
                      checkpoint_signature,
                      splits_file,
-                     checkpoint_path),
+                     checkpoint_path,
+                     skip_manual_confirm),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -249,6 +335,10 @@ def run_training(
             nnunet_trainer.disable_checkpointing = disable_checkpointing
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
+
+        # Show existing best checkpoint info and ask for confirmation (unless validation only)
+        if not only_run_validation:
+            check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm)
 
         maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights,
                               checkpoint_path=checkpoint_path)
@@ -314,6 +404,9 @@ def run_training_entry():
     parser.add_argument('--checkpoint_path', type=str, required=False, default=None,
                         help='[OPTIONAL] Absolute path to a specific checkpoint file to load when using --c. '
                              'If not specified, searches for checkpoint_final/latest/best in output folder.')
+    parser.add_argument('--skip_manual_confirm', action='store_true', required=False,
+                        help='[OPTIONAL] Skip the manual confirmation prompt that shows existing best checkpoint '
+                             'accuracy before training. Use this for automated/scripted training runs.')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -332,7 +425,7 @@ def run_training_entry():
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
                  device=device, checkpoint_signature=args.signature, splits_file=args.split,
-                 checkpoint_path=args.checkpoint_path)
+                 checkpoint_path=args.checkpoint_path, skip_manual_confirm=args.skip_manual_confirm)
 
 
 if __name__ == '__main__':

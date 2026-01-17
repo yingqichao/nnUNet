@@ -29,11 +29,103 @@ from nnunetv2.inference.sliding_window_prediction import compute_gaussian, \
     compute_steps_for_sliding_window
 from nnunetv2.utilities.file_path_utilities import get_output_folder, check_workers_alive_and_busy
 from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
-from nnunetv2.utilities.helpers import empty_cache, dummy_context
+from nnunetv2.utilities.helpers import empty_cache, dummy_context, check_if_proceed
 from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
+
+
+def infer_plans_from_checkpoint_name(checkpoint_name: str, fallback: str = 'nnUNetPlans') -> str:
+    """
+    Infer the plans identifier from the checkpoint filename.
+    
+    The checkpoint naming convention is: checkpoint_<type>_<plans_name>.pth
+    e.g., checkpoint_best_nnUNetResEncUNetLPlans.pth -> nnUNetResEncUNetLPlans
+          checkpoint_final_nnUNetPlans.pth -> nnUNetPlans
+    
+    Args:
+        checkpoint_name: The checkpoint filename (e.g., 'checkpoint_best_nnUNetResEncUNetLPlans.pth')
+        fallback: Default plans identifier if inference fails (default: 'nnUNetPlans')
+    
+    Returns:
+        Inferred plans identifier string
+    """
+    # Remove extension
+    basename = os.path.splitext(checkpoint_name)[0]
+    
+    # Split by underscore and take the last part
+    parts = basename.split('_')
+    
+    if len(parts) >= 3:
+        # checkpoint_best_nnUNetResEncUNetLPlans -> ['checkpoint', 'best', 'nnUNetResEncUNetLPlans']
+        inferred_plans = parts[-1]
+        # Basic validation: plans should start with 'nnUNet'
+        if inferred_plans.startswith('nnUNet'):
+            return inferred_plans
+    
+    # Fallback to default if inference fails
+    return fallback
+
+
+def check_everything_before_inference(model_folder: str, use_folds: tuple, checkpoint_name: str, 
+                                       input_folder: str, output_folder: str, skip_confirm: bool = False):
+    """
+    Display inference configuration and prompt user for confirmation before inference starts.
+    This helps prevent accidentally using wrong checkpoints or overwriting results.
+    
+    Args:
+        model_folder: Path to the trained model folder
+        use_folds: Tuple of folds to use for inference
+        checkpoint_name: Name of the checkpoint file
+        input_folder: Input folder with images to predict
+        output_folder: Output folder for predictions
+        skip_confirm: If True, show info but don't require user confirmation
+    """
+    info_lines = [
+        f"Model folder: {model_folder}",
+        f"Folds: {use_folds}",
+        f"Checkpoint name: {checkpoint_name}",
+        f"Input folder: {input_folder}",
+        f"Output folder: {output_folder}",
+    ]
+    
+    # Check each fold's checkpoint
+    info_lines.append(f"\n*** CHECKPOINT DETAILS ***")
+    for f in use_folds:
+        fold_str = f if f == 'all' else int(f)
+        checkpoint_path = join(model_folder, f'fold_{fold_str}', checkpoint_name)
+        
+        if isfile(checkpoint_path):
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                existing_ema = checkpoint.get('_best_ema', None)
+                existing_epoch = checkpoint.get('current_epoch', 'unknown')
+                info_lines.append(f"\nFold {fold_str}:")
+                info_lines.append(f"  Checkpoint path: {checkpoint_path}")
+                if existing_ema is not None:
+                    info_lines.append(f"  Best EMA pseudo Dice: {existing_ema:.4f}")
+                else:
+                    info_lines.append(f"  Best EMA: Not recorded")
+                info_lines.append(f"  Saved at epoch: {existing_epoch}")
+            except Exception as e:
+                info_lines.append(f"\nFold {fold_str}:")
+                info_lines.append(f"  Checkpoint path: {checkpoint_path}")
+                info_lines.append(f"  Error loading checkpoint: {e}")
+        else:
+            info_lines.append(f"\nFold {fold_str}:")
+            info_lines.append(f"  WARNING: Checkpoint NOT found at: {checkpoint_path}")
+    
+    info_str = "\n".join(info_lines)
+    
+    if skip_confirm:
+        print("=" * 70)
+        print("Inference Configuration (--skip_manual_confirm is set):")
+        print("=" * 70)
+        print(info_str)
+        print("=" * 70)
+    else:
+        check_if_proceed(info_str)
 
 
 class nnUNetPredictor(object):
@@ -83,7 +175,11 @@ class nnUNetPredictor(object):
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
+            checkpoint_path = join(model_training_output_dir, f'fold_{f}', checkpoint_name)
+            if not isfile(checkpoint_path):
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+            print(f"Loading checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path,
                                     map_location=torch.device('cpu'), weights_only=False)
             if i == 0:
                 trainer_name = checkpoint['trainer_name']
@@ -821,6 +917,9 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--skip_manual_confirm', action='store_true', required=False, default=False,
+                        help='Skip the manual confirmation prompt that shows checkpoint info before inference. '
+                             'Use this for automated/scripted inference runs.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -831,6 +930,16 @@ def predict_entry_point_modelfolder():
 
     args = parser.parse_args()
     args.f = [i if i == 'all' else int(i) for i in args.f]
+
+    # Show checkpoint info and ask for confirmation before inference
+    check_everything_before_inference(
+        model_folder=args.m,
+        use_folds=tuple(args.f),
+        checkpoint_name=args.chk,
+        input_folder=args.i,
+        output_folder=args.o,
+        skip_confirm=args.skip_manual_confirm
+    )
 
     if not isdir(args.o):
         maybe_mkdir_p(args.o)
@@ -881,9 +990,10 @@ def predict_entry_point():
                              'have the same name as their source images.')
     parser.add_argument('-d', type=str, required=True,
                         help='Dataset with which you would like to predict. You can specify either dataset name or id')
-    parser.add_argument('-p', type=str, required=False, default='nnUNetPlans',
+    parser.add_argument('-p', type=str, required=False, default=None,
                         help='Plans identifier. Specify the plans in which the desired configuration is located. '
-                             'Default: nnUNetPlans')
+                             'If not specified, will try to infer from checkpoint name (e.g., checkpoint_best_nnUNetResEncUNetLPlans.pth -> nnUNetResEncUNetLPlans). '
+                             'Fallback: nnUNetPlans')
     parser.add_argument('-tr', type=str, required=False, default='nnUNetTrainer',
                         help='What nnU-Net trainer class was used for training? Default: nnUNetTrainer')
     parser.add_argument('-c', type=str, required=True,
@@ -930,6 +1040,9 @@ def predict_entry_point():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--skip_manual_confirm', action='store_true', required=False, default=False,
+                        help='Skip the manual confirmation prompt that shows checkpoint info before inference. '
+                             'Use this for automated/scripted inference runs.')
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -941,7 +1054,22 @@ def predict_entry_point():
     args = parser.parse_args()
     args.f = [i if i == 'all' else int(i) for i in args.f]
 
+    # Infer plans from checkpoint name if not specified
+    if args.p is None:
+        args.p = infer_plans_from_checkpoint_name(args.chk)
+        print(f"Plans identifier not specified. Inferred from checkpoint name: {args.p}")
+
     model_folder = get_output_folder(args.d, args.tr, args.p, args.c)
+    
+    # Show checkpoint info and ask for confirmation before inference
+    check_everything_before_inference(
+        model_folder=model_folder,
+        use_folds=tuple(args.f),
+        checkpoint_name=args.chk,
+        input_folder=args.i,
+        output_folder=args.o,
+        skip_confirm=args.skip_manual_confirm
+    )
 
     if not isdir(args.o):
         maybe_mkdir_p(args.o)
