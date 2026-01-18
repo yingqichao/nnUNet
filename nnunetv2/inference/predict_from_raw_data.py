@@ -82,11 +82,45 @@ def check_everything_before_inference(model_folder: str, use_folds: tuple, check
         output_folder: Output folder for predictions
         skip_confirm: If True, show info but don't require user confirmation
     """
+    # Count input files and get some examples
+    input_file_info = ""
+    if isdir(input_folder):
+        try:
+            # List files in input folder (excluding directories)
+            input_files = [f for f in os.listdir(input_folder) if os.path.isfile(join(input_folder, f))]
+            # Filter to common medical image extensions
+            image_files = [f for f in input_files if f.endswith(('.nii.gz', '.nii', '.mha', '.nrrd'))]
+            # Get unique case IDs (remove _0000, _0001, etc. suffixes)
+            case_ids = set()
+            for f in image_files:
+                # Remove extension and channel suffix
+                base = f.replace('.nii.gz', '').replace('.nii', '').replace('.mha', '').replace('.nrrd', '')
+                if '_' in base:
+                    parts = base.rsplit('_', 1)
+                    if parts[-1].isdigit() and len(parts[-1]) == 4:
+                        case_ids.add(parts[0])
+                    else:
+                        case_ids.add(base)
+                else:
+                    case_ids.add(base)
+            
+            num_cases = len(case_ids)
+            example_cases = sorted(list(case_ids))[:5]
+            input_file_info = f"\n  Number of cases: {num_cases}"
+            if example_cases:
+                input_file_info += f"\n  Example cases: {', '.join(example_cases)}"
+                if num_cases > 5:
+                    input_file_info += f" ... and {num_cases - 5} more"
+        except Exception as e:
+            input_file_info = f"\n  (Could not list files: {e})"
+    else:
+        input_file_info = "\n  WARNING: Input folder does not exist!"
+    
     info_lines = [
         f"Model folder: {model_folder}",
         f"Folds: {use_folds}",
         f"Checkpoint name: {checkpoint_name}",
-        f"Input folder: {input_folder}",
+        f"Input folder: {input_folder}{input_file_info}",
         f"Output folder: {output_folder}",
     ]
     
