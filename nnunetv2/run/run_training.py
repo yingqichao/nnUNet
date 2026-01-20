@@ -274,7 +274,7 @@ def cleanup_ddp():
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
             checkpoint_path=None, skip_manual_confirm=False, pattern_original_samples=None,
-            ignore_existing_best=False):
+            ignore_existing_best=False, skip_val=False):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -313,10 +313,13 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     if not val:
         nnunet_trainer.run_training()
 
-    if val_with_best:
-        best_checkpoint = join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best'))
-        nnunet_trainer.load_checkpoint(best_checkpoint)
-    nnunet_trainer.perform_actual_validation(npz)
+    if not skip_val:
+        if val_with_best:
+            best_checkpoint = join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best'))
+            nnunet_trainer.load_checkpoint(best_checkpoint)
+        nnunet_trainer.perform_actual_validation(npz)
+    else:
+        print("Skipping final validation (--skip_val flag set)")
     cleanup_ddp()
 
 
@@ -333,6 +336,7 @@ def run_training(
     only_run_validation: bool = False,              # args.val
     disable_checkpointing: bool = False,             # args.disable_checkpointing
     val_with_best: bool = False,                    # args.val_best
+    skip_val: bool = False,                          # args.skip_val
     device: torch.device = torch.device('cuda'),     # args.device
     checkpoint_signature: Optional[str] = None,      # args.signature
     splits_file: Optional[str] = None,               # args.split
@@ -386,7 +390,8 @@ def run_training(
                      checkpoint_path,
                      skip_manual_confirm,
                      pattern_original_samples,
-                     ignore_existing_best),
+                     ignore_existing_best,
+                     skip_val),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -423,10 +428,13 @@ def run_training(
         if not only_run_validation:
             nnunet_trainer.run_training()
 
-        if val_with_best:
-            best_checkpoint = join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best'))
-            nnunet_trainer.load_checkpoint(best_checkpoint)
-        nnunet_trainer.perform_actual_validation(export_validation_probabilities)
+        if not skip_val:
+            if val_with_best:
+                best_checkpoint = join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best'))
+                nnunet_trainer.load_checkpoint(best_checkpoint)
+            nnunet_trainer.perform_actual_validation(export_validation_probabilities)
+        else:
+            print("Skipping final validation (--skip_val flag set)")
 
 
 def run_training_entry():
@@ -462,6 +470,9 @@ def run_training_entry():
     parser.add_argument('--disable_checkpointing', action='store_true', required=False,
                         help='[OPTIONAL] Set this flag to disable checkpointing. Ideal for testing things out and '
                              'you dont want to flood your hard drive with checkpoints.')
+    parser.add_argument('--skip_val', action='store_true', required=False,
+                        help='[OPTIONAL] Skip the final validation step after training. Useful when you want to '
+                             'run validation separately on a different test set (e.g., external validation).')
     parser.add_argument('-signature', type=str, required=False, default=None,
                         help='[OPTIONAL] Custom signature to append to checkpoint filenames. '
                              'Checkpoints will be named: checkpoint_<type>_<plans_name>_<signature>.pth. '
@@ -506,7 +517,7 @@ def run_training_entry():
 
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 device=device, checkpoint_signature=args.signature, splits_file=args.split,
+                 args.skip_val, device=device, checkpoint_signature=args.signature, splits_file=args.split,
                  checkpoint_path=args.checkpoint_path, skip_manual_confirm=args.skip_manual_confirm,
                  pattern_original_samples=args.pattern_original_samples,
                  ignore_existing_best=args.ignore_existing_best)
