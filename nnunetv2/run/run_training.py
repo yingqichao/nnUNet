@@ -72,7 +72,8 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
     return nnunet_trainer
 
 
-def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm: bool = False):
+def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm: bool = False,
+                                      ignore_existing_best: bool = False):
     """
     Display training configuration and prompt user for confirmation before training starts.
     This helps prevent accidentally training in the wrong folder and overwriting good checkpoints.
@@ -89,10 +90,12 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
            - Best EMA pseudo Dice score achieved
            - Epoch when checkpoint was saved
            - Note about checkpoint overwrite policy
+        8. Warning if --ignore_existing_best is set
     
     Args:
         nnunet_trainer: The initialized nnUNetTrainer instance
         skip_confirm: If True, show info but don't require user confirmation
+        ignore_existing_best: If True, show warning that existing checkpoint will be removed
     """
     # Try to find existing best checkpoint (new naming convention first, then old)
     checkpoint_candidates = [
@@ -138,6 +141,11 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
     else:
         info_lines.append(f"\nNo existing best checkpoint found in output folder.")
     
+    # Add warning if --ignore_existing_best is set
+    if ignore_existing_best:
+        info_lines.append(f"\n*** NOTE!!! You have set --ignore_existing_best, and this will accordingly "
+                          f"remove the above checkpoint if it exists! ***")
+    
     info_str = "\n".join(info_lines)
     
     if skip_confirm:
@@ -148,6 +156,46 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
         print("=" * 60)
     else:
         check_if_proceed(info_str)
+
+
+def maybe_remove_existing_best_checkpoint(nnunet_trainer: nnUNetTrainer, ignore_existing_best: bool = False):
+    """
+    Remove existing best checkpoint if --ignore_existing_best is set.
+    
+    This allows starting fresh without the accuracy threshold from a previous training run.
+    Both new naming convention (checkpoint_best_<plans>.pth) and old naming convention
+    (checkpoint_best.pth) are checked and removed.
+    
+    Args:
+        nnunet_trainer: The initialized nnUNetTrainer instance
+        ignore_existing_best: If True, remove existing best checkpoints
+    """
+    if not ignore_existing_best:
+        return
+    
+    import os
+    
+    # Check for existing best checkpoints (new naming convention first, then old)
+    checkpoint_candidates = [
+        join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
+        join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
+    ]
+    
+    removed_any = False
+    for checkpoint_path in checkpoint_candidates:
+        if isfile(checkpoint_path):
+            try:
+                os.remove(checkpoint_path)
+                print(f"*** REMOVED existing best checkpoint: {checkpoint_path}")
+                removed_any = True
+            except Exception as e:
+                print(f"WARNING: Failed to remove checkpoint {checkpoint_path}: {e}")
+    
+    # Also reset the trainer's _best_ema to None so it starts fresh
+    if removed_any:
+        nnunet_trainer._best_ema = None
+        print("*** Training will start fresh without accuracy threshold from previous run.")
+
 
 def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool, validation_only: bool,
                           pretrained_weights_file: str = None, checkpoint_path: str = None):
@@ -225,7 +273,8 @@ def cleanup_ddp():
 
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
-            checkpoint_path=None, skip_manual_confirm=False):
+            checkpoint_path=None, skip_manual_confirm=False, pattern_original_samples=None,
+            ignore_existing_best=False):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -235,13 +284,24 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
 
     if disable_checkpointing:
         nnunet_trainer.disable_checkpointing = disable_checkpointing
+    
+    # Set pattern for identifying original samples (used by nnUNetTrainer_WithTuningSet)
+    if pattern_original_samples is not None:
+        nnunet_trainer.pattern_original_samples = pattern_original_samples
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
 
     # Show existing best checkpoint info and ask for confirmation (only on rank 0, unless validation only)
     if rank == 0 and not val:
-        check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm)
+        check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm,
+                                         ignore_existing_best=ignore_existing_best)
     # Synchronize all ranks after confirmation
+    dist.barrier()
+    
+    # Remove existing best checkpoint if requested (only on rank 0, only for fresh training)
+    if rank == 0 and not val and not c:
+        maybe_remove_existing_best_checkpoint(nnunet_trainer, ignore_existing_best)
+    # Synchronize all ranks after removal
     dist.barrier()
 
     maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights, checkpoint_path=checkpoint_path)
@@ -277,7 +337,9 @@ def run_training(
     checkpoint_signature: Optional[str] = None,      # args.signature
     splits_file: Optional[str] = None,               # args.split
     checkpoint_path: Optional[str] = None,           # args.checkpoint_path
-    skip_manual_confirm: bool = False                # args.skip_manual_confirm
+    skip_manual_confirm: bool = False,               # args.skip_manual_confirm
+    pattern_original_samples: Optional[str] = None,  # args.pattern_original_samples
+    ignore_existing_best: bool = False               # args.ignore_existing_best
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -322,7 +384,9 @@ def run_training(
                      checkpoint_signature,
                      splits_file,
                      checkpoint_path,
-                     skip_manual_confirm),
+                     skip_manual_confirm,
+                     pattern_original_samples,
+                     ignore_existing_best),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -333,12 +397,21 @@ def run_training(
 
         if disable_checkpointing:
             nnunet_trainer.disable_checkpointing = disable_checkpointing
+        
+        # Set pattern for identifying original samples (used by nnUNetTrainer_WithTuningSet)
+        if pattern_original_samples is not None:
+            nnunet_trainer.pattern_original_samples = pattern_original_samples
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
         # Show existing best checkpoint info and ask for confirmation (unless validation only)
         if not only_run_validation:
-            check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm)
+            check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm,
+                                             ignore_existing_best=ignore_existing_best)
+        
+        # Remove existing best checkpoint if requested (only for fresh training, not continue or validation)
+        if not only_run_validation and not continue_training:
+            maybe_remove_existing_best_checkpoint(nnunet_trainer, ignore_existing_best)
 
         maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights,
                               checkpoint_path=checkpoint_path)
@@ -407,6 +480,15 @@ def run_training_entry():
     parser.add_argument('--skip_manual_confirm', action='store_true', required=False,
                         help='[OPTIONAL] Skip the manual confirmation prompt that shows existing best checkpoint '
                              'accuracy before training. Use this for automated/scripted training runs.')
+    parser.add_argument('--pattern_original_samples', type=str, required=False, default=None,
+                        help='[OPTIONAL] Regex pattern to identify original (non-synthetic) samples by their '
+                             'basename (without extension). E.g., "liver_\\d+" for files like liver_0, liver_123. '
+                             'Samples not matching this pattern are considered synthetic. '
+                             'Only used by nnUNetTrainer_WithTuningSet. If not specified, all samples are original.')
+    parser.add_argument('--ignore_existing_best', action='store_true', required=False,
+                        help='[OPTIONAL] If set, any existing best checkpoint in the output folder will be REMOVED '
+                             'before training starts. This allows starting fresh without the accuracy threshold '
+                             'from a previous training run. Use with caution!')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -425,7 +507,9 @@ def run_training_entry():
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
                  device=device, checkpoint_signature=args.signature, splits_file=args.split,
-                 checkpoint_path=args.checkpoint_path, skip_manual_confirm=args.skip_manual_confirm)
+                 checkpoint_path=args.checkpoint_path, skip_manual_confirm=args.skip_manual_confirm,
+                 pattern_original_samples=args.pattern_original_samples,
+                 ignore_existing_best=args.ignore_existing_best)
 
 
 if __name__ == '__main__':

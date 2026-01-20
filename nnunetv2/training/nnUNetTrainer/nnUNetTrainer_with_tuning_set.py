@@ -14,11 +14,15 @@ Key features:
 - Tuning metrics computed FIRST each epoch, then test metrics
 - Configurable 3-way patch centering: random / anatomy / tumor
 - Extension point for adaptive hyperparameter adjustment based on tuning performance
+- Original vs synthetic sample handling via --pattern_original_samples
+- Tuning set always uses ONLY original samples
+- Synthetic data ratio capped at 50% in training set
+- EMA pseudo dice based on TUMOR DICE ONLY (not mean of all foreground classes)
 
 Evaluation order each epoch:
 1. TUNING SET: Compute metrics (logged, for adaptive decisions)
 2. TEST SET: Compute pseudo dice (logged, for checkpoint selection)
-3. Checkpoint: "Yayy! New best EMA pseudo Dice" if improved (based on TEST only)
+3. Checkpoint: "Yayy! New best EMA pseudo Dice" if improved (based on TEST tumor dice only)
 
 Patch centering probabilities (configurable per mode):
 - prob_random: Center on random voxel (anywhere)
@@ -33,12 +37,15 @@ Label convention:
 
 Usage:
     nnUNetv2_train DATASET CONFIG FOLD -tr nnUNetTrainer_WithTuningSet
+    nnUNetv2_train DATASET CONFIG FOLD -tr nnUNetTrainer_WithTuningSet --pattern_original_samples "liver_\\d+"
 """
 
+import re
 import numpy as np
 import torch
 from typing import List, Tuple, Union
 from threadpoolctl import threadpool_limits
+from batchgenerators.utilities.file_and_folder_operations import join
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset
@@ -319,6 +326,21 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.tuning_dataloader = None
         
         # =====================================================================
+        # ORIGINAL vs SYNTHETIC SAMPLE HANDLING
+        # =====================================================================
+        # Pattern to identify original samples (set via --pattern_original_samples)
+        # If None, all samples are considered original
+        self.pattern_original_samples: str = None  # Set by run_training.py
+        self.max_synthetic_ratio = 0.5  # Max ratio of synthetic samples in training
+        
+        # Track original/synthetic sample counts (populated in do_split)
+        self.n_original_total = 0
+        self.n_synthetic_total = 0
+        self.n_synthetic_removed = 0
+        self.removed_synthetic_keys: List[str] = []
+        # =====================================================================
+        
+        # =====================================================================
         # 3-WAY CENTERING PROBABILITIES
         # =====================================================================
         # Probabilities for patch centering: (prob_random, prob_anatomy, prob_tumor)
@@ -362,9 +384,33 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"  Test:     ({self.test_prob_random:.2f} / {self.test_prob_anatomy:.2f} / {self.test_prob_tumor:.2f})")
         self.print_to_log_file("=" * 70 + "\n")
     
+    def _is_original_sample(self, key: str) -> bool:
+        """
+        Check if a sample key represents an original (non-synthetic) sample.
+        
+        Args:
+            key: Sample key (basename without extension)
+            
+        Returns:
+            True if sample is original, False if synthetic
+        """
+        if self.pattern_original_samples is None:
+            # No pattern specified, all samples are original
+            return True
+        
+        # Match the entire key against the pattern
+        pattern = f"^{self.pattern_original_samples}$"
+        return bool(re.match(pattern, key))
+    
     def do_split(self) -> Tuple[List[str], List[str]]:
         """
         Override to create 3-way split: train/tuning/test.
+        
+        Features:
+        - Classifies samples as original vs synthetic based on pattern
+        - Ensures tuning set contains ONLY original samples
+        - Caps synthetic data ratio at max_synthetic_ratio (default 50%)
+        - Logs all statistics and removed samples
         
         The tuning keys are stored in self.tuning_keys.
         Returns (train_keys, test_keys) - tuning is handled separately.
@@ -372,19 +418,99 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Get original 2-way split from parent
         original_tr_keys, test_keys = super().do_split()
         
-        # Deterministically split training into train + tuning
-        # Use fold number in seed for reproducibility across runs
+        # =====================================================================
+        # STEP 1: Classify samples as original vs synthetic
+        # =====================================================================
+        original_keys = []
+        synthetic_keys = []
+        
+        for key in original_tr_keys:
+            if self._is_original_sample(key):
+                original_keys.append(key)
+            else:
+                synthetic_keys.append(key)
+        
+        self.n_original_total = len(original_keys)
+        self.n_synthetic_total = len(synthetic_keys)
+        
+        self.print_to_log_file("\n" + "-" * 70)
+        self.print_to_log_file("Original vs Synthetic sample classification:")
+        if self.pattern_original_samples:
+            self.print_to_log_file(f"  Pattern for original samples: '{self.pattern_original_samples}'")
+        else:
+            self.print_to_log_file(f"  No pattern specified - all samples treated as original")
+        self.print_to_log_file(f"  Original samples: {self.n_original_total}")
+        self.print_to_log_file(f"  Synthetic samples: {self.n_synthetic_total}")
+        self.print_to_log_file("-" * 70)
+        
+        # =====================================================================
+        # STEP 2: Create tuning set from ORIGINAL samples only
+        # =====================================================================
         rng = np.random.RandomState(seed=12345 + self.fold)
-        shuffled = rng.permutation(original_tr_keys).tolist()
         
-        n_tuning = int(len(shuffled) * self.tuning_ratio)
-        self.tuning_keys = shuffled[:n_tuning]
-        train_keys = shuffled[n_tuning:]
+        # Shuffle original samples for tuning selection
+        shuffled_original = rng.permutation(original_keys).tolist()
         
-        self.print_to_log_file(f"3-way split for fold {self.fold}:")
+        # Calculate tuning set size (from original samples only)
+        n_tuning = int(len(shuffled_original) * self.tuning_ratio)
+        self.tuning_keys = shuffled_original[:n_tuning]
+        remaining_original = shuffled_original[n_tuning:]
+        
+        self.print_to_log_file(f"Tuning set: {len(self.tuning_keys)} cases (original samples only)")
+        
+        # =====================================================================
+        # STEP 3: Cap synthetic ratio in training set
+        # =====================================================================
+        # Training = remaining original + (possibly capped) synthetic
+        n_remaining_original = len(remaining_original)
+        
+        # Calculate max synthetic samples allowed
+        # If synthetic_ratio = 0.5, then synthetic <= original
+        # max_synthetic = original * synthetic_ratio / (1 - synthetic_ratio)
+        if self.max_synthetic_ratio < 1.0:
+            max_synthetic = int(n_remaining_original * self.max_synthetic_ratio / (1 - self.max_synthetic_ratio))
+        else:
+            max_synthetic = len(synthetic_keys)  # No cap
+        
+        # Randomly select synthetic samples if we have too many
+        if len(synthetic_keys) > max_synthetic:
+            shuffled_synthetic = rng.permutation(synthetic_keys).tolist()
+            synthetic_for_training = shuffled_synthetic[:max_synthetic]
+            self.removed_synthetic_keys = shuffled_synthetic[max_synthetic:]
+            self.n_synthetic_removed = len(self.removed_synthetic_keys)
+            
+            self.print_to_log_file(f"\n*** SYNTHETIC DATA CAP APPLIED ***")
+            self.print_to_log_file(f"  Max synthetic ratio: {self.max_synthetic_ratio:.0%}")
+            self.print_to_log_file(f"  Synthetic samples allowed: {max_synthetic}")
+            self.print_to_log_file(f"  Synthetic samples removed: {self.n_synthetic_removed}")
+            self.print_to_log_file(f"  Removed samples:")
+            for key in self.removed_synthetic_keys:
+                self.print_to_log_file(f"    - {key}")
+        else:
+            synthetic_for_training = synthetic_keys
+            self.removed_synthetic_keys = []
+            self.n_synthetic_removed = 0
+        
+        # Combine remaining original + allowed synthetic for training
+        train_keys = remaining_original + synthetic_for_training
+        
+        # Shuffle training set
+        train_keys = rng.permutation(train_keys).tolist()
+        
+        # =====================================================================
+        # STEP 4: Log final split statistics
+        # =====================================================================
+        n_original_in_train = len(remaining_original)
+        n_synthetic_in_train = len(synthetic_for_training)
+        actual_synthetic_ratio = n_synthetic_in_train / len(train_keys) if len(train_keys) > 0 else 0
+        
+        self.print_to_log_file(f"\n3-way split for fold {self.fold}:")
         self.print_to_log_file(f"  - Training: {len(train_keys)} cases")
-        self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases")
+        self.print_to_log_file(f"      Original:  {n_original_in_train} ({100*n_original_in_train/len(train_keys):.1f}%)")
+        self.print_to_log_file(f"      Synthetic: {n_synthetic_in_train} ({100*actual_synthetic_ratio:.1f}%)")
+        self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases (100% original)")
         self.print_to_log_file(f"  - Test:     {len(test_keys)} cases (original val fold)")
+        self.print_to_log_file("-" * 70 + "\n")
         
         return train_keys, test_keys
     
@@ -604,10 +730,15 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         These metrics can be used for adaptive training decisions.
         
         Returns:
-            Dictionary with:
+            Dictionary with per-class metrics:
             - 'dice_per_class': List of dice scores per class
             - 'mean_fg_dice': Mean foreground dice
             - 'loss': Average loss on tuning set
+            - 'tp_per_class', 'fp_per_class', 'fn_per_class', 'tn_per_class': Raw counts
+            - 'recall_per_class': TP / (TP + FN) in percent
+            - 'precision_per_class': TP / (TP + FP) in percent
+            - 'f1_per_class': 2 * precision * recall / (precision + recall)
+            - 'fpr_per_class': FP / (FP + TN) in percent (False Positive Rate)
         """
         self.network.eval()
         
@@ -628,19 +759,47 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         tp = np.sum(outputs_collated['tp_hard'], 0)
         fp = np.sum(outputs_collated['fp_hard'], 0)
         fn = np.sum(outputs_collated['fn_hard'], 0)
+        tn = np.sum(outputs_collated['tn_hard'], 0)
         
-        # Compute dice per class
+        # Compute dice per class: 2*TP / (2*TP + FP + FN)
         dice_per_class = [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0.0 
                          for i, j, k in zip(tp, fp, fn)]
         mean_fg_dice = float(np.nanmean(dice_per_class))
         mean_loss = float(np.mean(outputs_collated['loss']))
+        
+        # Compute additional metrics per class
+        # Recall (Sensitivity): TP / (TP + FN)
+        recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 
+                           for t, f in zip(tp, fn)]
+        
+        # Precision (Positive Predictive Value): TP / (TP + FP)
+        precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 
+                              for t, f in zip(tp, fp)]
+        
+        # F1 Score: 2 * precision * recall / (precision + recall)
+        f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
+                       for p, r in zip(precision_per_class, recall_per_class)]
+        
+        # False Positive Rate: FP / (FP + TN)
+        fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 
+                        for f, t in zip(fp, tn)]
         
         self.network.train()
         
         return {
             'dice_per_class': dice_per_class,
             'mean_fg_dice': mean_fg_dice,
-            'loss': mean_loss
+            'loss': mean_loss,
+            # Raw counts
+            'tp_per_class': tp.tolist(),
+            'fp_per_class': fp.tolist(),
+            'fn_per_class': fn.tolist(),
+            'tn_per_class': tn.tolist(),
+            # Rate metrics (in percent)
+            'recall_per_class': recall_per_class,
+            'precision_per_class': precision_per_class,
+            'f1_per_class': f1_per_class,
+            'fpr_per_class': fpr_per_class,
         }
     
     def _tuning_step(self, batch: dict) -> dict:
@@ -695,18 +854,21 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         else:
             mask = None
         
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+        tp, fp, fn, tn = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
         
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
         fn_hard = fn.detach().cpu().numpy()
+        tn_hard = tn.detach().cpu().numpy()
         
         if not self.label_manager.has_regions:
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
+            tn_hard = tn_hard[1:]
         
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 
+                'fn_hard': fn_hard, 'tn_hard': tn_hard}
     
     def on_validation_epoch_start(self):
         """
@@ -734,26 +896,35 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         tuning_result = self.compute_tuning_metrics()
         
-        # Compute EMA of mean_fg_dice (same formula as test set: α=0.1)
-        # ema[t] = ema[t-1] * 0.9 + mean_fg_dice * 0.1
-        mean_fg_dice = tuning_result['mean_fg_dice']
+        # Use TUMOR DICE ONLY for EMA calculation (index 1 = tumor, label >= 2)
+        # dice_per_class: [anatomy_dice, tumor_dice]
+        tumor_dice = tuning_result['dice_per_class'][1] if len(tuning_result['dice_per_class']) > 1 else tuning_result['mean_fg_dice']
+        
+        # Compute EMA of tumor_dice (α=0.1)
+        # ema[t] = ema[t-1] * 0.9 + tumor_dice * 0.1
         if len(self.tuning_metrics['ema_fg_dice']) > 0:
             prev_ema = self.tuning_metrics['ema_fg_dice'][-1]
-            current_ema = prev_ema * 0.9 + mean_fg_dice * 0.1
+            current_ema = prev_ema * 0.9 + tumor_dice * 0.1
         else:
-            # First epoch - no previous EMA, use current mean directly
-            current_ema = mean_fg_dice
+            # First epoch - no previous EMA, use current tumor dice directly
+            current_ema = tumor_dice
         
         # Store metrics
         self.tuning_metrics['dice_per_class'].append(tuning_result['dice_per_class'])
-        self.tuning_metrics['mean_fg_dice'].append(mean_fg_dice)
+        self.tuning_metrics['mean_fg_dice'].append(tuning_result['mean_fg_dice'])
         self.tuning_metrics['ema_fg_dice'].append(current_ema)
         self.tuning_metrics['loss'].append(tuning_result['loss'])
         
         # Log tuning metrics
         self.print_to_log_file(f"  Tuning loss: {np.round(tuning_result['loss'], 4)}")
         self.print_to_log_file(f"  Tuning Pseudo dice: {[np.round(d, 4) for d in tuning_result['dice_per_class']]}")
-        self.print_to_log_file(f"  Tuning EMA Pseudo dice: {np.round(current_ema, 4)}")
+        self.print_to_log_file(f"  Tuning EMA Pseudo dice (tumor only): {np.round(current_ema, 4)}")
+        
+        # Log additional rate-based metrics
+        self.print_to_log_file(f"  Tuning Recall (%): {[np.round(r, 2) for r in tuning_result['recall_per_class']]}")
+        self.print_to_log_file(f"  Tuning Precision (%): {[np.round(p, 2) for p in tuning_result['precision_per_class']]}")
+        self.print_to_log_file(f"  Tuning F1: {[np.round(f, 4) for f in tuning_result['f1_per_class']]}")
+        self.print_to_log_file(f"  Tuning FPR (%): {[np.round(f, 4) for f in tuning_result['fpr_per_class']]}")
         
         # Store current tuning result for potential use in adaptive decisions
         tuning_result['ema_fg_dice'] = current_ema
@@ -777,13 +948,198 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file("-" * 40)
         self.print_to_log_file("TEST SET evaluation (for checkpoint selection):")
     
-    # Note: We don't override on_epoch_end() anymore - parent handles:
-    # - Logging test metrics (train_loss, val_loss, Pseudo dice)
-    # - Checkpoint selection with "Yayy! New best EMA pseudo Dice" message
+    def validation_step(self, batch: dict) -> dict:
+        """
+        Override to also capture TN for additional metrics computation.
+        """
+        data = batch['data']
+        target = batch['target']
+
+        data = data.to(self.device, non_blocking=True)
+        if isinstance(target, list):
+            target = [i.to(self.device, non_blocking=True) for i in target]
+        else:
+            target = target.to(self.device, non_blocking=True)
+
+        from torch.amp import autocast
+        from nnunetv2.utilities.helpers import dummy_context
+
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data)
+            del data
+            l = self.loss(output, target)
+
+        if self.enable_deep_supervision:
+            output = output[0]
+            target = target[0]
+
+        axes = [0] + list(range(2, output.ndim))
+
+        if self.label_manager.has_regions:
+            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+        else:
+            output_seg = output.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
+            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+            del output_seg
+
+        if self.label_manager.has_ignore_label:
+            if not self.label_manager.has_regions:
+                mask = (target != self.label_manager.ignore_label).float()
+                target[target == self.label_manager.ignore_label] = 0
+            else:
+                if target.dtype == torch.bool:
+                    mask = ~target[:, -1:]
+                else:
+                    mask = 1 - target[:, -1:]
+                target = target[:, :-1]
+        else:
+            mask = None
+
+        tp, fp, fn, tn = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        tn_hard = tn.detach().cpu().numpy()
+        
+        if not self.label_manager.has_regions:
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+            tn_hard = tn_hard[1:]
+
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 
+                'fn_hard': fn_hard, 'tn_hard': tn_hard}
+    
+    def on_validation_epoch_end(self, val_outputs: list):
+        """
+        Override to use TUMOR DICE ONLY for EMA calculation instead of mean foreground dice.
+        Also computes and logs additional metrics: Recall, Precision, F1, FPR.
+        
+        dice_per_class_or_region: [anatomy_dice, tumor_dice]
+        We use index 1 (tumor) for the EMA that determines checkpoint selection.
+        """
+        from torch import distributed as dist
+        
+        outputs_collated = collate_outputs(val_outputs)
+        tp = np.sum(outputs_collated['tp_hard'], 0)
+        fp = np.sum(outputs_collated['fp_hard'], 0)
+        fn = np.sum(outputs_collated['fn_hard'], 0)
+        tn = np.sum(outputs_collated['tn_hard'], 0)
+
+        if self.is_ddp:
+            world_size = dist.get_world_size()
+
+            tps = [None for _ in range(world_size)]
+            dist.all_gather_object(tps, tp)
+            tp = np.vstack([i[None] for i in tps]).sum(0)
+
+            fps = [None for _ in range(world_size)]
+            dist.all_gather_object(fps, fp)
+            fp = np.vstack([i[None] for i in fps]).sum(0)
+
+            fns = [None for _ in range(world_size)]
+            dist.all_gather_object(fns, fn)
+            fn = np.vstack([i[None] for i in fns]).sum(0)
+            
+            tns = [None for _ in range(world_size)]
+            dist.all_gather_object(tns, tn)
+            tn = np.vstack([i[None] for i in tns]).sum(0)
+
+            losses_val = [None for _ in range(world_size)]
+            dist.all_gather_object(losses_val, outputs_collated['loss'])
+            loss_here = np.vstack(losses_val).mean()
+        else:
+            loss_here = np.mean(outputs_collated['loss'])
+
+        # Compute Dice per class: 2*TP / (2*TP + FP + FN)
+        global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+        
+        # Compute additional metrics per class
+        # Recall (Sensitivity): TP / (TP + FN)
+        recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 
+                           for t, f in zip(tp, fn)]
+        
+        # Precision (Positive Predictive Value): TP / (TP + FP)
+        precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 
+                              for t, f in zip(tp, fp)]
+        
+        # F1 Score: 2 * precision * recall / (precision + recall)
+        f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
+                       for p, r in zip(precision_per_class, recall_per_class)]
+        
+        # False Positive Rate: FP / (FP + TN)
+        fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 
+                        for f, t in zip(fp, tn)]
+        
+        # =====================================================================
+        # KEY CHANGE: Use TUMOR DICE ONLY for EMA calculation
+        # =====================================================================
+        # global_dc_per_class: [anatomy_dice, tumor_dice]
+        # Index 1 = tumor (label >= 2)
+        tumor_dice = global_dc_per_class[1] if len(global_dc_per_class) > 1 else np.nanmean(global_dc_per_class)
+        
+        # Log tumor_dice as 'mean_fg_dice' - the logger will compute EMA from this
+        # This makes the checkpoint selection based on tumor dice EMA
+        self.logger.log('mean_fg_dice', tumor_dice, self.current_epoch)
+        self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
+        self.logger.log('val_losses', loss_here, self.current_epoch)
+        
+        # Log additional rate-based metrics for test set (will appear after "Pseudo dice" in on_epoch_end)
+        # Store for logging in on_epoch_end
+        self._test_additional_metrics = {
+            'recall_per_class': recall_per_class,
+            'precision_per_class': precision_per_class,
+            'f1_per_class': f1_per_class,
+            'fpr_per_class': fpr_per_class,
+        }
+    
+    def on_epoch_end(self):
+        """
+        Override to log additional metrics after the standard Pseudo dice line.
+        """
+        from time import time
+        
+        self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
+
+        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
+        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
+                                               self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
+        
+        # Log additional rate-based metrics
+        if hasattr(self, '_test_additional_metrics') and self._test_additional_metrics is not None:
+            metrics = self._test_additional_metrics
+            self.print_to_log_file(f"Recall (%): {[np.round(r, 2) for r in metrics['recall_per_class']]}")
+            self.print_to_log_file(f"Precision (%): {[np.round(p, 2) for p in metrics['precision_per_class']]}")
+            self.print_to_log_file(f"F1: {[np.round(f, 4) for f in metrics['f1_per_class']]}")
+            self.print_to_log_file(f"FPR (%): {[np.round(f, 4) for f in metrics['fpr_per_class']]}")
+        
+        self.print_to_log_file(
+            f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
+
+        # handling periodic checkpointing
+        current_epoch = self.current_epoch
+        if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
+            self.save_checkpoint(join(self.output_folder, self.get_checkpoint_filename('checkpoint_latest')))
+
+        # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
+        current_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+        if self._best_ema is None or current_ema > self._best_ema:
+            # Use the new method that checks existing checkpoint before overwriting
+            if self.save_best_checkpoint_if_improved(current_ema):
+                self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
+
+        if self.local_rank == 0:
+            self.logger.plot_progress_png(self.output_folder)
+
+        self.current_epoch += 1
     
     def save_checkpoint(self, filename: str) -> None:
         """
-        Override to also save tuning metrics and centering probabilities in checkpoint.
+        Override to also save tuning metrics, centering probabilities, and 
+        original/synthetic sample handling info in checkpoint.
         """
         # Store tuning info and centering probabilities before saving
         self._tuning_checkpoint_data = {
@@ -800,13 +1156,21 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             'test_prob_random': self.test_prob_random,
             'test_prob_anatomy': self.test_prob_anatomy,
             'test_prob_tumor': self.test_prob_tumor,
+            # Original vs synthetic sample handling
+            'pattern_original_samples': self.pattern_original_samples,
+            'max_synthetic_ratio': self.max_synthetic_ratio,
+            'n_original_total': self.n_original_total,
+            'n_synthetic_total': self.n_synthetic_total,
+            'n_synthetic_removed': self.n_synthetic_removed,
+            'removed_synthetic_keys': self.removed_synthetic_keys,
         }
         
         super().save_checkpoint(filename)
     
     def load_checkpoint(self, filename_or_checkpoint) -> None:
         """
-        Override to also load tuning metrics and centering probabilities from checkpoint.
+        Override to also load tuning metrics, centering probabilities, and
+        original/synthetic sample handling info from checkpoint.
         """
         super().load_checkpoint(filename_or_checkpoint)
         
@@ -832,8 +1196,19 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             self.test_prob_anatomy = checkpoint.get('test_prob_anatomy', self.test_prob_anatomy)
             self.test_prob_tumor = checkpoint.get('test_prob_tumor', self.test_prob_tumor)
             
+            # Load original/synthetic sample handling info
+            self.pattern_original_samples = checkpoint.get('pattern_original_samples', self.pattern_original_samples)
+            self.max_synthetic_ratio = checkpoint.get('max_synthetic_ratio', self.max_synthetic_ratio)
+            self.n_original_total = checkpoint.get('n_original_total', self.n_original_total)
+            self.n_synthetic_total = checkpoint.get('n_synthetic_total', self.n_synthetic_total)
+            self.n_synthetic_removed = checkpoint.get('n_synthetic_removed', self.n_synthetic_removed)
+            self.removed_synthetic_keys = checkpoint.get('removed_synthetic_keys', self.removed_synthetic_keys)
+            
             self.print_to_log_file(f"Loaded tuning info: {len(self.tuning_keys)} tuning cases")
             self.print_to_log_file(f"Loaded centering probs - Train: ({self.train_prob_random:.2f}/{self.train_prob_anatomy:.2f}/{self.train_prob_tumor:.2f})")
+            if self.pattern_original_samples:
+                self.print_to_log_file(f"Loaded original/synthetic handling: pattern='{self.pattern_original_samples}', "
+                                       f"orig={self.n_original_total}, synth={self.n_synthetic_total}, removed={self.n_synthetic_removed}")
 
 
 # Convenience alias with shorter name
