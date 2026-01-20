@@ -209,7 +209,16 @@ def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool
                 expected_checkpoint_file = checkpoint_path
                 print(f"Using specified checkpoint for continue training: {expected_checkpoint_file}")
             else:
-                raise FileNotFoundError(f"Specified checkpoint file not found: {checkpoint_path}")
+                # raise FileNotFoundError(f"Specified checkpoint file not found: {checkpoint_path}")
+                # Instead of raising an error, ask the user to confirm if they want to continue training without a checkpoint
+                print(f"Specified checkpoint file not found: {checkpoint_path}")
+                print("Do you want to continue training without a checkpoint? (y/n)")
+                answer = input()
+                if answer == 'y':
+                    expected_checkpoint_file = None
+                    print("Continuing training without a checkpoint...")
+                else:
+                    raise FileNotFoundError(f"Specified checkpoint file not found: {checkpoint_path}")
         else:
             # Try new naming convention first, then fall back to old naming
             checkpoint_candidates = [
@@ -274,7 +283,7 @@ def cleanup_ddp():
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
             checkpoint_path=None, skip_manual_confirm=False, pattern_original_samples=None,
-            ignore_existing_best=False, skip_val=False):
+            ignore_existing_best=False, skip_val=False, ignore_synthetic=False):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -288,6 +297,10 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     # Set pattern for identifying original samples (used by nnUNetTrainer_WithTuningSet)
     if pattern_original_samples is not None:
         nnunet_trainer.pattern_original_samples = pattern_original_samples
+    
+    # If ignore_synthetic is set, exclude all synthetic data from training
+    if ignore_synthetic and hasattr(nnunet_trainer, 'max_synthetic_ratio'):
+        nnunet_trainer.max_synthetic_ratio = 0.0
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -343,7 +356,8 @@ def run_training(
     checkpoint_path: Optional[str] = None,           # args.checkpoint_path
     skip_manual_confirm: bool = False,               # args.skip_manual_confirm
     pattern_original_samples: Optional[str] = None,  # args.pattern_original_samples
-    ignore_existing_best: bool = False               # args.ignore_existing_best
+    ignore_existing_best: bool = False,              # args.ignore_existing_best
+    ignore_synthetic: bool = False                   # args.ignore_synthetic
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -391,7 +405,8 @@ def run_training(
                      skip_manual_confirm,
                      pattern_original_samples,
                      ignore_existing_best,
-                     skip_val),
+                     skip_val,
+                     ignore_synthetic),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -406,6 +421,10 @@ def run_training(
         # Set pattern for identifying original samples (used by nnUNetTrainer_WithTuningSet)
         if pattern_original_samples is not None:
             nnunet_trainer.pattern_original_samples = pattern_original_samples
+        
+        # If ignore_synthetic is set, exclude all synthetic data from training
+        if ignore_synthetic and hasattr(nnunet_trainer, 'max_synthetic_ratio'):
+            nnunet_trainer.max_synthetic_ratio = 0.0
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -500,6 +519,10 @@ def run_training_entry():
                         help='[OPTIONAL] If set, any existing best checkpoint in the output folder will be REMOVED '
                              'before training starts. This allows starting fresh without the accuracy threshold '
                              'from a previous training run. Use with caution!')
+    parser.add_argument('--ignore_synthetic', action='store_true', required=False,
+                        help='[OPTIONAL] If set, all synthetic samples (those NOT matching --pattern_original_samples) '
+                             'will be excluded from training. Requires --pattern_original_samples to be set. '
+                             'Only used by nnUNetTrainer_WithTuningSet.')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -520,7 +543,8 @@ def run_training_entry():
                  args.skip_val, device=device, checkpoint_signature=args.signature, splits_file=args.split,
                  checkpoint_path=args.checkpoint_path, skip_manual_confirm=args.skip_manual_confirm,
                  pattern_original_samples=args.pattern_original_samples,
-                 ignore_existing_best=args.ignore_existing_best)
+                 ignore_existing_best=args.ignore_existing_best,
+                 ignore_synthetic=args.ignore_synthetic)
 
 
 if __name__ == '__main__':
