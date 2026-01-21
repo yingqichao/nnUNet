@@ -3,18 +3,21 @@ Custom nnUNet Trainer with anatomy-tumor focused sampling.
 
 This trainer modifies the default patch sampling strategy:
 - Default nnUNet: 33% forced foreground (random class), 67% random
-- This trainer: 33% centered on tumor (label >= 2), 67% centered on anatomy (label 1)
+- This trainer: 33% centered on tumor (label 2 ONLY), 67% centered on anatomy (label 1)
 
 Label convention assumed:
 - Label 0: Background
 - Label 1: Anatomy (liver for LiTS, kidney for KiTS)
-- Label 2+: Tumor/lesion
+- Label 2: Tumor/lesion (PRIMARY focus for centering)
+- Label 3+: Other lesions like cyst (trained but NOT explicitly centered on)
 
 This ensures:
-- 33% of patches are guaranteed to contain tumor (centered on tumor voxel)
+- 33% of patches are guaranteed to contain tumor (centered on label 2 voxel)
 - 67% of patches are guaranteed to contain anatomy (centered on anatomy voxel)
 - No purely background patches
 - Better representation of small tumor regions in training
+- Labels >= 3 (e.g., cyst in KiTS) are included in training but don't get
+  explicit centering priority, avoiding excessive focus on secondary lesions
 
 Usage:
     nnUNetv2_train DATASET CONFIG FOLD -tr nnUNetTrainer_AnatomyTumorFocused
@@ -41,17 +44,19 @@ class nnUNetDataLoaderAnatomyTumorFocused(nnUNetDataLoader):
     Custom DataLoader that implements anatomy-tumor focused sampling.
     
     For each batch:
-    - Last (oversample_foreground_percent * batch_size) samples: centered on TUMOR (label >= 2)
+    - Last (oversample_foreground_percent * batch_size) samples: centered on TUMOR (label 2 ONLY)
     - Remaining samples: centered on ANATOMY (label 1)
     
     This ensures all patches contain meaningful foreground, with explicit control
-    over tumor vs anatomy representation.
+    over tumor vs anatomy representation. Labels >= 3 (e.g., cyst in KiTS) are 
+    trained but NOT explicitly centered on to avoid excessive focus on secondary lesions.
     """
     
     # Class labels for anatomy-tumor focused sampling
     BACKGROUND_LABEL = 0
     ANATOMY_LABEL = 1  # liver for LiTS, kidney for KiTS
-    # Labels >= 2 are considered tumor/lesion
+    PRIMARY_TUMOR_LABEL = 2  # Only label 2 is used for tumor-centered cropping
+    # Note: Labels >= 3 (e.g., cyst in KiTS) are trained but NOT explicitly centered on
     
     def __init__(self,
                  data: nnUNetBaseDataset,
@@ -77,8 +82,14 @@ class nnUNetDataLoaderAnatomyTumorFocused(nnUNetDataLoader):
             transforms=transforms
         )
         
-        # Get tumor labels (all labels >= 2)
-        self.tumor_labels = [l for l in label_manager.foreground_labels if l >= 2]
+        # Only use PRIMARY_TUMOR_LABEL (2) for tumor-centered cropping
+        # Labels >= 3 (e.g., cyst in KiTS) are trained but not explicitly centered on
+        if self.PRIMARY_TUMOR_LABEL not in label_manager.foreground_labels:
+            raise ValueError(
+                f"The dedicated tumor channel (2) is not found! Please note that "
+                f"{self.__class__.__name__} is designed for better tumor-focused training!"
+            )
+        self.tumor_labels = [self.PRIMARY_TUMOR_LABEL]
         self.anatomy_label = self.ANATOMY_LABEL
         
         # Override the oversampling function to use our custom logic
@@ -87,7 +98,7 @@ class nnUNetDataLoaderAnatomyTumorFocused(nnUNetDataLoader):
     
     def _tumor_oversample_last_XX_percent(self, sample_idx: int) -> bool:
         """
-        Returns True if this sample should be centered on TUMOR (label >= 2).
+        Returns True if this sample should be centered on TUMOR (label 2 ONLY).
         Returns False if this sample should be centered on ANATOMY (label 1).
         """
         return not sample_idx < round(self.batch_size * (1 - self.oversample_foreground_percent))
@@ -103,7 +114,7 @@ class nnUNetDataLoaderAnatomyTumorFocused(nnUNetDataLoader):
         
         Args:
             data_shape: Shape of the data (excluding channel dimension)
-            force_tumor: If True, center on tumor voxel. If False, center on anatomy voxel.
+            force_tumor: If True, center on tumor voxel (label 2 ONLY). If False, center on anatomy voxel.
             class_locations: Dict mapping class labels to voxel locations
             verbose: Whether to print debug info
             
@@ -123,12 +134,12 @@ class nnUNetDataLoaderAnatomyTumorFocused(nnUNetDataLoader):
         selected_class = None
         
         if force_tumor:
-            # Try to center on tumor (label >= 2)
+            # Try to center on tumor (label 2 ONLY - self.tumor_labels contains only PRIMARY_TUMOR_LABEL)
             tumor_classes_with_voxels = [l for l in self.tumor_labels 
                                          if l in class_locations and len(class_locations[l]) > 0]
             
             if len(tumor_classes_with_voxels) > 0:
-                # Randomly select one of the tumor classes (if multiple exist)
+                # Select tumor class (label 2)
                 selected_class = tumor_classes_with_voxels[np.random.choice(len(tumor_classes_with_voxels))]
                 if verbose:
                     print(f'Selected tumor class: {selected_class}')
@@ -233,18 +244,20 @@ class nnUNetTrainer_AnatomyTumorFocused(nnUNetTrainer):
     nnUNet Trainer with anatomy-tumor focused sampling strategy.
     
     Modifies the default sampling:
-    - 33% of patches: centered on TUMOR voxels (label >= 2)
+    - 33% of patches: centered on TUMOR voxels (label 2 ONLY)
     - 67% of patches: centered on ANATOMY voxels (label 1)
     
     This ensures:
     - All patches contain meaningful foreground (no pure background patches)
     - Tumor regions get adequate representation despite being small
     - Anatomy context is maintained in majority of patches
+    - Labels >= 3 (e.g., cyst in KiTS) are trained but not explicitly centered on
     
     Label convention:
     - Label 0: Background
     - Label 1: Anatomy (liver for LiTS, kidney for KiTS)  
-    - Label 2+: Tumor/lesion
+    - Label 2: Tumor/lesion (PRIMARY focus)
+    - Label 3+: Secondary lesions (trained but not centered on)
     
     Usage:
         nnUNetv2_train 602 3d_fullres 0 -tr nnUNetTrainer_AnatomyTumorFocused
@@ -261,11 +274,12 @@ class nnUNetTrainer_AnatomyTumorFocused(nnUNetTrainer):
         self.print_to_log_file("\n" + "=" * 70)
         self.print_to_log_file("Using nnUNetTrainer_AnatomyTumorFocused")
         self.print_to_log_file(f"TRAINING sampling strategy:")
-        self.print_to_log_file(f"  - {self.oversample_foreground_percent*100:.1f}% patches centered on TUMOR (label >= 2)")
+        self.print_to_log_file(f"  - {self.oversample_foreground_percent*100:.1f}% patches centered on TUMOR (label 2 ONLY)")
         self.print_to_log_file(f"  - {(1-self.oversample_foreground_percent)*100:.1f}% patches centered on ANATOMY (label 1)")
+        self.print_to_log_file(f"  - Labels >= 3 (e.g., cyst) are trained but NOT explicitly centered on")
         self.print_to_log_file(f"  - No purely background patches")
         self.print_to_log_file(f"VALIDATION (pseudo dice) sampling strategy:")
-        self.print_to_log_file(f"  - 100% patches centered on TUMOR (label >= 2)")
+        self.print_to_log_file(f"  - 100% patches centered on TUMOR (label 2 ONLY)")
         self.print_to_log_file("=" * 70 + "\n")
     
     def get_dataloaders(self):
@@ -360,8 +374,9 @@ class nnUNetTrainer_AnatomyTumorFocused50(nnUNetTrainer_AnatomyTumorFocused):
     """
     Same as nnUNetTrainer_AnatomyTumorFocused but with 50% tumor sampling.
     
-    - 50% of patches: centered on TUMOR voxels (label >= 2)
+    - 50% of patches: centered on TUMOR voxels (label 2 ONLY)
     - 50% of patches: centered on ANATOMY voxels (label 1)
+    - Labels >= 3 (e.g., cyst) are trained but NOT explicitly centered on
     """
     
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -377,9 +392,10 @@ class nnUNetTrainer_AnatomyTumorFocused50(nnUNetTrainer_AnatomyTumorFocused):
         self.print_to_log_file("\n" + "=" * 70)
         self.print_to_log_file("Using nnUNetTrainer_AnatomyTumorFocused50")
         self.print_to_log_file(f"TRAINING sampling strategy:")
-        self.print_to_log_file(f"  - 50% patches centered on TUMOR (label >= 2)")
+        self.print_to_log_file(f"  - 50% patches centered on TUMOR (label 2 ONLY)")
         self.print_to_log_file(f"  - 50% patches centered on ANATOMY (label 1)")
+        self.print_to_log_file(f"  - Labels >= 3 (e.g., cyst) are trained but NOT explicitly centered on")
         self.print_to_log_file(f"  - No purely background patches")
         self.print_to_log_file(f"VALIDATION (pseudo dice) sampling strategy:")
-        self.print_to_log_file(f"  - 100% patches centered on TUMOR (label >= 2)")
+        self.print_to_log_file(f"  - 100% patches centered on TUMOR (label 2 ONLY)")
         self.print_to_log_file("=" * 70 + "\n")

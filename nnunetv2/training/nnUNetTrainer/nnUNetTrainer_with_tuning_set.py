@@ -27,13 +27,14 @@ Evaluation order each epoch:
 Patch centering probabilities (configurable per mode):
 - prob_random: Center on random voxel (anywhere)
 - prob_anatomy: Center on random anatomy voxel (label 1)
-- prob_tumor: Center on random tumor voxel (label >= 2)
+- prob_tumor: Center on random tumor voxel (label 2 ONLY)
 (Probabilities must sum to 1.0)
 
 Label convention:
 - Label 0: Background
 - Label 1: Anatomy (liver for LiTS, kidney for KiTS)
-- Label 2+: Tumor/lesion
+- Label 2: Tumor/lesion (PRIMARY focus for centering)
+- Label 3+: Secondary lesions (e.g., cyst in KiTS - trained but NOT explicitly centered on)
 
 Usage:
     nnUNetv2_train DATASET CONFIG FOLD -tr nnUNetTrainer_WithTuningSet
@@ -572,15 +573,17 @@ class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
     For each sample in batch, randomly choose centering mode based on probabilities:
     - Random: Center on any random voxel
     - Anatomy: Center on random anatomy voxel (label 1)
-    - Tumor: Center on random tumor voxel (label >= 2)
+    - Tumor: Center on random tumor voxel (label 2 ONLY)
     
+    Note: Labels >= 3 (e.g., cyst in KiTS) are trained but NOT explicitly centered on.
     This provides fine-grained control over patch sampling strategy.
     """
     
     # Label conventions
     BACKGROUND_LABEL = 0
     ANATOMY_LABEL = 1  # liver for LiTS, kidney for KiTS
-    # Labels >= 2 are considered tumor/lesion
+    PRIMARY_TUMOR_LABEL = 2  # Only label 2 is used for tumor-centered cropping
+    # Note: Labels >= 3 (e.g., cyst in KiTS) are trained but NOT explicitly centered on
     
     def __init__(self,
                  data: nnUNetBaseDataset,
@@ -598,7 +601,7 @@ class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
         Args:
             prob_random: Probability of centering on random voxel
             prob_anatomy: Probability of centering on anatomy voxel (label 1)
-            prob_tumor: Probability of centering on tumor voxel (label >= 2)
+            prob_tumor: Probability of centering on tumor voxel (label 2 ONLY)
             
             Note: prob_random + prob_anatomy + prob_tumor must equal 1.0
         """
@@ -625,8 +628,14 @@ class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
         self.prob_anatomy = prob_anatomy
         self.prob_tumor = prob_tumor
         
-        # Get tumor labels (all labels >= 2)
-        self.tumor_labels = [l for l in label_manager.foreground_labels if l >= 2]
+        # Only use PRIMARY_TUMOR_LABEL (2) for tumor-centered cropping
+        # Labels >= 3 (e.g., cyst in KiTS) are trained but not explicitly centered on
+        if self.PRIMARY_TUMOR_LABEL not in label_manager.foreground_labels:
+            raise ValueError(
+                f"The dedicated tumor channel (2) is not found! Please note that "
+                f"{self.__class__.__name__} is designed for better tumor-focused training!"
+            )
+        self.tumor_labels = [self.PRIMARY_TUMOR_LABEL]
         self.anatomy_label = self.ANATOMY_LABEL
         
         # Counters for tracking actual centering modes used (including fallbacks)
@@ -653,7 +662,7 @@ class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
         Args:
             prob_random: Probability of centering on random voxel
             prob_anatomy: Probability of centering on anatomy voxel (label 1)
-            prob_tumor: Probability of centering on tumor voxel (label >= 2)
+            prob_tumor: Probability of centering on tumor voxel (label 2 ONLY)
         """
         total = prob_random + prob_anatomy + prob_tumor
         if not np.isclose(total, 1.0, atol=1e-6):
@@ -704,7 +713,7 @@ class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
         actual_mode = centering_mode  # Track actual mode used
         
         if centering_mode == 'tumor':
-            # Try to center on tumor (label >= 2)
+            # Try to center on tumor (label 2 ONLY - self.tumor_labels contains only PRIMARY_TUMOR_LABEL)
             tumor_classes_with_voxels = [l for l in self.tumor_labels 
                                          if class_locations and l in class_locations 
                                          and len(class_locations[l]) > 0]
@@ -869,7 +878,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Training: Where gradient updates happen
         self.train_prob_random = 0.25     # Center on random voxel
         self.train_prob_anatomy = 0.25   # Center on anatomy voxel (label 1)
-        self.train_prob_tumor = 0.5     # Center on tumor voxel (label >= 2)
+        self.train_prob_tumor = 0.5     # Center on tumor voxel (label 2 ONLY)
         
         # Tuning: For adaptive decisions (evaluation)
         self.tuning_prob_random = 0.0
@@ -1430,8 +1439,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         tuning_result = self.compute_tuning_metrics()
         
-        # Use TUMOR DICE ONLY for EMA calculation (index 1 = tumor, label >= 2)
-        # dice_per_class: [anatomy_dice, tumor_dice]
+        # Use TUMOR DICE ONLY for EMA calculation (index 1 = tumor, label 2)
+        # dice_per_class: [anatomy_dice, tumor_dice, ...] (index corresponds to foreground labels)
         tumor_dice = tuning_result['dice_per_class'][1] if len(tuning_result['dice_per_class']) > 1 else tuning_result['mean_fg_dice']
         
         # Compute EMA of tumor_dice (α=0.1)
@@ -1641,8 +1650,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         # KEY CHANGE: Use TUMOR DICE ONLY for EMA calculation
         # =====================================================================
-        # global_dc_per_class: [anatomy_dice, tumor_dice]
-        # Index 1 = tumor (label >= 2)
+        # global_dc_per_class: [anatomy_dice, tumor_dice, ...]
+        # Index 1 = tumor (label 2)
         tumor_dice = global_dc_per_class[1] if len(global_dc_per_class) > 1 else np.nanmean(global_dc_per_class)
         
         # Log tumor_dice as 'mean_fg_dice' - the logger will compute EMA from this
