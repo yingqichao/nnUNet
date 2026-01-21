@@ -50,7 +50,7 @@ from typing import List, Tuple, Union, Dict, Optional, Callable
 from threadpoolctl import threadpool_limits
 from collections import defaultdict
 from dataclasses import dataclass
-from batchgenerators.utilities.file_and_folder_operations import join
+from batchgenerators.utilities.file_and_folder_operations import join, isfile
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset
@@ -1094,6 +1094,15 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.probability_history: List[Tuple[float, float, float]] = []  # (random, anatomy, tumor)
         # =====================================================================
         
+        # =====================================================================
+        # TOP-K CHECKPOINT TRACKING
+        # =====================================================================
+        # Maintain top-K checkpoints ranked by tumor dice EMA
+        # Naming: checkpoint_best.pth (rank 1), checkpoint_best.pth.2 (rank 2), etc.
+        self.top_k_checkpoints = 5  # Number of top checkpoints to maintain
+        self.top_k_emas: List[Tuple[float, int]] = []  # List of (ema, epoch) sorted descending
+        # =====================================================================
+        
         self.print_to_log_file("\n" + "=" * 70)
         self.print_to_log_file("Using nnUNetTrainer_WithTuningSet")
         self.print_to_log_file("=" * 70)
@@ -1111,7 +1120,172 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"Dynamic sampling: {'ENABLED' if self.enable_dynamic_sampling else 'DISABLED'}")
         if self.enable_dynamic_sampling:
             self.print_to_log_file("  → Training probabilities will be adjusted based on tuning metrics")
+        self.print_to_log_file(f"Top-K checkpoints: Maintaining top {self.top_k_checkpoints} checkpoints by tumor dice EMA")
         self.print_to_log_file("=" * 70 + "\n")
+    
+    # =========================================================================
+    # TOP-K CHECKPOINT MANAGEMENT METHODS
+    # =========================================================================
+    
+    def get_top_k_checkpoint_path(self, rank: int) -> str:
+        """
+        Get checkpoint path for a given rank (1-5).
+        
+        Naming convention:
+        - Rank 1 (best): checkpoint_best_<plans>.pth
+        - Rank 2: checkpoint_best_<plans>.pth.2
+        - Rank 3: checkpoint_best_<plans>.pth.3
+        - etc.
+        
+        Args:
+            rank: Rank of the checkpoint (1 = best, 2 = second best, etc.)
+            
+        Returns:
+            Full path to the checkpoint file
+        """
+        base_path = join(self.output_folder, self.get_checkpoint_filename('checkpoint_best'))
+        if rank == 1:
+            return base_path
+        else:
+            return f"{base_path}.{rank}"
+    
+    def _scan_existing_top_k_checkpoints(self) -> List[Tuple[float, int]]:
+        """
+        Scan the output folder for existing top-k checkpoint files and reconstruct
+        the top_k_emas list from them.
+        
+        This provides backward compatibility when loading checkpoints that don't
+        have top_k_emas stored, or when resuming training with existing checkpoints.
+        
+        Returns:
+            List of (ema, epoch) tuples sorted descending by ema
+        """
+        top_k_list = []
+        
+        for rank in range(1, self.top_k_checkpoints + 1):
+            checkpoint_path = self.get_top_k_checkpoint_path(rank)
+            if isfile(checkpoint_path):
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                    ema = checkpoint.get('_best_ema', None)
+                    epoch = checkpoint.get('current_epoch', 0)
+                    if ema is not None:
+                        top_k_list.append((ema, epoch, rank))
+                        self.print_to_log_file(f"  Found existing checkpoint rank {rank}: EMA={ema:.4f}, epoch={epoch}")
+                except Exception as e:
+                    self.print_to_log_file(f"  Warning: Could not load checkpoint at rank {rank}: {e}")
+        
+        # Sort by EMA descending and drop rank info (used only for logging)
+        top_k_list.sort(key=lambda x: x[0], reverse=True)
+        return [(ema, epoch) for ema, epoch, _ in top_k_list]
+    
+    def _get_insertion_rank(self, current_ema: float) -> int:
+        """
+        Determine where the current EMA would rank in the top-k list.
+        
+        Args:
+            current_ema: Current epoch's tumor dice EMA
+            
+        Returns:
+            Rank (1-based) where this EMA would be inserted, or 0 if not in top-k
+        """
+        # Find insertion position (1-based rank)
+        for i, (ema, _) in enumerate(self.top_k_emas):
+            if current_ema > ema:
+                return i + 1  # 1-based rank
+        
+        # Check if we can add to the end (list not full yet)
+        if len(self.top_k_emas) < self.top_k_checkpoints:
+            return len(self.top_k_emas) + 1
+        
+        return 0  # Not in top-k
+    
+    def _shift_checkpoints_down(self, insert_rank: int) -> None:
+        """
+        Shift checkpoint files down to make room for a new checkpoint at insert_rank.
+        
+        Example: inserting at rank 3 with 5 existing checkpoints:
+        - Remove rank 5 file
+        - Rename rank 4 → rank 5
+        - Rename rank 3 → rank 4
+        - (Rank 3 slot is now free for the new checkpoint)
+        
+        Args:
+            insert_rank: The rank where the new checkpoint will be saved (1-based)
+        """
+        import os
+        
+        # Only shift if we have enough checkpoints that would be affected
+        max_existing_rank = min(len(self.top_k_emas), self.top_k_checkpoints)
+        
+        # If list is full, remove the last checkpoint file
+        if len(self.top_k_emas) >= self.top_k_checkpoints:
+            last_path = self.get_top_k_checkpoint_path(self.top_k_checkpoints)
+            if isfile(last_path):
+                try:
+                    os.remove(last_path)
+                except Exception as e:
+                    self.print_to_log_file(f"Warning: Could not remove rank {self.top_k_checkpoints} checkpoint: {e}")
+        
+        # Shift files down: from (max_existing_rank - 1) to insert_rank
+        # We shift backwards to avoid overwriting
+        for rank in range(min(max_existing_rank, self.top_k_checkpoints - 1), insert_rank - 1, -1):
+            src_path = self.get_top_k_checkpoint_path(rank)
+            dst_path = self.get_top_k_checkpoint_path(rank + 1)
+            if isfile(src_path):
+                try:
+                    os.rename(src_path, dst_path)
+                except Exception as e:
+                    self.print_to_log_file(f"Warning: Could not rename rank {rank} → {rank + 1}: {e}")
+    
+    def _update_top_k_checkpoints(self, current_ema: float, current_epoch: int) -> int:
+        """
+        Update top-k checkpoints if current EMA qualifies.
+        
+        This method:
+        1. Checks if current EMA ranks in top-k
+        2. If yes, shifts existing checkpoints and saves new one
+        3. Updates the top_k_emas list
+        
+        Args:
+            current_ema: Current epoch's tumor dice EMA
+            current_epoch: Current epoch number
+            
+        Returns:
+            The rank achieved (1-5), or 0 if not in top-k
+        """
+        # Get insertion rank
+        insert_rank = self._get_insertion_rank(current_ema)
+        
+        if insert_rank == 0:
+            return 0  # Not in top-k
+        
+        # Shift existing checkpoint files down
+        self._shift_checkpoints_down(insert_rank)
+        
+        # Save new checkpoint at the insertion rank
+        checkpoint_path = self.get_top_k_checkpoint_path(insert_rank)
+        
+        # Temporarily set _best_ema to current for saving
+        old_best_ema = self._best_ema
+        self._best_ema = current_ema
+        self.save_checkpoint(checkpoint_path)
+        
+        # Update _best_ema only if this is rank 1
+        if insert_rank != 1:
+            self._best_ema = old_best_ema
+        
+        # Update the in-memory list
+        # Insert at correct position (0-indexed)
+        self.top_k_emas.insert(insert_rank - 1, (current_ema, current_epoch))
+        
+        # Trim list to top_k_checkpoints
+        if len(self.top_k_emas) > self.top_k_checkpoints:
+            self.top_k_emas = self.top_k_emas[:self.top_k_checkpoints]
+        
+        return insert_rank
+    
+    # =========================================================================
     
     def _is_original_sample(self, key: str) -> bool:
         """
@@ -1906,12 +2080,38 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         if (current_epoch + 1) % self.save_every == 0 and current_epoch != (self.num_epochs - 1):
             self.save_checkpoint(join(self.output_folder, self.get_checkpoint_filename('checkpoint_latest')))
 
-        # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
+        # =====================================================================
+        # TOP-K CHECKPOINT HANDLING
+        # =====================================================================
+        # Use tumor dice EMA for checkpoint ranking
         current_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
-        if self._best_ema is None or current_ema > self._best_ema:
-            # Use the new method that checks existing checkpoint before overwriting
-            if self.save_best_checkpoint_if_improved(current_ema):
-                self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
+        
+        # Initialize top_k_emas from existing checkpoints if empty (e.g., first epoch or after loading)
+        if not self.top_k_emas:
+            self.print_to_log_file("Scanning for existing top-k checkpoints...")
+            self.top_k_emas = self._scan_existing_top_k_checkpoints()
+            if self.top_k_emas:
+                self.print_to_log_file(f"  Reconstructed top-{len(self.top_k_emas)} list from existing files")
+            else:
+                self.print_to_log_file("  No existing top-k checkpoints found")
+        
+        # Check if _skip_existing_best_comparison is set (--ignore_existing_best with --c)
+        skip_comparison = getattr(self, '_skip_existing_best_comparison', False)
+        if skip_comparison:
+            self.print_to_log_file(f"Skipping top-k comparison (--ignore_existing_best). Current EMA: {np.round(current_ema, decimals=4)}")
+            # Clear top_k_emas to start fresh
+            self.top_k_emas = []
+            self._skip_existing_best_comparison = False
+        
+        # Try to update top-k checkpoints
+        achieved_rank = self._update_top_k_checkpoints(current_ema, current_epoch)
+        
+        if achieved_rank > 0:
+            if achieved_rank == 1:
+                self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(current_ema, decimals=4)} (top-1)")
+            else:
+                self.print_to_log_file(f"New top-{achieved_rank} checkpoint! EMA: {np.round(current_ema, decimals=4)}")
+        # =====================================================================
 
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
@@ -1949,6 +2149,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             'enable_dynamic_sampling': self.enable_dynamic_sampling,
             'probability_history': self.probability_history,
             'dynamic_sampling_history': self.dynamic_sampling_strategy.get_history() if self.dynamic_sampling_strategy else None,
+            # Top-K checkpoint tracking
+            'top_k_checkpoints': self.top_k_checkpoints,
+            'top_k_emas': self.top_k_emas,
         }
         
         super().save_checkpoint(filename)
@@ -2019,6 +2222,15 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 self.dynamic_sampling_strategy.best_p_anatomy = saved_history.get('best_p_anatomy', None)
                 self.dynamic_sampling_strategy.best_epoch = saved_history.get('best_epoch', 0)
                 self.dynamic_sampling_strategy.reverted_count = saved_history.get('reverted_count', 0)
+            
+            # Load top-K checkpoint tracking
+            # Note: We don't load top_k_emas from the checkpoint data because we'll 
+            # reconstruct it by scanning existing files in on_epoch_end. This ensures
+            # consistency even if checkpoint files were manually moved/deleted.
+            # We only log that we'll scan for existing checkpoints later.
+            self.top_k_checkpoints = checkpoint.get('top_k_checkpoints', self.top_k_checkpoints)
+            # Keep top_k_emas empty - it will be populated by scanning files in on_epoch_end
+            self.top_k_emas = []
             
             self.print_to_log_file(f"Loaded tuning info: {len(self.tuning_keys)} tuning cases")
             self.print_to_log_file(f"Loaded centering probs - Train: ({self.train_prob_random:.2f}/{self.train_prob_anatomy:.2f}/{self.train_prob_tumor:.2f})")

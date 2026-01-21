@@ -85,10 +85,10 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
         4. Fold - the cross-validation fold number
         5. Output folder - where checkpoints and logs will be saved
         6. Splits file - the JSON file defining train/val splits (default or custom)
-        7. Existing best checkpoint info (if found):
-           - Checkpoint file path
-           - Best EMA pseudo Dice score achieved
-           - Epoch when checkpoint was saved
+        7. Existing top-K checkpoints info (if found):
+           - Checkpoint file paths and their ranks
+           - Best EMA pseudo Dice scores achieved
+           - Epochs when checkpoints were saved
            - Note about checkpoint overwrite policy
         8. Warning if --ignore_existing_best is set
     
@@ -98,18 +98,6 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
         ignore_existing_best: If True, show warning about best checkpoint handling
         continue_training: If True, indicates --c flag is set (affects warning message)
     """
-    # Try to find existing best checkpoint (new naming convention first, then old)
-    checkpoint_candidates = [
-        join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
-        join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
-    ]
-    
-    existing_checkpoint_path = None
-    for candidate in checkpoint_candidates:
-        if isfile(candidate):
-            existing_checkpoint_path = candidate
-            break
-    
     # Determine the splits file path
     if nnunet_trainer.splits_file is not None:
         splits_file_path = join(nnunet_trainer.preprocessed_dataset_folder_base, nnunet_trainer.splits_file)
@@ -125,34 +113,63 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
         f"Splits file: {splits_file_path}",
     ]
     
-    if existing_checkpoint_path is not None:
-        try:
-            checkpoint = torch.load(existing_checkpoint_path, map_location='cpu', weights_only=False)
-            existing_ema = checkpoint.get('_best_ema', None)
-            existing_epoch = checkpoint.get('current_epoch', 'unknown')
-            info_lines.append(f"\n*** EXISTING BEST CHECKPOINT FOUND ***")
-            info_lines.append(f"Checkpoint path: {existing_checkpoint_path}")
-            info_lines.append(f"Best EMA pseudo Dice: {existing_ema:.4f}" if existing_ema is not None else "Best EMA: Not recorded")
-            info_lines.append(f"Saved at epoch: {existing_epoch}")
-            info_lines.append(f"\nNOTE: New checkpoints will only be saved if they exceed this accuracy.")
-        except Exception as e:
-            info_lines.append(f"\n*** EXISTING BEST CHECKPOINT FOUND (but could not load) ***")
-            info_lines.append(f"Checkpoint path: {existing_checkpoint_path}")
-            info_lines.append(f"Error loading: {e}")
+    # Check for top-K checkpoints (if trainer supports it) or just the best checkpoint
+    has_top_k = hasattr(nnunet_trainer, 'get_top_k_checkpoint_path')
+    top_k = getattr(nnunet_trainer, 'top_k_checkpoints', 5) if has_top_k else 1
+    
+    found_checkpoints = []
+    
+    if has_top_k:
+        # Scan for top-K checkpoints
+        for rank in range(1, top_k + 1):
+            checkpoint_path = nnunet_trainer.get_top_k_checkpoint_path(rank)
+            if isfile(checkpoint_path):
+                try:
+                    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+                    ema = checkpoint.get('_best_ema', None)
+                    epoch = checkpoint.get('current_epoch', 'unknown')
+                    found_checkpoints.append((rank, checkpoint_path, ema, epoch))
+                except Exception as e:
+                    found_checkpoints.append((rank, checkpoint_path, None, f"Error: {e}"))
     else:
-        info_lines.append(f"\nNo existing best checkpoint found in output folder.")
+        # Fall back to old behavior - check for single best checkpoint
+        checkpoint_candidates = [
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
+            join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
+        ]
+        for candidate in checkpoint_candidates:
+            if isfile(candidate):
+                try:
+                    checkpoint = torch.load(candidate, map_location='cpu', weights_only=False)
+                    ema = checkpoint.get('_best_ema', None)
+                    epoch = checkpoint.get('current_epoch', 'unknown')
+                    found_checkpoints.append((1, candidate, ema, epoch))
+                except Exception as e:
+                    found_checkpoints.append((1, candidate, None, f"Error: {e}"))
+                break
+    
+    if found_checkpoints:
+        info_lines.append(f"\n*** EXISTING TOP-{len(found_checkpoints)} CHECKPOINTS FOUND ***")
+        for rank, path, ema, epoch in found_checkpoints:
+            ema_str = f"{ema:.4f}" if ema is not None else "Not recorded"
+            info_lines.append(f"  Rank {rank}: EMA={ema_str}, epoch={epoch}")
+            info_lines.append(f"           {path}")
+        info_lines.append(f"\nNOTE: New checkpoints will only be saved if they rank in top-{top_k}.")
+    else:
+        info_lines.append(f"\nNo existing checkpoints found in output folder.")
     
     # Add warning if --ignore_existing_best is set (message depends on --c flag)
     if ignore_existing_best:
         if continue_training:
             # With --c: checkpoint is loaded but _best_ema is reset (checkpoint file NOT removed)
             info_lines.append(f"\n*** NOTE: --ignore_existing_best with --c: "
-                              f"Checkpoint will be LOADED but _best_ema will be RESET to None. "
-                              f"Model weights loaded, best checkpoint selection starts fresh. ***")
+                              f"Checkpoint will be LOADED but top-K tracking will be RESET. "
+                              f"Model weights loaded, checkpoint ranking starts fresh. ***")
         else:
-            # Without --c: checkpoint file is removed
+            # Without --c: all checkpoint files are removed
+            num_to_remove = len(found_checkpoints) if found_checkpoints else 0
             info_lines.append(f"\n*** NOTE!!! You have set --ignore_existing_best, and this will accordingly "
-                              f"REMOVE the above checkpoint file if it exists! ***")
+                              f"REMOVE all {num_to_remove} checkpoint file(s) above! ***")
     
     info_str = "\n".join(info_lines)
     
@@ -168,11 +185,12 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
 
 def maybe_remove_existing_best_checkpoint(nnunet_trainer: nnUNetTrainer, ignore_existing_best: bool = False):
     """
-    Remove existing best checkpoint if --ignore_existing_best is set.
+    Remove existing best checkpoint(s) if --ignore_existing_best is set.
     
     This allows starting fresh without the accuracy threshold from a previous training run.
-    Both new naming convention (checkpoint_best_<plans>.pth) and old naming convention
-    (checkpoint_best.pth) are checked and removed.
+    For trainers with top-K checkpoint support, removes all top-K checkpoint files.
+    For standard trainers, removes both new naming convention (checkpoint_best_<plans>.pth) 
+    and old naming convention (checkpoint_best.pth).
     
     Args:
         nnunet_trainer: The initialized nnUNetTrainer instance
@@ -183,26 +201,48 @@ def maybe_remove_existing_best_checkpoint(nnunet_trainer: nnUNetTrainer, ignore_
     
     import os
     
-    # Check for existing best checkpoints (new naming convention first, then old)
-    checkpoint_candidates = [
+    checkpoint_candidates = []
+    
+    # Check if trainer supports top-K checkpoints
+    has_top_k = hasattr(nnunet_trainer, 'get_top_k_checkpoint_path')
+    
+    if has_top_k:
+        # Collect all top-K checkpoint paths
+        top_k = getattr(nnunet_trainer, 'top_k_checkpoints', 5)
+        for rank in range(1, top_k + 1):
+            checkpoint_candidates.append(nnunet_trainer.get_top_k_checkpoint_path(rank))
+    
+    # Also check for old naming convention (for backward compatibility)
+    checkpoint_candidates.extend([
         join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
         join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
-    ]
+    ])
     
-    removed_any = False
-    for checkpoint_path in checkpoint_candidates:
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_candidates = []
+    for c in checkpoint_candidates:
+        if c not in seen:
+            seen.add(c)
+            unique_candidates.append(c)
+    
+    removed_count = 0
+    for checkpoint_path in unique_candidates:
         if isfile(checkpoint_path):
             try:
                 os.remove(checkpoint_path)
-                print(f"*** REMOVED existing best checkpoint: {checkpoint_path}")
-                removed_any = True
+                print(f"*** REMOVED checkpoint: {checkpoint_path}")
+                removed_count += 1
             except Exception as e:
                 print(f"WARNING: Failed to remove checkpoint {checkpoint_path}: {e}")
     
-    # Also reset the trainer's _best_ema to None so it starts fresh
-    if removed_any:
+    # Reset trainer state
+    if removed_count > 0:
         nnunet_trainer._best_ema = None
-        print("*** Training will start fresh without accuracy threshold from previous run.")
+        # Also reset top_k_emas if available
+        if hasattr(nnunet_trainer, 'top_k_emas'):
+            nnunet_trainer.top_k_emas = []
+        print(f"*** REMOVED {removed_count} checkpoint(s). Training will start fresh.")
 
 
 def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool, validation_only: bool,
