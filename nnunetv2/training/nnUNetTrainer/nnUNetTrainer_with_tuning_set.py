@@ -18,19 +18,24 @@ Key features:
 - Original vs synthetic sample handling via --pattern_original_samples
 - Tuning set always uses ONLY original samples
 - Synthetic data ratio capped at 50% in training set
-- EMA pseudo dice based on TUMOR DICE ONLY (not mean of all foreground classes)
+- Checkpoint saved based on SINGLE-EPOCH TUMOR DICE (not EMA)
 
 Evaluation order each epoch:
 1. TUNING SET: Compute metrics (logged, for adaptive decisions)
 2. TEST SET: Compute pseudo dice (logged, for checkpoint selection)
-3. Checkpoint: "Yayy! New best EMA pseudo Dice" if improved (based on TEST tumor dice only)
+3. Checkpoint: "Yayy! New best pseudo Dice" if improved (based on TEST tumor dice only)
 
-Patch centering strategy:
-- TRAINING: Configurable 3-way probabilistic centering (random / anatomy / tumor)
-- EVALUATION (tuning & test): Dual-crop per sample
+Evaluation modes (configurable via self.eval_mode):
+- 'sliding_window': Full sliding window inference within GT anatomy bounding box
+  - More accurate, closer to real inference
+  - Computes metrics on full prediction within anatomy region
+- 'dual_crop': Two random patches per sample (legacy)
   - 1 patch centered on random anatomy voxel (evaluates FP control)
   - 1 patch centered on random tumor voxel (evaluates tumor detection)
-  - Doubles effective samples: N samples → 2N patches for balanced evaluation
+  - Faster but less representative of real inference
+
+Patch centering strategy for TRAINING:
+- Configurable 3-way probabilistic centering (random / anatomy / tumor)
 
 Label convention:
 - Label 0: Background
@@ -50,6 +55,9 @@ from typing import List, Tuple, Union, Dict, Optional, Callable
 from threadpoolctl import threadpool_limits
 from collections import defaultdict
 from dataclasses import dataclass
+from queue import Queue
+from threading import Thread
+from tqdm import tqdm
 from batchgenerators.utilities.file_and_folder_operations import join, isfile
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
@@ -58,7 +66,10 @@ from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
+from nnunetv2.inference.sliding_window_prediction import compute_steps_for_sliding_window, compute_gaussian
+from nnunetv2.utilities.helpers import empty_cache
 from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
+from acvl_utils.cropping_and_padding.padding import pad_nd_image
 
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
@@ -1097,10 +1108,22 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         # TOP-K CHECKPOINT TRACKING
         # =====================================================================
-        # Maintain top-K checkpoints ranked by tumor dice EMA
+        # Maintain top-K checkpoints ranked by tumor dice (single-epoch, NOT EMA)
         # Naming: checkpoint_best.pth (rank 1), checkpoint_best.pth.2 (rank 2), etc.
         self.top_k_checkpoints = 5  # Number of top checkpoints to maintain
-        self.top_k_emas: List[Tuple[float, int]] = []  # List of (ema, epoch) sorted descending
+        self.top_k_dices: List[Tuple[float, int]] = []  # List of (dice, epoch) sorted descending
+        # =====================================================================
+        
+        # =====================================================================
+        # EVALUATION MODE: 'sliding_window' or 'dual_crop'
+        # =====================================================================
+        # sliding_window: Full inference within GT anatomy bounding box (more accurate)
+        # dual_crop: Two random patches per sample (faster, legacy)
+        self.eval_mode = 'sliding_window'  # Default to sliding window for better accuracy
+        self.sliding_window_step_size = 0.5  # Step size for sliding window (0.5 = 50% overlap)
+        # Cache for anatomy bounding boxes (computed once, reused across epochs)
+        # Format: {case_key: (bbox_lbs, bbox_ubs)}
+        self._anatomy_bbox_cache: Dict[str, Tuple[List[int], List[int]]] = {}
         # =====================================================================
         
         self.print_to_log_file("\n" + "=" * 70)
@@ -1111,16 +1134,21 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file("Tuning set: For adaptive training decisions (NO leakage to test)")
         self.print_to_log_file("Test set: For final evaluation ONLY (original val fold)")
         self.print_to_log_file("-" * 70)
-        self.print_to_log_file("Patch centering strategy:")
-        self.print_to_log_file(f"  Training: 3-way probabilistic ({self.train_prob_random:.2f} / {self.train_prob_anatomy:.2f} / {self.train_prob_tumor:.2f})")
-        self.print_to_log_file(f"  Tuning:   Dual-crop (1 anatomy + 1 tumor per sample)")
-        self.print_to_log_file(f"  Test:     Dual-crop (1 anatomy + 1 tumor per sample)")
-        self.print_to_log_file("  → Evaluation: N samples → 2N patches (balanced FP control + tumor detection)")
+        self.print_to_log_file("Patch centering strategy (TRAINING):")
+        self.print_to_log_file(f"  3-way probabilistic ({self.train_prob_random:.2f} / {self.train_prob_anatomy:.2f} / {self.train_prob_tumor:.2f})")
+        self.print_to_log_file("-" * 70)
+        self.print_to_log_file(f"Evaluation mode: {self.eval_mode.upper()}")
+        if self.eval_mode == 'sliding_window':
+            self.print_to_log_file(f"  → Sliding window inference within GT anatomy bounding box")
+            self.print_to_log_file(f"  → Step size: {self.sliding_window_step_size} (overlap: {(1-self.sliding_window_step_size)*100:.0f}%)")
+        else:
+            self.print_to_log_file(f"  → Dual-crop: 1 anatomy + 1 tumor patch per sample")
+            self.print_to_log_file(f"  → N samples → 2N patches (balanced FP control + tumor detection)")
         self.print_to_log_file("-" * 70)
         self.print_to_log_file(f"Dynamic sampling: {'ENABLED' if self.enable_dynamic_sampling else 'DISABLED'}")
         if self.enable_dynamic_sampling:
             self.print_to_log_file("  → Training probabilities will be adjusted based on tuning metrics")
-        self.print_to_log_file(f"Top-K checkpoints: Maintaining top {self.top_k_checkpoints} checkpoints by tumor dice EMA")
+        self.print_to_log_file(f"Top-K checkpoints: Maintaining top {self.top_k_checkpoints} by single-epoch tumor Dice")
         self.print_to_log_file("=" * 70 + "\n")
     
     # =========================================================================
@@ -1152,13 +1180,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
     def _scan_existing_top_k_checkpoints(self) -> List[Tuple[float, int]]:
         """
         Scan the output folder for existing top-k checkpoint files and reconstruct
-        the top_k_emas list from them.
+        the top_k_dices list from them.
         
         This provides backward compatibility when loading checkpoints that don't
-        have top_k_emas stored, or when resuming training with existing checkpoints.
+        have top_k_dices stored, or when resuming training with existing checkpoints.
         
         Returns:
-            List of (ema, epoch) tuples sorted descending by ema
+            List of (dice, epoch) tuples sorted descending by dice
         """
         top_k_list = []
         
@@ -1167,36 +1195,37 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             if isfile(checkpoint_path):
                 try:
                     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-                    ema = checkpoint.get('_best_ema', None)
+                    # Try to get single-epoch dice first, fall back to _best_ema for compatibility
+                    dice = checkpoint.get('_best_dice', checkpoint.get('_best_ema', None))
                     epoch = checkpoint.get('current_epoch', 0)
-                    if ema is not None:
-                        top_k_list.append((ema, epoch, rank))
-                        self.print_to_log_file(f"  Found existing checkpoint rank {rank}: EMA={ema:.4f}, epoch={epoch}")
+                    if dice is not None:
+                        top_k_list.append((dice, epoch, rank))
+                        self.print_to_log_file(f"  Found existing checkpoint rank {rank}: Dice={dice:.4f}, epoch={epoch}")
                 except Exception as e:
                     self.print_to_log_file(f"  Warning: Could not load checkpoint at rank {rank}: {e}")
         
-        # Sort by EMA descending and drop rank info (used only for logging)
+        # Sort by dice descending and drop rank info (used only for logging)
         top_k_list.sort(key=lambda x: x[0], reverse=True)
-        return [(ema, epoch) for ema, epoch, _ in top_k_list]
+        return [(dice, epoch) for dice, epoch, _ in top_k_list]
     
-    def _get_insertion_rank(self, current_ema: float) -> int:
+    def _get_insertion_rank(self, current_dice: float) -> int:
         """
-        Determine where the current EMA would rank in the top-k list.
+        Determine where the current dice would rank in the top-k list.
         
         Args:
-            current_ema: Current epoch's tumor dice EMA
+            current_dice: Current epoch's tumor dice (single-epoch, not EMA)
             
         Returns:
-            Rank (1-based) where this EMA would be inserted, or 0 if not in top-k
+            Rank (1-based) where this dice would be inserted, or 0 if not in top-k
         """
         # Find insertion position (1-based rank)
-        for i, (ema, _) in enumerate(self.top_k_emas):
-            if current_ema > ema:
+        for i, (dice, _) in enumerate(self.top_k_dices):
+            if current_dice > dice:
                 return i + 1  # 1-based rank
         
         # Check if we can add to the end (list not full yet)
-        if len(self.top_k_emas) < self.top_k_checkpoints:
-            return len(self.top_k_emas) + 1
+        if len(self.top_k_dices) < self.top_k_checkpoints:
+            return len(self.top_k_dices) + 1
         
         return 0  # Not in top-k
     
@@ -1216,10 +1245,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         import os
         
         # Only shift if we have enough checkpoints that would be affected
-        max_existing_rank = min(len(self.top_k_emas), self.top_k_checkpoints)
+        max_existing_rank = min(len(self.top_k_dices), self.top_k_checkpoints)
         
         # If list is full, remove the last checkpoint file
-        if len(self.top_k_emas) >= self.top_k_checkpoints:
+        if len(self.top_k_dices) >= self.top_k_checkpoints:
             last_path = self.get_top_k_checkpoint_path(self.top_k_checkpoints)
             if isfile(last_path):
                 try:
@@ -1238,24 +1267,24 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 except Exception as e:
                     self.print_to_log_file(f"Warning: Could not rename rank {rank} → {rank + 1}: {e}")
     
-    def _update_top_k_checkpoints(self, current_ema: float, current_epoch: int) -> int:
+    def _update_top_k_checkpoints(self, current_dice: float, current_epoch: int) -> int:
         """
-        Update top-k checkpoints if current EMA qualifies.
+        Update top-k checkpoints if current dice qualifies.
         
         This method:
-        1. Checks if current EMA ranks in top-k
+        1. Checks if current dice ranks in top-k
         2. If yes, shifts existing checkpoints and saves new one
-        3. Updates the top_k_emas list
+        3. Updates the top_k_dices list
         
         Args:
-            current_ema: Current epoch's tumor dice EMA
+            current_dice: Current epoch's tumor dice (single-epoch, not EMA)
             current_epoch: Current epoch number
             
         Returns:
             The rank achieved (1-5), or 0 if not in top-k
         """
         # Get insertion rank
-        insert_rank = self._get_insertion_rank(current_ema)
+        insert_rank = self._get_insertion_rank(current_dice)
         
         if insert_rank == 0:
             return 0  # Not in top-k
@@ -1266,22 +1295,22 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Save new checkpoint at the insertion rank
         checkpoint_path = self.get_top_k_checkpoint_path(insert_rank)
         
-        # Temporarily set _best_ema to current for saving
-        old_best_ema = self._best_ema
-        self._best_ema = current_ema
+        # Store the dice value for this checkpoint
+        old_best_dice = getattr(self, '_best_dice', None)
+        self._best_dice = current_dice
         self.save_checkpoint(checkpoint_path)
         
-        # Update _best_ema only if this is rank 1
+        # Update _best_dice only if this is rank 1
         if insert_rank != 1:
-            self._best_ema = old_best_ema
+            self._best_dice = old_best_dice
         
         # Update the in-memory list
         # Insert at correct position (0-indexed)
-        self.top_k_emas.insert(insert_rank - 1, (current_ema, current_epoch))
+        self.top_k_dices.insert(insert_rank - 1, (current_dice, current_epoch))
         
         # Trim list to top_k_checkpoints
-        if len(self.top_k_emas) > self.top_k_checkpoints:
-            self.top_k_emas = self.top_k_emas[:self.top_k_checkpoints]
+        if len(self.top_k_dices) > self.top_k_checkpoints:
+            self.top_k_dices = self.top_k_dices[:self.top_k_checkpoints]
         
         return insert_rank
     
@@ -1603,7 +1632,12 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Initialize by fetching first batch
         _ = next(self.tuning_dataloader)
         
-        self.print_to_log_file(f"Created tuning dataloader with dual-crop eval (anatomy + tumor per sample)")
+        # Log the actual evaluation mode (DataLoader is created for both modes, but may not be used)
+        if self.eval_mode == 'sliding_window':
+            self.print_to_log_file(f"Created tuning dataloader (for dual-crop fallback)")
+            self.print_to_log_file(f"  → Actual eval mode: SLIDING WINDOW within GT anatomy bbox")
+        else:
+            self.print_to_log_file(f"Created tuning dataloader with dual-crop eval (anatomy + tumor per sample)")
     
     def on_train_epoch_start(self):
         """
@@ -1637,12 +1671,365 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Call parent's on_train_epoch_end
         super().on_train_epoch_end(train_outputs)
     
+    # =========================================================================
+    # SLIDING WINDOW EVALUATION METHODS
+    # =========================================================================
+    
+    def _get_anatomy_bounding_box(self, segmentation: np.ndarray, 
+                                   anatomy_label: int = 1,
+                                   margin: int = 5,
+                                   cache_key: str = None) -> Tuple[List[int], List[int]]:
+        """
+        Get bounding box of the anatomy region (label 1) from GT segmentation.
+        
+        Uses caching to avoid recomputation across epochs since GT doesn't change.
+        
+        Args:
+            segmentation: Ground truth segmentation array (no channel dim)
+            anatomy_label: Label value for anatomy (default 1)
+            margin: Margin to add around the bounding box in voxels
+            cache_key: Optional key for caching (e.g., case_id)
+            
+        Returns:
+            bbox_lbs, bbox_ubs: Lower and upper bounds for each dimension
+        """
+        # Check cache first
+        if cache_key is not None and cache_key in self._anatomy_bbox_cache:
+            return self._anatomy_bbox_cache[cache_key]
+        
+        # Find where anatomy exists
+        anatomy_mask = (segmentation == anatomy_label)
+        
+        if not np.any(anatomy_mask):
+            # No anatomy found, return full image bounds
+            bbox_lbs = [0] * len(segmentation.shape)
+            bbox_ubs = list(segmentation.shape)
+        else:
+            # Get coordinates where anatomy exists
+            coords = np.where(anatomy_mask)
+            
+            bbox_lbs = []
+            bbox_ubs = []
+            
+            for dim in range(len(segmentation.shape)):
+                dim_coords = coords[dim]
+                lb = max(0, int(np.min(dim_coords)) - margin)
+                ub = min(segmentation.shape[dim], int(np.max(dim_coords)) + margin + 1)
+                bbox_lbs.append(lb)
+                bbox_ubs.append(ub)
+        
+        # Cache the result
+        if cache_key is not None:
+            self._anatomy_bbox_cache[cache_key] = (bbox_lbs, bbox_ubs)
+        
+        return bbox_lbs, bbox_ubs
+    
+    def _get_sliding_window_slicers(self, image_size: Tuple[int, ...], 
+                                     patch_size: Tuple[int, ...],
+                                     step_size: float = 0.5) -> List[Tuple]:
+        """
+        Compute sliding window positions for inference.
+        
+        Args:
+            image_size: Size of the image region (D, H, W)
+            patch_size: Size of patches for inference
+            step_size: Overlap between patches (0.5 = 50% overlap)
+            
+        Returns:
+            List of slicers for extracting patches
+        """
+        # Ensure image is at least patch size (pad if needed)
+        adjusted_size = [max(i, p) for i, p in zip(image_size, patch_size)]
+        
+        steps = compute_steps_for_sliding_window(tuple(adjusted_size), tuple(patch_size), step_size)
+        
+        slicers = []
+        for sx in steps[0]:
+            for sy in steps[1]:
+                for sz in steps[2]:
+                    slicers.append(
+                        tuple([slice(si, si + ti) for si, ti in zip((sx, sy, sz), patch_size)])
+                    )
+        
+        return slicers
+    
+    @torch.inference_mode()
+    def _sliding_window_inference(self, data: torch.Tensor, 
+                                   use_gaussian: bool = True) -> torch.Tensor:
+        """
+        Perform sliding window inference on preprocessed data.
+        
+        Args:
+            data: Input tensor of shape (C, D, H, W)
+            use_gaussian: Whether to use Gaussian weighting for aggregation
+            
+        Returns:
+            Predicted logits of same spatial shape as input
+        """
+        patch_size = self.configuration_manager.patch_size
+        step_size = self.sliding_window_step_size
+        
+        # Pad to ensure divisible by patch size
+        data_padded, slicer_revert = pad_nd_image(data, patch_size, 'constant', {'value': 0}, True, None)
+        
+        # Get slicers
+        slicers = self._get_sliding_window_slicers(data_padded.shape[1:], patch_size, step_size)
+        
+        # Initialize prediction arrays
+        predicted_logits = torch.zeros(
+            (self.label_manager.num_segmentation_heads, *data_padded.shape[1:]),
+            dtype=torch.half,
+            device=self.device
+        )
+        n_predictions = torch.zeros(data_padded.shape[1:], dtype=torch.half, device=self.device)
+        
+        # Gaussian weighting
+        if use_gaussian:
+            gaussian = compute_gaussian(tuple(patch_size), sigma_scale=1./8, 
+                                        value_scaling_factor=10, device=self.device)
+        else:
+            gaussian = 1
+        
+        # Move data to device
+        data_padded = data_padded.to(self.device)
+        
+        # Process each patch
+        for sl in slicers:
+            # Extract patch: sl is for spatial dims, need to add channel dim
+            patch = data_padded[(slice(None),) + sl][None]  # Add batch dim
+            
+            # Forward pass
+            pred = self.network(patch)[0]  # Remove batch dim
+            
+            if self.enable_deep_supervision:
+                pred = pred[0]  # Take first output (highest resolution)
+            
+            if use_gaussian:
+                pred = pred * gaussian
+            
+            # Aggregate
+            predicted_logits[(slice(None),) + sl] += pred
+            n_predictions[sl] += gaussian
+        
+        # Normalize by prediction counts
+        torch.div(predicted_logits, n_predictions, out=predicted_logits)
+        
+        # Revert padding
+        predicted_logits = predicted_logits[(slice(None),) + slicer_revert[1:]]
+        
+        return predicted_logits
+    
+    def _compute_metrics_from_prediction(self, 
+                                         predicted_logits: torch.Tensor,
+                                         target_seg: torch.Tensor,
+                                         loss_fn = None) -> dict:
+        """
+        Compute TP/FP/FN/TN from predicted logits and target segmentation.
+        
+        Args:
+            predicted_logits: Predicted logits (num_classes, D, H, W)
+            target_seg: Target segmentation (1, D, H, W) or (D, H, W)
+            loss_fn: Optional loss function to compute loss
+            
+        Returns:
+            Dict with tp_hard, fp_hard, fn_hard, tn_hard, loss
+        """
+        # Ensure target has channel dimension
+        if target_seg.ndim == 3:
+            target_seg = target_seg.unsqueeze(0)
+        
+        # Convert logits to segmentation
+        if self.label_manager.has_regions:
+            predicted_seg_onehot = (torch.sigmoid(predicted_logits) > 0.5).long()
+        else:
+            output_seg = predicted_logits.argmax(0, keepdim=True)
+            predicted_seg_onehot = torch.zeros(predicted_logits.shape, device=predicted_logits.device, dtype=torch.float32)
+            predicted_seg_onehot.scatter_(0, output_seg, 1)
+        
+        # Add batch dimension for get_tp_fp_fn_tn
+        predicted_seg_onehot = predicted_seg_onehot.unsqueeze(0)
+        target_seg = target_seg.unsqueeze(0)
+        
+        # Convert target to one-hot if needed
+        if not self.label_manager.has_regions:
+            target_onehot = torch.zeros(predicted_seg_onehot.shape, device=target_seg.device, dtype=torch.float32)
+            target_onehot.scatter_(1, target_seg.long(), 1)
+        else:
+            target_onehot = target_seg
+        
+        axes = [0] + list(range(2, predicted_seg_onehot.ndim))
+        tp, fp, fn, tn = get_tp_fp_fn_tn(predicted_seg_onehot, target_onehot, axes=axes, mask=None)
+        
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        tn_hard = tn.detach().cpu().numpy()
+        
+        if not self.label_manager.has_regions:
+            tp_hard = tp_hard[1:]  # Skip background
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+            tn_hard = tn_hard[1:]
+        
+        # Compute loss if provided
+        loss_value = 0.0
+        if loss_fn is not None:
+            with torch.no_grad():
+                loss_value = loss_fn(predicted_logits.unsqueeze(0), target_seg).item()
+        
+        return {
+            'tp_hard': tp_hard,
+            'fp_hard': fp_hard,
+            'fn_hard': fn_hard,
+            'tn_hard': tn_hard,
+            'loss': loss_value
+        }
+    
+    def compute_metrics_sliding_window(self, dataset, keys: List[str], 
+                                        num_samples: int = None,
+                                        progress_desc: str = "Sliding Window Eval") -> dict:
+        """
+        Compute metrics using sliding window inference within GT anatomy bounding box.
+        
+        For each sample:
+        1. Load preprocessed data
+        2. Get GT anatomy bounding box (cached for efficiency)
+        3. Crop data to bounding box (with padding to patch size)
+        4. Run sliding window inference
+        5. Compute metrics
+        
+        Args:
+            dataset: nnUNet dataset with preprocessed data
+            keys: List of case keys to evaluate
+            num_samples: Max number of samples (None = all)
+            progress_desc: Description for progress bar
+            
+        Returns:
+            Aggregated metrics dict
+        """
+        self.network.eval()
+        
+        if num_samples is not None:
+            keys = keys[:num_samples]
+        
+        all_outputs = []
+        patch_size = self.configuration_manager.patch_size
+        
+        # Check cache status
+        cached_keys = [k for k in keys if k in self._anatomy_bbox_cache]
+        if cached_keys:
+            self.print_to_log_file(f"  Using {len(cached_keys)}/{len(keys)} cached anatomy bboxes")
+        
+        with torch.no_grad():
+            # Only show progress bar on main process (local_rank == 0)
+            for key in tqdm(keys, desc=progress_desc, disable=self.local_rank != 0):
+                try:
+                    # Load preprocessed data
+                    data, seg, seg_prev, properties = dataset.load_case(key)
+                    
+                    # Get GT anatomy bounding box (cached to avoid recomputation)
+                    # seg shape: (1, D, H, W) or (D, H, W)
+                    seg_np = seg[0] if seg.ndim == 4 else seg
+                    bbox_lbs, bbox_ubs = self._get_anatomy_bounding_box(
+                        seg_np, anatomy_label=1, margin=10, cache_key=key
+                    )
+                    
+                    # Ensure bbox is at least patch size
+                    for dim in range(len(bbox_lbs)):
+                        current_size = bbox_ubs[dim] - bbox_lbs[dim]
+                        if current_size < patch_size[dim]:
+                            # Expand the bounding box
+                            expand_needed = patch_size[dim] - current_size
+                            expand_start = expand_needed // 2
+                            expand_end = expand_needed - expand_start
+                            bbox_lbs[dim] = max(0, bbox_lbs[dim] - expand_start)
+                            bbox_ubs[dim] = min(seg_np.shape[dim], bbox_ubs[dim] + expand_end)
+                    
+                    # Create slicers
+                    bbox_slicer = tuple(slice(lb, ub) for lb, ub in zip(bbox_lbs, bbox_ubs))
+                    
+                    # Crop data and segmentation to bounding box
+                    data_cropped = data[(slice(None),) + bbox_slicer]  # (C, d, h, w)
+                    seg_cropped = seg[(slice(None),) + bbox_slicer]    # (1, d, h, w)
+                    
+                    # Convert to tensor
+                    data_tensor = torch.from_numpy(data_cropped).float()
+                    seg_tensor = torch.from_numpy(seg_cropped).long().to(self.device)
+                    
+                    # Run sliding window inference
+                    predicted_logits = self._sliding_window_inference(data_tensor)
+                    
+                    # Compute metrics
+                    metrics = self._compute_metrics_from_prediction(
+                        predicted_logits, seg_tensor, loss_fn=None
+                    )
+                    all_outputs.append(metrics)
+                    
+                except Exception as e:
+                    self.print_to_log_file(f"  Warning: Failed to process {key}: {e}")
+                    continue
+        
+        self.network.train()
+        
+        if not all_outputs:
+            # Return empty metrics
+            num_classes = len(self.label_manager.foreground_labels)
+            return {
+                'dice_per_class': [0.0] * num_classes,
+                'mean_fg_dice': 0.0,
+                'loss': 0.0,
+                'tp_per_class': [0] * num_classes,
+                'fp_per_class': [0] * num_classes,
+                'fn_per_class': [0] * num_classes,
+                'tn_per_class': [0] * num_classes,
+                'recall_per_class': [0.0] * num_classes,
+                'precision_per_class': [0.0] * num_classes,
+                'f1_per_class': [0.0] * num_classes,
+                'fpr_per_class': [0.0] * num_classes,
+            }
+        
+        # Aggregate results
+        outputs_collated = collate_outputs(all_outputs)
+        tp = np.sum(outputs_collated['tp_hard'], 0)
+        fp = np.sum(outputs_collated['fp_hard'], 0)
+        fn = np.sum(outputs_collated['fn_hard'], 0)
+        tn = np.sum(outputs_collated['tn_hard'], 0)
+        
+        # Compute metrics
+        dice_per_class = [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0.0 
+                         for i, j, k in zip(tp, fp, fn)]
+        mean_fg_dice = float(np.nanmean(dice_per_class))
+        mean_loss = float(np.mean(outputs_collated['loss']))
+        
+        recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fn)]
+        precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fp)]
+        f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
+                       for p, r in zip(precision_per_class, recall_per_class)]
+        fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 for f, t in zip(fp, tn)]
+        
+        return {
+            'dice_per_class': dice_per_class,
+            'mean_fg_dice': mean_fg_dice,
+            'loss': mean_loss,
+            'tp_per_class': tp.tolist(),
+            'fp_per_class': fp.tolist(),
+            'fn_per_class': fn.tolist(),
+            'tn_per_class': tn.tolist(),
+            'recall_per_class': recall_per_class,
+            'precision_per_class': precision_per_class,
+            'f1_per_class': f1_per_class,
+            'fpr_per_class': fpr_per_class,
+        }
+    
+    # =========================================================================
+    # END SLIDING WINDOW EVALUATION METHODS
+    # =========================================================================
+    
     def compute_tuning_metrics(self) -> dict:
         """
         Compute metrics on the tuning set.
         
-        This is similar to validation_step but on the tuning set.
-        These metrics can be used for adaptive training decisions.
+        Uses either sliding_window or dual_crop mode based on self.eval_mode.
         
         Returns:
             Dictionary with per-class metrics:
@@ -1654,6 +2041,24 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             - 'precision_per_class': TP / (TP + FP) in percent
             - 'f1_per_class': 2 * precision * recall / (precision + recall)
             - 'fpr_per_class': FP / (FP + TN) in percent (False Positive Rate)
+        """
+        if self.eval_mode == 'sliding_window':
+            # Use sliding window inference within GT anatomy bounding box
+            return self.compute_metrics_sliding_window(
+                self.tuning_dataset, 
+                self.tuning_keys,
+                num_samples=None,  # Use all tuning samples
+                progress_desc="Tuning SW Eval"
+            )
+        else:
+            # Use dual-crop evaluation (legacy)
+            return self._compute_tuning_metrics_dual_crop()
+    
+    def _compute_tuning_metrics_dual_crop(self) -> dict:
+        """
+        Compute tuning metrics using dual-crop evaluation (legacy method).
+        
+        For each sample, creates two patches: one anatomy-centered, one tumor-centered.
         """
         self.network.eval()
         
@@ -1893,8 +2298,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         self.print_to_log_file("-" * 40)
         self.print_to_log_file("TEST SET evaluation (for checkpoint selection):")
-        if self._best_ema is not None:
-            self.print_to_log_file(f"  [Reminder] Current best EMA pseudo Dice (tumor): {np.round(self._best_ema, decimals=4)}")
+        # Log top-k checkpoints status
+        if self.top_k_dices:
+            self.print_to_log_file(f"  [Reminder] Current top-{len(self.top_k_dices)} pseudo Dice (tumor, single-epoch):")
+            for rank, (dice, epoch) in enumerate(self.top_k_dices, 1):
+                self.print_to_log_file(f"    Rank {rank}: {np.round(dice, decimals=4)} (epoch {epoch})")
+        elif getattr(self, '_best_dice', None) is not None:
+            # Fallback if top_k_dices not populated yet but _best_dice exists
+            self.print_to_log_file(f"  [Reminder] Current best pseudo Dice (tumor): {np.round(self._best_dice, decimals=4)}")
         else:
             self.print_to_log_file(f"  [Reminder] No best checkpoint yet (first evaluation)")
     
@@ -1964,80 +2375,98 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
     
     def on_validation_epoch_end(self, val_outputs: list):
         """
-        Override to use TUMOR DICE ONLY for EMA calculation instead of mean foreground dice.
-        Also computes and logs additional metrics: Recall, Precision, F1, FPR.
+        Override to support both dual-crop and sliding window evaluation modes.
+        Uses TUMOR DICE ONLY for checkpoint selection.
         
-        dice_per_class_or_region: [anatomy_dice, tumor_dice]
-        We use index 1 (tumor) for the EMA that determines checkpoint selection.
+        In sliding_window mode: Computes test metrics using sliding window inference
+        In dual_crop mode: Uses the val_outputs from parent's validation loop
         """
         from torch import distributed as dist
         
-        outputs_collated = collate_outputs(val_outputs)
-        tp = np.sum(outputs_collated['tp_hard'], 0)
-        fp = np.sum(outputs_collated['fp_hard'], 0)
-        fn = np.sum(outputs_collated['fn_hard'], 0)
-        tn = np.sum(outputs_collated['tn_hard'], 0)
-
-        if self.is_ddp:
-            world_size = dist.get_world_size()
-
-            tps = [None for _ in range(world_size)]
-            dist.all_gather_object(tps, tp)
-            tp = np.vstack([i[None] for i in tps]).sum(0)
-
-            fps = [None for _ in range(world_size)]
-            dist.all_gather_object(fps, fp)
-            fp = np.vstack([i[None] for i in fps]).sum(0)
-
-            fns = [None for _ in range(world_size)]
-            dist.all_gather_object(fns, fn)
-            fn = np.vstack([i[None] for i in fns]).sum(0)
+        if self.eval_mode == 'sliding_window':
+            # =====================================================================
+            # SLIDING WINDOW MODE: Use sliding window inference for test set
+            # =====================================================================
+            # Use the already-initialized test dataset via self._dl_val
+            # _dl_val is the nnUNetDataLoaderDualCropEval we created in get_dataloaders()
             
-            tns = [None for _ in range(world_size)]
-            dist.all_gather_object(tns, tn)
-            tn = np.vstack([i[None] for i in tns]).sum(0)
-
-            losses_val = [None for _ in range(world_size)]
-            dist.all_gather_object(losses_val, outputs_collated['loss'])
-            loss_here = np.vstack(losses_val).mean()
+            # Get test keys from the dataloader's dataset
+            test_keys = list(self._dl_val._data.keys)
+            
+            self.print_to_log_file(f"  Running sliding window evaluation on {len(test_keys)} test samples...")
+            
+            test_result = self.compute_metrics_sliding_window(
+                self._dl_val._data,  # The underlying dataset
+                test_keys,
+                num_samples=None,  # Use all test samples
+                progress_desc="Test SW Eval"
+            )
+            
+            global_dc_per_class = test_result['dice_per_class']
+            recall_per_class = test_result['recall_per_class']
+            precision_per_class = test_result['precision_per_class']
+            f1_per_class = test_result['f1_per_class']
+            fpr_per_class = test_result['fpr_per_class']
+            loss_here = test_result['loss']
         else:
-            loss_here = np.mean(outputs_collated['loss'])
+            # =====================================================================
+            # DUAL-CROP MODE: Use the val_outputs from parent's validation loop
+            # =====================================================================
+            outputs_collated = collate_outputs(val_outputs)
+            tp = np.sum(outputs_collated['tp_hard'], 0)
+            fp = np.sum(outputs_collated['fp_hard'], 0)
+            fn = np.sum(outputs_collated['fn_hard'], 0)
+            tn = np.sum(outputs_collated['tn_hard'], 0)
 
-        # Compute Dice per class: 2*TP / (2*TP + FP + FN)
-        global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
-        
-        # Compute additional metrics per class
-        # Recall (Sensitivity): TP / (TP + FN)
-        recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 
-                           for t, f in zip(tp, fn)]
-        
-        # Precision (Positive Predictive Value): TP / (TP + FP)
-        precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 
-                              for t, f in zip(tp, fp)]
-        
-        # F1 Score: 2 * precision * recall / (precision + recall)
-        f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
-                       for p, r in zip(precision_per_class, recall_per_class)]
-        
-        # False Positive Rate: FP / (FP + TN)
-        fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 
-                        for f, t in zip(fp, tn)]
+            if self.is_ddp:
+                world_size = dist.get_world_size()
+
+                tps = [None for _ in range(world_size)]
+                dist.all_gather_object(tps, tp)
+                tp = np.vstack([i[None] for i in tps]).sum(0)
+
+                fps = [None for _ in range(world_size)]
+                dist.all_gather_object(fps, fp)
+                fp = np.vstack([i[None] for i in fps]).sum(0)
+
+                fns = [None for _ in range(world_size)]
+                dist.all_gather_object(fns, fn)
+                fn = np.vstack([i[None] for i in fns]).sum(0)
+                
+                tns = [None for _ in range(world_size)]
+                dist.all_gather_object(tns, tn)
+                tn = np.vstack([i[None] for i in tns]).sum(0)
+
+                losses_val = [None for _ in range(world_size)]
+                dist.all_gather_object(losses_val, outputs_collated['loss'])
+                loss_here = np.vstack(losses_val).mean()
+            else:
+                loss_here = np.mean(outputs_collated['loss'])
+
+            # Compute Dice per class: 2*TP / (2*TP + FP + FN)
+            global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
+            
+            # Compute additional metrics per class
+            recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fn)]
+            precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fp)]
+            f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
+                           for p, r in zip(precision_per_class, recall_per_class)]
+            fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 for f, t in zip(fp, tn)]
         
         # =====================================================================
-        # KEY CHANGE: Use TUMOR DICE ONLY for EMA calculation
+        # Use TUMOR DICE ONLY for checkpoint selection (single-epoch, not EMA)
         # =====================================================================
         # global_dc_per_class: [anatomy_dice, tumor_dice, ...]
         # Index 1 = tumor (label 2)
         tumor_dice = global_dc_per_class[1] if len(global_dc_per_class) > 1 else np.nanmean(global_dc_per_class)
         
-        # Log tumor_dice as 'mean_fg_dice' - the logger will compute EMA from this
-        # This makes the checkpoint selection based on tumor dice EMA
+        # Log tumor_dice as 'mean_fg_dice' - used for checkpoint selection
+        # Note: Logger will still compute EMA, but we use single-epoch dice for checkpointing
         self.logger.log('mean_fg_dice', tumor_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
         
-        # Log additional rate-based metrics for test set (will appear after "Pseudo dice" in on_epoch_end)
-        # Store for logging in on_epoch_end
+        # Store additional metrics for logging in on_epoch_end
         self._test_additional_metrics = {
             'recall_per_class': recall_per_class,
             'precision_per_class': precision_per_class,
@@ -2083,34 +2512,35 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         # TOP-K CHECKPOINT HANDLING
         # =====================================================================
-        # Use tumor dice EMA for checkpoint ranking
-        current_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+        # Use single-epoch tumor dice for checkpoint ranking (NOT EMA)
+        # mean_fg_dice is actually tumor_dice for this trainer (see on_validation_epoch_end)
+        current_dice = self.logger.my_fantastic_logging['mean_fg_dice'][-1]
         
-        # Initialize top_k_emas from existing checkpoints if empty (e.g., first epoch or after loading)
-        if not self.top_k_emas:
+        # Initialize top_k_dices from existing checkpoints if empty (e.g., first epoch or after loading)
+        if not self.top_k_dices:
             self.print_to_log_file("Scanning for existing top-k checkpoints...")
-            self.top_k_emas = self._scan_existing_top_k_checkpoints()
-            if self.top_k_emas:
-                self.print_to_log_file(f"  Reconstructed top-{len(self.top_k_emas)} list from existing files")
+            self.top_k_dices = self._scan_existing_top_k_checkpoints()
+            if self.top_k_dices:
+                self.print_to_log_file(f"  Reconstructed top-{len(self.top_k_dices)} list from existing files")
             else:
                 self.print_to_log_file("  No existing top-k checkpoints found")
         
         # Check if _skip_existing_best_comparison is set (--ignore_existing_best with --c)
         skip_comparison = getattr(self, '_skip_existing_best_comparison', False)
         if skip_comparison:
-            self.print_to_log_file(f"Skipping top-k comparison (--ignore_existing_best). Current EMA: {np.round(current_ema, decimals=4)}")
-            # Clear top_k_emas to start fresh
-            self.top_k_emas = []
+            self.print_to_log_file(f"Skipping top-k comparison (--ignore_existing_best). Current Dice: {np.round(current_dice, decimals=4)}")
+            # Clear top_k_dices to start fresh
+            self.top_k_dices = []
             self._skip_existing_best_comparison = False
         
         # Try to update top-k checkpoints
-        achieved_rank = self._update_top_k_checkpoints(current_ema, current_epoch)
+        achieved_rank = self._update_top_k_checkpoints(current_dice, current_epoch)
         
         if achieved_rank > 0:
             if achieved_rank == 1:
-                self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(current_ema, decimals=4)} (top-1)")
+                self.print_to_log_file(f"Yayy! New best pseudo Dice: {np.round(current_dice, decimals=4)} (top-1)")
             else:
-                self.print_to_log_file(f"New top-{achieved_rank} checkpoint! EMA: {np.round(current_ema, decimals=4)}")
+                self.print_to_log_file(f"New top-{achieved_rank} checkpoint! Dice: {np.round(current_dice, decimals=4)}")
         # =====================================================================
 
         if self.local_rank == 0:
@@ -2151,7 +2581,11 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             'dynamic_sampling_history': self.dynamic_sampling_strategy.get_history() if self.dynamic_sampling_strategy else None,
             # Top-K checkpoint tracking
             'top_k_checkpoints': self.top_k_checkpoints,
-            'top_k_emas': self.top_k_emas,
+            'top_k_dices': self.top_k_dices,
+            '_best_dice': getattr(self, '_best_dice', None),
+            # Evaluation mode
+            'eval_mode': self.eval_mode,
+            'sliding_window_step_size': self.sliding_window_step_size,
         }
         
         super().save_checkpoint(filename)
@@ -2224,16 +2658,21 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 self.dynamic_sampling_strategy.reverted_count = saved_history.get('reverted_count', 0)
             
             # Load top-K checkpoint tracking
-            # Note: We don't load top_k_emas from the checkpoint data because we'll 
+            # Note: We don't load top_k_dices from the checkpoint data because we'll 
             # reconstruct it by scanning existing files in on_epoch_end. This ensures
             # consistency even if checkpoint files were manually moved/deleted.
             # We only log that we'll scan for existing checkpoints later.
             self.top_k_checkpoints = checkpoint.get('top_k_checkpoints', self.top_k_checkpoints)
-            # Keep top_k_emas empty - it will be populated by scanning files in on_epoch_end
-            self.top_k_emas = []
+            # Keep top_k_dices empty - it will be populated by scanning files in on_epoch_end
+            self.top_k_dices = []
+            
+            # Load evaluation mode
+            self.eval_mode = checkpoint.get('eval_mode', self.eval_mode)
+            self.sliding_window_step_size = checkpoint.get('sliding_window_step_size', self.sliding_window_step_size)
             
             self.print_to_log_file(f"Loaded tuning info: {len(self.tuning_keys)} tuning cases")
             self.print_to_log_file(f"Loaded centering probs - Train: ({self.train_prob_random:.2f}/{self.train_prob_anatomy:.2f}/{self.train_prob_tumor:.2f})")
+            self.print_to_log_file(f"Loaded eval mode: {self.eval_mode}")
             if self.pattern_original_samples:
                 self.print_to_log_file(f"Loaded original/synthetic handling: pattern='{self.pattern_original_samples}', "
                                        f"orig={self.n_original_total}, synth={self.n_synthetic_total}, removed={self.n_synthetic_removed}")

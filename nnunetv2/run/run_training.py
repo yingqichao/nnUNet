@@ -126,9 +126,10 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
             if isfile(checkpoint_path):
                 try:
                     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-                    ema = checkpoint.get('_best_ema', None)
+                    # Support both _best_dice (new) and _best_ema (legacy)
+                    dice = checkpoint.get('_best_dice', checkpoint.get('_best_ema', None))
                     epoch = checkpoint.get('current_epoch', 'unknown')
-                    found_checkpoints.append((rank, checkpoint_path, ema, epoch))
+                    found_checkpoints.append((rank, checkpoint_path, dice, epoch))
                 except Exception as e:
                     found_checkpoints.append((rank, checkpoint_path, None, f"Error: {e}"))
     else:
@@ -141,18 +142,19 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
             if isfile(candidate):
                 try:
                     checkpoint = torch.load(candidate, map_location='cpu', weights_only=False)
-                    ema = checkpoint.get('_best_ema', None)
+                    # Support both _best_dice (new) and _best_ema (legacy)
+                    dice = checkpoint.get('_best_dice', checkpoint.get('_best_ema', None))
                     epoch = checkpoint.get('current_epoch', 'unknown')
-                    found_checkpoints.append((1, candidate, ema, epoch))
+                    found_checkpoints.append((1, candidate, dice, epoch))
                 except Exception as e:
                     found_checkpoints.append((1, candidate, None, f"Error: {e}"))
                 break
     
     if found_checkpoints:
         info_lines.append(f"\n*** EXISTING TOP-{len(found_checkpoints)} CHECKPOINTS FOUND ***")
-        for rank, path, ema, epoch in found_checkpoints:
-            ema_str = f"{ema:.4f}" if ema is not None else "Not recorded"
-            info_lines.append(f"  Rank {rank}: EMA={ema_str}, epoch={epoch}")
+        for rank, path, dice, epoch in found_checkpoints:
+            dice_str = f"{dice:.4f}" if dice is not None else "Not recorded"
+            info_lines.append(f"  Rank {rank}: Dice={dice_str}, epoch={epoch}")
             info_lines.append(f"           {path}")
         info_lines.append(f"\nNOTE: New checkpoints will only be saved if they rank in top-{top_k}.")
     else:
@@ -161,9 +163,9 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
     # Add warning if --ignore_existing_best is set (message depends on --c flag)
     if ignore_existing_best:
         if continue_training:
-            # With --c: checkpoint is loaded but _best_ema is reset (checkpoint file NOT removed)
+            # With --c: checkpoint is loaded but best metric is reset (checkpoint file NOT removed)
             info_lines.append(f"\n*** NOTE: --ignore_existing_best with --c: "
-                              f"Checkpoint will be LOADED but top-K tracking will be RESET. "
+                              f"Checkpoint will be LOADED but best metric tracking will be RESET. "
                               f"Model weights loaded, checkpoint ranking starts fresh. ***")
         else:
             # Without --c: all checkpoint files are removed
@@ -238,8 +240,13 @@ def maybe_remove_existing_best_checkpoint(nnunet_trainer: nnUNetTrainer, ignore_
     
     # Reset trainer state
     if removed_count > 0:
+        # Reset both _best_dice (new) and _best_ema (legacy) for compatibility
+        if hasattr(nnunet_trainer, '_best_dice'):
+            nnunet_trainer._best_dice = None
         nnunet_trainer._best_ema = None
-        # Also reset top_k_emas if available
+        # Also reset top_k_dices/top_k_emas if available
+        if hasattr(nnunet_trainer, 'top_k_dices'):
+            nnunet_trainer.top_k_dices = []
         if hasattr(nnunet_trainer, 'top_k_emas'):
             nnunet_trainer.top_k_emas = []
         print(f"*** REMOVED {removed_count} checkpoint(s). Training will start fresh.")
@@ -368,16 +375,22 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
 
     maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights, checkpoint_path=checkpoint_path)
     
-    # If --ignore_existing_best is set with --c, reset _best_ema after loading checkpoint
+    # If --ignore_existing_best is set with --c, reset best metrics after loading checkpoint
     # This allows loading model weights but starting fresh for checkpoint selection
     # (useful when evaluation criteria has changed)
     if c and ignore_existing_best:
-        old_best = nnunet_trainer._best_ema
+        # Reset both _best_dice (new) and _best_ema (legacy) for compatibility
+        old_best_dice = getattr(nnunet_trainer, '_best_dice', None)
+        old_best_ema = nnunet_trainer._best_ema
+        old_best = old_best_dice if old_best_dice is not None else old_best_ema
+        
+        if hasattr(nnunet_trainer, '_best_dice'):
+            nnunet_trainer._best_dice = None
         nnunet_trainer._best_ema = None
         # Also set flag to skip comparing with existing checkpoint file on first epoch
         nnunet_trainer._skip_existing_best_comparison = True
         if rank == 0:
-            print(f"*** --ignore_existing_best with --c: Reset _best_ema from {old_best} to None")
+            print(f"*** --ignore_existing_best with --c: Reset best metric from {old_best} to None")
             print(f"*** Model weights loaded, but best checkpoint selection starts fresh.")
             print(f"*** Will skip existing checkpoint file comparison on first evaluation.")
 
@@ -503,15 +516,21 @@ def run_training(
         maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights,
                               checkpoint_path=checkpoint_path)
         
-        # If --ignore_existing_best is set with --c, reset _best_ema after loading checkpoint
+        # If --ignore_existing_best is set with --c, reset best metrics after loading checkpoint
         # This allows loading model weights but starting fresh for checkpoint selection
         # (useful when evaluation criteria has changed)
         if continue_training and ignore_existing_best:
-            old_best = nnunet_trainer._best_ema
+            # Reset both _best_dice (new) and _best_ema (legacy) for compatibility
+            old_best_dice = getattr(nnunet_trainer, '_best_dice', None)
+            old_best_ema = nnunet_trainer._best_ema
+            old_best = old_best_dice if old_best_dice is not None else old_best_ema
+            
+            if hasattr(nnunet_trainer, '_best_dice'):
+                nnunet_trainer._best_dice = None
             nnunet_trainer._best_ema = None
             # Also set flag to skip comparing with existing checkpoint file on first epoch
             nnunet_trainer._skip_existing_best_comparison = True
-            print(f"*** --ignore_existing_best with --c: Reset _best_ema from {old_best} to None")
+            print(f"*** --ignore_existing_best with --c: Reset best metric from {old_best} to None")
             print(f"*** Model weights loaded, but best checkpoint selection starts fresh.")
             print(f"*** Will skip existing checkpoint file comparison on first evaluation.")
 
@@ -592,8 +611,8 @@ def run_training_entry():
                              'Only used by nnUNetTrainer_WithTuningSet. If not specified, all samples are original.')
     parser.add_argument('--ignore_existing_best', action='store_true', required=False,
                         help='[OPTIONAL] Reset best checkpoint threshold. Behavior depends on --c flag: '
-                             '(1) Without --c: REMOVES existing best checkpoint file before training. '
-                             '(2) With --c: Loads checkpoint but RESETS _best_ema to None after loading. '
+                             '(1) Without --c: REMOVES existing best checkpoint file(s) before training. '
+                             '(2) With --c: Loads checkpoint but RESETS best metric to None after loading. '
                              'This allows loading model weights but starting fresh for checkpoint selection '
                              '(useful when evaluation criteria has changed). Use with caution!')
     parser.add_argument('--ignore_synthetic', action='store_true', required=False,
