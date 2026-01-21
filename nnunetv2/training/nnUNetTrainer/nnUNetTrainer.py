@@ -1195,7 +1195,10 @@ class nnUNetTrainer(object):
         best_checkpoint_path = join(self.output_folder, self.get_checkpoint_filename('checkpoint_best'))
         
         # Check if existing checkpoint has better EMA
-        if isfile(best_checkpoint_path):
+        # Skip this check if _skip_existing_best_comparison is set (e.g., when --ignore_existing_best with --c)
+        skip_comparison = getattr(self, '_skip_existing_best_comparison', False)
+        
+        if not skip_comparison and isfile(best_checkpoint_path):
             try:
                 existing_checkpoint = torch.load(best_checkpoint_path, map_location='cpu', weights_only=False)
                 existing_ema = existing_checkpoint.get('_best_ema', None)
@@ -1208,6 +1211,11 @@ class nnUNetTrainer(object):
                                           f"existing {np.round(existing_ema, decimals=4) if existing_ema else 'None'}. Overwriting checkpoint.")
             except Exception as e:
                 self.print_to_log_file(f"Could not load existing checkpoint for comparison: {e}. Will overwrite.")
+        elif skip_comparison:
+            self.print_to_log_file(f"Skipping existing checkpoint comparison (--ignore_existing_best). "
+                                   f"Current EMA: {np.round(current_ema, decimals=4)}")
+            # Reset the flag after first use so subsequent epochs still compare
+            self._skip_existing_best_comparison = False
         
         # Save the checkpoint
         self._best_ema = current_ema

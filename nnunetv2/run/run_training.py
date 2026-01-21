@@ -73,7 +73,7 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
 
 
 def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm: bool = False,
-                                      ignore_existing_best: bool = False):
+                                      ignore_existing_best: bool = False, continue_training: bool = False):
     """
     Display training configuration and prompt user for confirmation before training starts.
     This helps prevent accidentally training in the wrong folder and overwriting good checkpoints.
@@ -95,7 +95,8 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
     Args:
         nnunet_trainer: The initialized nnUNetTrainer instance
         skip_confirm: If True, show info but don't require user confirmation
-        ignore_existing_best: If True, show warning that existing checkpoint will be removed
+        ignore_existing_best: If True, show warning about best checkpoint handling
+        continue_training: If True, indicates --c flag is set (affects warning message)
     """
     # Try to find existing best checkpoint (new naming convention first, then old)
     checkpoint_candidates = [
@@ -141,10 +142,17 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
     else:
         info_lines.append(f"\nNo existing best checkpoint found in output folder.")
     
-    # Add warning if --ignore_existing_best is set
+    # Add warning if --ignore_existing_best is set (message depends on --c flag)
     if ignore_existing_best:
-        info_lines.append(f"\n*** NOTE!!! You have set --ignore_existing_best, and this will accordingly "
-                          f"remove the above checkpoint if it exists! ***")
+        if continue_training:
+            # With --c: checkpoint is loaded but _best_ema is reset (checkpoint file NOT removed)
+            info_lines.append(f"\n*** NOTE: --ignore_existing_best with --c: "
+                              f"Checkpoint will be LOADED but _best_ema will be RESET to None. "
+                              f"Model weights loaded, best checkpoint selection starts fresh. ***")
+        else:
+            # Without --c: checkpoint file is removed
+            info_lines.append(f"\n*** NOTE!!! You have set --ignore_existing_best, and this will accordingly "
+                              f"REMOVE the above checkpoint file if it exists! ***")
     
     info_str = "\n".join(info_lines)
     
@@ -307,7 +315,8 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     # Show existing best checkpoint info and ask for confirmation (only on rank 0, unless validation only)
     if rank == 0 and not val:
         check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm,
-                                         ignore_existing_best=ignore_existing_best)
+                                         ignore_existing_best=ignore_existing_best,
+                                         continue_training=c)
     # Synchronize all ranks after confirmation
     dist.barrier()
     
@@ -318,6 +327,19 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     dist.barrier()
 
     maybe_load_checkpoint(nnunet_trainer, c, val, pretrained_weights, checkpoint_path=checkpoint_path)
+    
+    # If --ignore_existing_best is set with --c, reset _best_ema after loading checkpoint
+    # This allows loading model weights but starting fresh for checkpoint selection
+    # (useful when evaluation criteria has changed)
+    if c and ignore_existing_best:
+        old_best = nnunet_trainer._best_ema
+        nnunet_trainer._best_ema = None
+        # Also set flag to skip comparing with existing checkpoint file on first epoch
+        nnunet_trainer._skip_existing_best_comparison = True
+        if rank == 0:
+            print(f"*** --ignore_existing_best with --c: Reset _best_ema from {old_best} to None")
+            print(f"*** Model weights loaded, but best checkpoint selection starts fresh.")
+            print(f"*** Will skip existing checkpoint file comparison on first evaluation.")
 
     if torch.cuda.is_available():
         cudnn.deterministic = False
@@ -431,7 +453,8 @@ def run_training(
         # Show existing best checkpoint info and ask for confirmation (unless validation only)
         if not only_run_validation:
             check_everything_before_training(nnunet_trainer, skip_confirm=skip_manual_confirm,
-                                             ignore_existing_best=ignore_existing_best)
+                                             ignore_existing_best=ignore_existing_best,
+                                             continue_training=continue_training)
         
         # Remove existing best checkpoint if requested (only for fresh training, not continue or validation)
         if not only_run_validation and not continue_training:
@@ -439,6 +462,18 @@ def run_training(
 
         maybe_load_checkpoint(nnunet_trainer, continue_training, only_run_validation, pretrained_weights,
                               checkpoint_path=checkpoint_path)
+        
+        # If --ignore_existing_best is set with --c, reset _best_ema after loading checkpoint
+        # This allows loading model weights but starting fresh for checkpoint selection
+        # (useful when evaluation criteria has changed)
+        if continue_training and ignore_existing_best:
+            old_best = nnunet_trainer._best_ema
+            nnunet_trainer._best_ema = None
+            # Also set flag to skip comparing with existing checkpoint file on first epoch
+            nnunet_trainer._skip_existing_best_comparison = True
+            print(f"*** --ignore_existing_best with --c: Reset _best_ema from {old_best} to None")
+            print(f"*** Model weights loaded, but best checkpoint selection starts fresh.")
+            print(f"*** Will skip existing checkpoint file comparison on first evaluation.")
 
         if torch.cuda.is_available():
             cudnn.deterministic = False
@@ -516,9 +551,11 @@ def run_training_entry():
                              'Samples not matching this pattern are considered synthetic. '
                              'Only used by nnUNetTrainer_WithTuningSet. If not specified, all samples are original.')
     parser.add_argument('--ignore_existing_best', action='store_true', required=False,
-                        help='[OPTIONAL] If set, any existing best checkpoint in the output folder will be REMOVED '
-                             'before training starts. This allows starting fresh without the accuracy threshold '
-                             'from a previous training run. Use with caution!')
+                        help='[OPTIONAL] Reset best checkpoint threshold. Behavior depends on --c flag: '
+                             '(1) Without --c: REMOVES existing best checkpoint file before training. '
+                             '(2) With --c: Loads checkpoint but RESETS _best_ema to None after loading. '
+                             'This allows loading model weights but starting fresh for checkpoint selection '
+                             '(useful when evaluation criteria has changed). Use with caution!')
     parser.add_argument('--ignore_synthetic', action='store_true', required=False,
                         help='[OPTIONAL] If set, all synthetic samples (those NOT matching --pattern_original_samples) '
                              'will be excluded from training. Requires --pattern_original_samples to be set. '

@@ -2,15 +2,16 @@
 nnUNet Trainer with separate tuning set for adaptive training strategies.
 
 This trainer implements a 3-way split within each fold:
-- Training set: For gradient updates (80% of original train)
-- Tuning set: For adaptive strategy decisions (20% of original train)
+- Training set: For gradient updates (remaining original + synthetic samples)
+- Tuning set: For adaptive strategy decisions (same size as test, original samples only)
 - Test set: For final evaluation only (original validation fold, untouched)
 
 This design allows validation-informed adaptive training without data leakage,
 because the test set is never used for any training decisions.
 
 Key features:
-- Automatic 20% tuning split from training data (no JSON modification needed)
+- Tuning set size = test set size (balanced evaluation)
+- Tuning set selection is DETERMINISTIC (sorted + fixed seed per fold)
 - Tuning metrics computed FIRST each epoch, then test metrics
 - Configurable 3-way patch centering: random / anatomy / tumor
 - Extension point for adaptive hyperparameter adjustment based on tuning performance
@@ -24,11 +25,12 @@ Evaluation order each epoch:
 2. TEST SET: Compute pseudo dice (logged, for checkpoint selection)
 3. Checkpoint: "Yayy! New best EMA pseudo Dice" if improved (based on TEST tumor dice only)
 
-Patch centering probabilities (configurable per mode):
-- prob_random: Center on random voxel (anywhere)
-- prob_anatomy: Center on random anatomy voxel (label 1)
-- prob_tumor: Center on random tumor voxel (label 2 ONLY)
-(Probabilities must sum to 1.0)
+Patch centering strategy:
+- TRAINING: Configurable 3-way probabilistic centering (random / anatomy / tumor)
+- EVALUATION (tuning & test): Dual-crop per sample
+  - 1 patch centered on random anatomy voxel (evaluates FP control)
+  - 1 patch centered on random tumor voxel (evaluates tumor detection)
+  - Doubles effective samples: N samples → 2N patches for balanced evaluation
 
 Label convention:
 - Label 0: Background
@@ -811,6 +813,187 @@ class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
 
 
 # =============================================================================
+# DUAL-CROP EVALUATION DATALOADER (ANATOMY + TUMOR)
+# =============================================================================
+
+class nnUNetDataLoaderDualCropEval(nnUNetDataLoader):
+    """
+    Evaluation DataLoader that creates TWO patches per sample for balanced evaluation.
+    
+    For each sample in the dataset:
+    - Patch 1: Centered on a random ANATOMY voxel (label 1) → evaluates FP control
+    - Patch 2: Centered on a random TUMOR voxel (label 2) → evaluates tumor detection
+    
+    This provides balanced evaluation that considers both:
+    - False positive rate on normal anatomy regions
+    - True positive rate (recall) on tumor regions
+    
+    If a sample has N original cases, evaluation will use 2N patches.
+    Example: 25 samples → 50 patches (25 anatomy-centered + 25 tumor-centered)
+    
+    This is used for tuning and test set evaluation ONLY (not training).
+    """
+    
+    ANATOMY_LABEL = 1  # liver for LiTS, kidney for KiTS
+    TUMOR_LABEL = 2    # Only label 2 is used for tumor centering
+    
+    def __init__(self,
+                 data: nnUNetBaseDataset,
+                 batch_size: int,
+                 patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
+                 final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
+                 label_manager: LabelManager,
+                 sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
+                 pad_sides: Union[List[int], Tuple[int, ...]] = None,
+                 transforms=None):
+        """
+        Note: batch_size here refers to the number of ORIGINAL samples per batch.
+        The actual output will have 2x batch_size patches (anatomy + tumor for each sample).
+        """
+        super().__init__(
+            data=data,
+            batch_size=batch_size,
+            patch_size=patch_size,
+            final_patch_size=final_patch_size,
+            label_manager=label_manager,
+            oversample_foreground_percent=1.0,  # Not used, we do dual-crop
+            sampling_probabilities=sampling_probabilities,
+            pad_sides=pad_sides,
+            probabilistic_oversampling=True,
+            transforms=transforms
+        )
+        
+        # Update data_shape and seg_shape to accommodate 2x patches
+        # Original shape: (batch_size, channels, *patch_size)
+        # New shape: (2 * batch_size, channels, *patch_size)
+        self.original_batch_size = batch_size
+        self.data_shape = (2 * batch_size,) + self.data_shape[1:]
+        self.seg_shape = (2 * batch_size,) + self.seg_shape[1:]
+    
+    def get_bbox_for_mode(self, data_shape: np.ndarray, mode: str,
+                          class_locations: Union[dict, None]) -> Tuple[List[int], List[int]]:
+        """
+        Get bounding box centered on a voxel of the specified class.
+        
+        Args:
+            data_shape: Shape of the data (excluding channel dimension)
+            mode: 'anatomy' or 'tumor'
+            class_locations: Dict mapping class labels to voxel locations
+            
+        Returns:
+            bbox_lbs, bbox_ubs: Bounding box lower and upper bounds
+        """
+        need_to_pad = self.need_to_pad.copy()
+        dim = len(data_shape)
+        
+        for d in range(dim):
+            if need_to_pad[d] + data_shape[d] < self.patch_size[d]:
+                need_to_pad[d] = self.patch_size[d] - data_shape[d]
+        
+        lbs = [- need_to_pad[i] // 2 for i in range(dim)]
+        ubs = [data_shape[i] + need_to_pad[i] // 2 + need_to_pad[i] % 2 - self.patch_size[i] for i in range(dim)]
+        
+        selected_voxel = None
+        target_label = self.ANATOMY_LABEL if mode == 'anatomy' else self.TUMOR_LABEL
+        fallback_label = self.TUMOR_LABEL if mode == 'anatomy' else self.ANATOMY_LABEL
+        
+        # Try to get voxel from target class
+        if class_locations and target_label in class_locations and len(class_locations[target_label]) > 0:
+            voxels = class_locations[target_label]
+            selected_voxel = voxels[np.random.choice(len(voxels))]
+        
+        # Fallback to other foreground class if target not available
+        if selected_voxel is None and class_locations:
+            if fallback_label in class_locations and len(class_locations[fallback_label]) > 0:
+                voxels = class_locations[fallback_label]
+                selected_voxel = voxels[np.random.choice(len(voxels))]
+        
+        # Final fallback: random location
+        if selected_voxel is None:
+            bbox_lbs = [np.random.randint(lbs[i], ubs[i] + 1) if lbs[i] < ubs[i] + 1 
+                        else lbs[i] for i in range(dim)]
+        else:
+            # Center on selected voxel (skip channel dim: voxel is [channel, z, y, x])
+            bbox_lbs = [max(lbs[i], selected_voxel[i + 1] - self.patch_size[i] // 2) for i in range(dim)]
+        
+        bbox_ubs = [bbox_lbs[i] + self.patch_size[i] for i in range(dim)]
+        
+        return bbox_lbs, bbox_ubs
+    
+    def generate_train_batch(self):
+        """
+        Generate an evaluation batch with dual-crop strategy.
+        
+        For each sample:
+        1. Create one patch centered on random anatomy voxel
+        2. Create one patch centered on random tumor voxel
+        
+        Output has 2x the original batch size.
+        """
+        selected_keys = self.get_indices()
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        
+        # Track keys for both patches (each key appears twice: once for anatomy, once for tumor)
+        output_keys = []
+        
+        for j, key in enumerate(selected_keys):
+            data, seg, seg_prev, properties = self._data.load_case(key)
+            shape = data.shape[1:]
+            class_locations = properties.get('class_locations')
+            
+            # === Patch 1: Anatomy-centered ===
+            idx_anatomy = 2 * j
+            bbox_lbs_anat, bbox_ubs_anat = self.get_bbox_for_mode(shape, 'anatomy', class_locations)
+            bbox_anat = [[i, k] for i, k in zip(bbox_lbs_anat, bbox_ubs_anat)]
+            
+            data_all[idx_anatomy] = crop_and_pad_nd(data, bbox_anat, 0)
+            seg_cropped_anat = crop_and_pad_nd(seg, bbox_anat, -1)
+            if seg_prev is not None:
+                seg_cropped_anat = np.vstack((seg_cropped_anat, crop_and_pad_nd(seg_prev, bbox_anat, -1)[None]))
+            seg_all[idx_anatomy] = seg_cropped_anat
+            output_keys.append(f"{key}_anatomy")
+            
+            # === Patch 2: Tumor-centered ===
+            idx_tumor = 2 * j + 1
+            bbox_lbs_tumor, bbox_ubs_tumor = self.get_bbox_for_mode(shape, 'tumor', class_locations)
+            bbox_tumor = [[i, k] for i, k in zip(bbox_lbs_tumor, bbox_ubs_tumor)]
+            
+            data_all[idx_tumor] = crop_and_pad_nd(data, bbox_tumor, 0)
+            seg_cropped_tumor = crop_and_pad_nd(seg, bbox_tumor, -1)
+            if seg_prev is not None:
+                seg_cropped_tumor = np.vstack((seg_cropped_tumor, crop_and_pad_nd(seg_prev, bbox_tumor, -1)[None]))
+            seg_all[idx_tumor] = seg_cropped_tumor
+            output_keys.append(f"{key}_tumor")
+        
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+        
+        if self.transforms is not None:
+            with torch.no_grad():
+                with threadpool_limits(limits=1, user_api=None):
+                    data_all = torch.from_numpy(data_all).float()
+                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    images = []
+                    segs = []
+                    # Process all 2*batch_size patches
+                    for b in range(2 * self.original_batch_size):
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                        images.append(tmp['image'])
+                        segs.append(tmp['segmentation'])
+                    data_all = torch.stack(images)
+                    if isinstance(segs[0], list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                    else:
+                        seg_all = torch.stack(segs)
+                    del segs, images
+            return {'data': data_all, 'target': seg_all, 'keys': output_keys}
+        
+        return {'data': data_all, 'target': seg_all, 'keys': output_keys}
+
+
+# =============================================================================
 # TRAINER CLASS
 # =============================================================================
 
@@ -849,7 +1032,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                          checkpoint_signature, splits_file)
         
         # Tuning set configuration
-        self.tuning_ratio = 0.2  # 20% of original training for tuning
+        # Note: tuning_ratio is kept for backward compatibility but NOT used
+        # Tuning set size is now set equal to test set size for balanced evaluation
+        self.tuning_ratio = 0.2  # Legacy, not used - tuning size = test size
         self.tuning_keys: List[str] = []
         self.tuning_dataset: nnUNetBaseDataset = None
         self.tuning_dataloader = None
@@ -912,15 +1097,16 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file("\n" + "=" * 70)
         self.print_to_log_file("Using nnUNetTrainer_WithTuningSet")
         self.print_to_log_file("=" * 70)
-        self.print_to_log_file(f"3-way split: {(1-self.tuning_ratio)*100:.0f}% train, "
-                               f"{self.tuning_ratio*100:.0f}% tuning, test=original val fold")
+        self.print_to_log_file(f"3-way split: train (remaining original + synthetic), "
+                               f"tuning (= test size, original only), test (original val fold)")
         self.print_to_log_file("Tuning set: For adaptive training decisions (NO leakage to test)")
         self.print_to_log_file("Test set: For final evaluation ONLY (original val fold)")
         self.print_to_log_file("-" * 70)
-        self.print_to_log_file("Patch centering probabilities (random / anatomy / tumor):")
-        self.print_to_log_file(f"  Training: ({self.train_prob_random:.2f} / {self.train_prob_anatomy:.2f} / {self.train_prob_tumor:.2f})")
-        self.print_to_log_file(f"  Tuning:   ({self.tuning_prob_random:.2f} / {self.tuning_prob_anatomy:.2f} / {self.tuning_prob_tumor:.2f})")
-        self.print_to_log_file(f"  Test:     ({self.test_prob_random:.2f} / {self.test_prob_anatomy:.2f} / {self.test_prob_tumor:.2f})")
+        self.print_to_log_file("Patch centering strategy:")
+        self.print_to_log_file(f"  Training: 3-way probabilistic ({self.train_prob_random:.2f} / {self.train_prob_anatomy:.2f} / {self.train_prob_tumor:.2f})")
+        self.print_to_log_file(f"  Tuning:   Dual-crop (1 anatomy + 1 tumor per sample)")
+        self.print_to_log_file(f"  Test:     Dual-crop (1 anatomy + 1 tumor per sample)")
+        self.print_to_log_file("  → Evaluation: N samples → 2N patches (balanced FP control + tumor detection)")
         self.print_to_log_file("-" * 70)
         self.print_to_log_file(f"Dynamic sampling: {'ENABLED' if self.enable_dynamic_sampling else 'DISABLED'}")
         if self.enable_dynamic_sampling:
@@ -989,17 +1175,29 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         # STEP 2: Create tuning set from ORIGINAL samples only
         # =====================================================================
+        # Use fixed seed for deterministic tuning set selection across runs
         rng = np.random.RandomState(seed=12345 + self.fold)
         
-        # Shuffle original samples for tuning selection
-        shuffled_original = rng.permutation(original_keys).tolist()
+        # IMPORTANT: Sort original_keys first to ensure determinism
+        # (order from parent class may vary, but sorted order is always the same)
+        sorted_original = sorted(original_keys)
         
-        # Calculate tuning set size (from original samples only)
-        n_tuning = int(len(shuffled_original) * self.tuning_ratio)
+        # Shuffle with fixed seed for reproducible selection
+        shuffled_original = rng.permutation(sorted_original).tolist()
+        
+        # Tuning set size = test set size (instead of tuning_ratio)
+        # This ensures balanced evaluation between tuning and test
+        n_tuning = len(test_keys)
+        if n_tuning > len(shuffled_original):
+            self.print_to_log_file(f"WARNING: Test set size ({n_tuning}) > available original samples ({len(shuffled_original)})")
+            self.print_to_log_file(f"         Using all {len(shuffled_original)} original samples for tuning")
+            n_tuning = len(shuffled_original)
+        
         self.tuning_keys = shuffled_original[:n_tuning]
         remaining_original = shuffled_original[n_tuning:]
         
-        self.print_to_log_file(f"Tuning set: {len(self.tuning_keys)} cases (original samples only)")
+        self.print_to_log_file(f"Tuning set: {len(self.tuning_keys)} cases (= test set size, from original samples only)")
+        self.print_to_log_file(f"  [Deterministic] Seed=12345+fold={12345 + self.fold}, sorted before shuffle")
         
         # =====================================================================
         # STEP 3: Cap synthetic ratio in training set
@@ -1137,16 +1335,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         )
         dl_tr = self._dl_tr
         
-        # Create TEST dataloader with 3-way centering
-        # Store reference for accessing centering counts
-        self._dl_val = nnUNetDataLoader3WayCentering(
+        # Create TEST dataloader with dual-crop evaluation (anatomy + tumor per sample)
+        # For each sample: 1 anatomy-centered patch + 1 tumor-centered patch
+        # This evaluates both FP control (anatomy) and tumor detection (tumor)
+        self._dl_val = nnUNetDataLoaderDualCropEval(
             dataset_val, self.batch_size,
             self.configuration_manager.patch_size,
             self.configuration_manager.patch_size,
             self.label_manager,
-            prob_random=self.test_prob_random,
-            prob_anatomy=self.test_prob_anatomy,
-            prob_tumor=self.test_prob_tumor,
             sampling_probabilities=None,
             pad_sides=None,
             transforms=val_transforms
@@ -1183,8 +1379,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
     
     def _create_tuning_dataloader(self):
         """
-        Create a dataloader for the tuning set with 3-way centering.
-        Uses validation transforms (no augmentation) for consistent metrics.
+        Create a dataloader for the tuning set with dual-crop evaluation strategy.
+        
+        For each sample, creates TWO patches:
+        - One centered on random anatomy voxel (evaluates FP control)
+        - One centered on random tumor voxel (evaluates tumor detection)
+        
+        This doubles the effective evaluation samples for balanced metrics.
         """
         from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
         
@@ -1198,16 +1399,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             ignore_label=self.label_manager.ignore_label
         )
         
-        # Create tuning dataloader with 3-way centering
-        dl_tuning = nnUNetDataLoader3WayCentering(
+        # Create tuning dataloader with dual-crop evaluation (anatomy + tumor per sample)
+        dl_tuning = nnUNetDataLoaderDualCropEval(
             self.tuning_dataset,
             self.batch_size,
             self.configuration_manager.patch_size,
             self.configuration_manager.patch_size,
             self.label_manager,
-            prob_random=self.tuning_prob_random,
-            prob_anatomy=self.tuning_prob_anatomy,
-            prob_tumor=self.tuning_prob_tumor,
             sampling_probabilities=None,
             pad_sides=None,
             transforms=val_transforms
@@ -1231,7 +1429,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Initialize by fetching first batch
         _ = next(self.tuning_dataloader)
         
-        self.print_to_log_file(f"Created tuning dataloader with 3-way centering")
+        self.print_to_log_file(f"Created tuning dataloader with dual-crop eval (anatomy + tumor per sample)")
     
     def on_train_epoch_start(self):
         """
@@ -1521,6 +1719,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         self.print_to_log_file("-" * 40)
         self.print_to_log_file("TEST SET evaluation (for checkpoint selection):")
+        if self._best_ema is not None:
+            self.print_to_log_file(f"  [Reminder] Current best EMA pseudo Dice (tumor): {np.round(self._best_ema, decimals=4)}")
+        else:
+            self.print_to_log_file(f"  [Reminder] No best checkpoint yet (first evaluation)")
     
     def validation_step(self, batch: dict) -> dict:
         """
