@@ -47,6 +47,9 @@ Label convention:
 - Label 2: Tumor/lesion (PRIMARY focus for centering)
 - Label 3+: Secondary lesions (e.g., cyst in KiTS - trained but NOT explicitly centered on)
 
+NOTE: 
+- Entry of actual real-world inference: nnUNetv2_predict = "nnunetv2.inference.predict_from_raw_data:predict_entry_point"
+
 Usage:
     nnUNetv2_train DATASET CONFIG FOLD -tr nnUNetTrainer_WithTuningSet
     nnUNetv2_train DATASET CONFIG FOLD -tr nnUNetTrainer_WithTuningSet --pattern_original_samples "liver_\\d+"
@@ -89,7 +92,7 @@ from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
-from nnunetv2.utilities.helpers import empty_cache, dummy_context
+from nnunetv2.utilities.helpers import empty_cache, dummy_context, check_if_proceed
 from nnunetv2.inference.sliding_window_prediction import compute_steps_for_sliding_window, compute_gaussian
 
 # =============================================================================
@@ -262,10 +265,25 @@ def _async_test_eval_worker(
                 try:
                     data, seg, seg_prev, properties = test_dataset.load_case(key)
                     
-                    seg_np = seg[0] if seg.ndim == 4 else seg
+                    # Get original segmentation for foreground classification
+                    seg_np_orig = seg[0] if seg.ndim == 4 else seg
+                    original_shape = tuple(seg_np_orig.shape)
+                    
+                    # PAD data and seg to at least patch_size (critical for UNet residual connections)
+                    # This mirrors what nnUNet predictor does in predict_sliding_window_return_logits
+                    from acvl_utils.cropping_and_padding.padding import pad_nd_image
+                    data_padded, slicer_revert = pad_nd_image(
+                        np.asarray(data), patch_size, 'constant', {'value': 0}, True, None
+                    )
+                    seg_padded, _ = pad_nd_image(
+                        np.asarray(seg), patch_size, 'constant', {'value': 0}, True, None
+                    )
+                    
+                    # Use padded shapes for sliding window computation
+                    seg_np = seg_padded[0] if seg_padded.ndim == 4 else seg_padded
                     volume_shape = tuple(seg_np.shape)
                     
-                    # Compute sliding window boxes
+                    # Compute sliding window boxes on PADDED volume
                     steps = compute_steps_for_sliding_window(volume_shape, patch_size, step_size)
                     
                     slicers = []
@@ -315,8 +333,8 @@ def _async_test_eval_worker(
                     if len(foreground_indices) == 0:
                         continue
                     
-                    # Run inference
-                    data_tensor = torch.from_numpy(np.asarray(data)).float().to(device)
+                    # Run inference on PADDED data
+                    data_tensor = torch.from_numpy(np.asarray(data_padded)).float().to(device)
                     
                     predicted_logits = torch.zeros(
                         (num_classes, *volume_shape), dtype=torch.half, device=device
@@ -344,6 +362,13 @@ def _async_test_eval_worker(
                     # Move to CPU for metrics
                     predicted_logits = predicted_logits.cpu()
                     valid_mask = valid_mask.cpu()
+                    
+                    # REVERT PADDING on predictions and valid_mask
+                    # slicer_revert is for spatial dims, need to add channel dim for predicted_logits
+                    predicted_logits = predicted_logits[(slice(None),) + slicer_revert[1:]]
+                    valid_mask = valid_mask[slicer_revert[1:]]
+                    
+                    # Use ORIGINAL (unpadded) seg for metrics
                     seg_tensor = torch.from_numpy(np.asarray(seg)).long()
                     
                     if seg_tensor.ndim == 3:
@@ -1845,6 +1870,17 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.backup_gpu_id: Optional[int] = None
         # =====================================================================
         
+        # =====================================================================
+        # INTEGRATION TEST MODE
+        # =====================================================================
+        # When enabled (via --integration_test), limits samples to at most 5 per split
+        # and modifies output folder to add "_integration_test" suffix
+        # Set by run_training.py, then _setup_integration_test_mode() must be called
+        self.integration_test_mode: bool = False
+        self.integration_test_max_samples: int = 5  # Max samples per split
+        self._integration_test_setup_done: bool = False  # Track if setup was done
+        # =====================================================================
+        
         self.print_to_log_file("\n" + "=" * 70)
         self.print_to_log_file("Using nnUNetTrainer_WithTuningSet")
         self.print_to_log_file("=" * 70)
@@ -1889,6 +1925,61 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"  TUNING: {'ENABLED' if ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET else 'DISABLED'}")
         self.print_to_log_file(f"  TEST:   {'ENABLED' if ENABLE_PRE_TRAINING_EVAL else 'DISABLED'}")
         self.print_to_log_file("=" * 70 + "\n")
+    
+    def _setup_integration_test_mode(self) -> None:
+        """
+        Setup integration test mode: modify output folder and create directory.
+        
+        This method MUST be called by run_training.py AFTER setting 
+        self.integration_test_mode = True and BEFORE check_everything_before_training().
+        
+        Actions:
+        - Adds "_integration_test" suffix to output folder
+        - Removes existing integration test folder if it exists
+        - Creates the new output folder
+        - Re-initializes log file path
+        """
+        if not self.integration_test_mode:
+            return
+        
+        if self._integration_test_setup_done:
+            return  # Already set up
+        
+        import shutil
+        
+        # Modify output folder to add "_integration_test" suffix
+        if not self.output_folder.endswith("_integration_test"):
+            new_output_folder = self.output_folder + "_integration_test"
+            
+            # Remove existing integration test folder if it exists
+            if os.path.exists(new_output_folder):
+                print(f"*** INTEGRATION TEST: Removing existing folder: {new_output_folder}")
+                shutil.rmtree(new_output_folder)
+            
+            # Update output folder
+            self.output_folder = new_output_folder
+            maybe_mkdir_p(self.output_folder)
+            
+            # Re-initialize log file in new folder
+            self.log_file = join(self.output_folder, 'training_log.txt')
+        
+        self._integration_test_setup_done = True
+        
+        # Also reduce iterations per epoch for faster testing
+        self.num_iterations_per_epoch = 10  # Instead of 250
+        self.num_val_iterations_per_epoch = 5  # Instead of 50
+        self.num_epochs = 10  # Instead of 1000
+        self.eval_every_n_epochs = 2  # Evaluate more frequently in integration test
+        
+        print("\n" + "=" * 70)
+        print("*** INTEGRATION TEST MODE ***")
+        print(f"  Max samples per split: {self.integration_test_max_samples}")
+        print(f"  Iterations per epoch: {self.num_iterations_per_epoch} (normally 250)")
+        print(f"  Val iterations per epoch: {self.num_val_iterations_per_epoch} (normally 50)")
+        print(f"  Total epochs: {self.num_epochs} (normally 1000)")
+        print(f"  Eval every: {self.eval_every_n_epochs} epochs")
+        print(f"  Output folder: {self.output_folder}")
+        print("=" * 70 + "\n")
     
     # =========================================================================
     # TOP-K CHECKPOINT MANAGEMENT METHODS
@@ -2143,9 +2234,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         if isfile(temp_ckpt_path):
             try:
                 os.remove(temp_ckpt_path)
-                self.print_to_log_file(f"[Async] Cleaned up temp checkpoint: {os.path.basename(temp_ckpt_path)}")
+                self.print_to_log_file(f"[MP] Cleaned up temp checkpoint: {os.path.basename(temp_ckpt_path)}")
             except Exception as e:
-                self.print_to_log_file(f"[Async] Warning: Could not remove temp checkpoint: {e}")
+                self.print_to_log_file(f"[MP] Warning: Could not remove temp checkpoint: {e}")
         
         # Also clean up result file
         result_path = self._get_async_result_path(epoch)
@@ -2168,9 +2259,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         for temp_file in glob.glob(pattern):
             try:
                 os.remove(temp_file)
-                self.print_to_log_file(f"[Async] Cleaned up orphaned temp file: {os.path.basename(temp_file)}")
+                self.print_to_log_file(f"[MP] Cleaned up orphaned temp file: {os.path.basename(temp_file)}")
             except Exception as e:
-                self.print_to_log_file(f"[Async] Warning: Could not remove orphaned temp file: {e}")
+                self.print_to_log_file(f"[MP] Warning: Could not remove orphaned temp file: {e}")
         
         # Find and remove orphaned result files
         pattern = join(self.output_folder, 'eval_result_epoch*.json')
@@ -2199,13 +2290,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         # Check if there's already a running subprocess - if so, wait for it
         if self._async_eval_process is not None and self._async_eval_process.is_alive():
-            self.print_to_log_file(f"[Async] Previous eval still running (epoch {self._async_eval_epoch}), waiting...")
+            self.print_to_log_file(f"[MP] Previous eval still running (epoch {self._async_eval_epoch}), waiting...")
             result = self._wait_for_async_eval(timeout=ASYNC_EVAL_TIMEOUT)
             if result:
                 self._handle_async_eval_result(result)
         
         # Save temporary checkpoint
-        self.print_to_log_file(f"[Async] Saving temp checkpoint for epoch {epoch}...")
+        self.print_to_log_file(f"[MP] Saving temp checkpoint for epoch {epoch}...")
         temp_ckpt_path = self._save_temp_eval_checkpoint(epoch)
         
         # Prepare result path
@@ -2260,9 +2351,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # Set CUDA_VISIBLE_DEVICES for subprocess if configured
             if subprocess_gpu_id is not None:
                 os.environ['CUDA_VISIBLE_DEVICES'] = str(subprocess_gpu_id)
-                self.print_to_log_file(f"[Async] Subprocess will use GPU {subprocess_gpu_id}")
+                self.print_to_log_file(f"[MP] Subprocess will use GPU {subprocess_gpu_id}")
             else:
-                self.print_to_log_file(f"[Async] Subprocess will use same GPU as training (CUDA_VISIBLE_DEVICES={original_cuda_visible})")
+                self.print_to_log_file(f"[MP] Subprocess will use same GPU as training (CUDA_VISIBLE_DEVICES={original_cuda_visible})")
             
             # Create and start the subprocess
             # Note: The subprocess inherits CUDA_VISIBLE_DEVICES at this moment
@@ -2297,7 +2388,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 # Original was not set, but we modified it - remove the modification
                 del os.environ['CUDA_VISIBLE_DEVICES']
         
-        self.print_to_log_file(f"[Async] Spawned test eval subprocess for epoch {epoch} (PID: {self._async_eval_process.pid})")
+        self.print_to_log_file(f"[MP] Spawned test eval subprocess for epoch {epoch} (PID: {self._async_eval_process.pid})")
         
         return True
     
@@ -2322,13 +2413,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 
                 return result
             except Exception as e:
-                self.print_to_log_file(f"[Async] Warning: Could not read result: {e}")
+                self.print_to_log_file(f"[MP] Warning: Could not read result: {e}")
                 return None
         
         # Check if process is still alive
         if not self._async_eval_process.is_alive():
             # Process finished but no result file - something went wrong
-            self.print_to_log_file(f"[Async] Warning: Process finished without result file")
+            self.print_to_log_file(f"[MP] Warning: Process finished without result file")
             self._async_eval_process.join()
             return {'success': False, 'error': 'Process finished without result', 'epoch': self._async_eval_epoch}
         
@@ -2350,14 +2441,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         if timeout is None:
             timeout = ASYNC_EVAL_TIMEOUT
         
-        self.print_to_log_file(f"[Async] Waiting for epoch {self._async_eval_epoch} evaluation (timeout: {timeout}s)...")
+        self.print_to_log_file(f"[MP] Waiting for epoch {self._async_eval_epoch} evaluation (timeout: {timeout}s)...")
         
         # Wait for process to complete
         self._async_eval_process.join(timeout=timeout)
         
         if self._async_eval_process.is_alive():
             # Timeout - kill the process
-            self.print_to_log_file(f"[Async] WARNING: Evaluation timed out after {timeout}s, terminating...")
+            self.print_to_log_file(f"[MP] WARNING: Evaluation timed out after {timeout}s, terminating...")
             self._async_eval_process.terminate()
             self._async_eval_process.join(timeout=5)
             if self._async_eval_process.is_alive():
@@ -2370,7 +2461,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 with open(self._async_eval_result_path, 'r') as f:
                     return json.load(f)
             except Exception as e:
-                self.print_to_log_file(f"[Async] Warning: Could not read result: {e}")
+                self.print_to_log_file(f"[MP] Warning: Could not read result: {e}")
                 return None
         
         return None
@@ -2391,15 +2482,15 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         epoch = result.get('epoch', self._async_eval_epoch)
         
         if not result.get('success', False):
-            self.print_to_log_file(f"[Async] Epoch {epoch} evaluation FAILED: {result.get('error', 'Unknown error')}")
+            self.print_to_log_file(f"[MP] Epoch {epoch} evaluation FAILED: {result.get('error', 'Unknown error')}")
             if 'traceback' in result:
-                self.print_to_log_file(f"[Async] Traceback:\n{result['traceback']}")
+                self.print_to_log_file(f"[MP] Traceback:\n{result['traceback']}")
         else:
             tumor_dice = result.get('tumor_dice', 0)
             achieved_rank = result.get('achieved_rank', 0)
             checkpoint_saved = result.get('checkpoint_saved', None)
             
-            self.print_to_log_file(f"[Async] Epoch {epoch} evaluation complete:")
+            self.print_to_log_file(f"[MP] Epoch {epoch} evaluation complete:")
             self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
             self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
             
@@ -2533,7 +2624,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                         progress_desc="Pre-train Tuning SW Eval"
                     )
                 else:
-                    self.print_to_log_file(f"Running dual-crop evaluation on {len(self.tuning_keys)} tuning samples...")
+                    self.print_to_log_file(f"Running dual-crop evaluation on {len(self.tuning_keys)} tuning samples ({len(self.tuning_keys) * 2} patches)...")
                     pre_train_tuning_metrics = self._compute_tuning_metrics_dual_crop()
                 
                 # Log the metrics
@@ -2596,7 +2687,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     )
                 else:
                     # Dual-crop for test set (rare case)
-                    self.print_to_log_file(f"Running dual-crop evaluation on {len(test_keys)} test samples...")
+                    self.print_to_log_file(f"Running dual-crop evaluation on {len(test_keys)} test samples ({len(test_keys) * 2} patches)...")
                     # Would need a separate dual-crop method for test set
                     # For now, use the tuning dual-crop method with test keys
                     pre_train_test_metrics = self._compute_tuning_metrics_dual_crop()
@@ -2687,6 +2778,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             
         Returns:
             True if sample is original, False if synthetic
+            
+        Raises:
+            ValueError: If pattern_original_samples contains invalid regex
         """
         if self.pattern_original_samples is None:
             # No pattern specified, all samples are original
@@ -2694,7 +2788,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         # Match the entire key against the pattern
         pattern = f"^{self.pattern_original_samples}$"
-        return bool(re.match(pattern, key))
+        try:
+            return bool(re.match(pattern, key))
+        except re.error as e:
+            raise ValueError(
+                f"Invalid regex pattern in --pattern_original_samples: '{self.pattern_original_samples}'\n"
+                f"Regex error: {e}\n"
+                f"Please provide a valid Python regex pattern."
+            ) from e
     
     def _sanity_check_samples_for_tumor(self, keys: List[str], dataset_folder: str, 
                                          num_workers: int = None) -> Tuple[List[str], List[str]]:
@@ -2815,6 +2916,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         The tuning keys are stored in self.tuning_keys.
         Returns (train_keys, test_keys) - tuning is handled separately.
         """
+        # Note: Integration test mode setup (output folder modification) is done
+        # in _setup_integration_test_mode() which is called by run_training.py
+        # BEFORE check_everything_before_training()
+        
         # =====================================================================
         # STEP 1: Get original 2-way split from parent
         # =====================================================================
@@ -2846,6 +2951,29 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"  Original samples: {self.n_original_total}")
         self.print_to_log_file(f"  Synthetic samples: {self.n_synthetic_total}")
         self.print_to_log_file("-" * 70)
+        
+        # =====================================================================
+        # VALIDATION: Check if regex pattern matches any samples
+        # =====================================================================
+        if self.pattern_original_samples is not None and self.n_original_total == 0:
+            warning_msg = (
+                "\n" + "!" * 70 + "\n"
+                "WARNING: REGEX PATTERN MATCHES NO SAMPLES!\n"
+                "!" * 70 + "\n"
+                f"  Pattern: '{self.pattern_original_samples}'\n"
+                f"  All {len(original_tr_keys)} training samples classified as SYNTHETIC.\n"
+                f"  Test set has {len(test_keys)} samples.\n"
+                "\n"
+                "This is likely a mistake. Common issues:\n"
+                "  - Pattern is too restrictive\n"
+                "  - Pattern uses wrong regex syntax\n"
+                "  - Sample naming doesn't match expected pattern\n"
+                "\n"
+                f"Sample keys (first 5): {original_tr_keys[:5]}\n"
+                "!" * 70
+            )
+            self.print_to_log_file(warning_msg)
+            check_if_proceed(warning_msg)
         
         # =====================================================================
         # STEP 3: Determine which synthetic samples will be used
@@ -2939,6 +3067,52 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 self.print_to_log_file(f"    Synthetic:  {synthetic_to_use_before} → {len(synthetic_to_use)} ({excluded_from_synthetic} excluded)")
         
         # =====================================================================
+        # VALIDATION: Check if any samples remain after filtering
+        # =====================================================================
+        if len(test_keys) == 0:
+            warning_msg = (
+                "\n" + "!" * 70 + "\n"
+                "CRITICAL WARNING: NO TEST SAMPLES REMAINING!\n"
+                "!" * 70 + "\n"
+                f"  All {test_keys_before} test samples were excluded (no tumor label 2).\n"
+                f"  Sanity check removed all test samples.\n"
+                "\n"
+                "This means:\n"
+                "  - Test set evaluation will fail\n"
+                "  - No checkpoints can be saved\n"
+                "\n"
+                "Possible causes:\n"
+                "  - Dataset doesn't contain tumor labels (label 2)\n"
+                "  - Wrong dataset selected\n"
+                "  - Preprocessing issue\n"
+                "!" * 70
+            )
+            self.print_to_log_file(warning_msg)
+            check_if_proceed(warning_msg)
+        
+        if len(original_keys) == 0:
+            warning_msg = (
+                "\n" + "!" * 70 + "\n"
+                "CRITICAL WARNING: NO ORIGINAL TRAINING SAMPLES REMAINING!\n"
+                "!" * 70 + "\n"
+                f"  All {original_keys_before} original samples were excluded (no tumor label 2).\n"
+                f"  Sanity check removed all original training samples.\n"
+                "\n"
+                "This means:\n"
+                "  - Tuning set will be empty (no adaptive strategy)\n"
+                "  - Training may only use synthetic data (if available)\n"
+                "\n"
+                "Possible causes:\n"
+                "  - Dataset doesn't contain tumor labels (label 2)\n"
+                "  - Wrong dataset selected\n"
+                "  - Preprocessing issue\n"
+                f"  - Regex pattern too restrictive: '{self.pattern_original_samples}'\n"
+                "!" * 70
+            )
+            self.print_to_log_file(warning_msg)
+            check_if_proceed(warning_msg)
+        
+        # =====================================================================
         # STEP 6: Create tuning set from ORIGINAL samples only
         # =====================================================================
         # IMPORTANT: Sort original_keys first to ensure determinism
@@ -3014,6 +3188,29 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases (100% original)")
         self.print_to_log_file(f"  - Test:     {len(test_keys)} cases (original val fold)")
         self.print_to_log_file("-" * 70 + "\n")
+        
+        # =====================================================================
+        # STEP 9 (OPTIONAL): INTEGRATION TEST - Limit samples per split
+        # =====================================================================
+        if self.integration_test_mode:
+            max_samples = self.integration_test_max_samples
+            
+            train_keys_before = len(train_keys)
+            tuning_keys_before = len(self.tuning_keys)
+            test_keys_before = len(test_keys)
+            
+            # Limit samples in each split
+            train_keys = train_keys[:max_samples]
+            self.tuning_keys = self.tuning_keys[:max_samples]
+            test_keys = test_keys[:max_samples]
+            
+            self.print_to_log_file("\n" + "=" * 70)
+            self.print_to_log_file("*** INTEGRATION TEST: Sample limits applied ***")
+            self.print_to_log_file(f"  Training: {train_keys_before} → {len(train_keys)} (max {max_samples})")
+            self.print_to_log_file(f"  Tuning:   {tuning_keys_before} → {len(self.tuning_keys)} (max {max_samples})")
+            self.print_to_log_file(f"  Test:     {test_keys_before} → {len(test_keys)} (max {max_samples})")
+            self.print_to_log_file(f"  Total samples: {len(train_keys) + len(self.tuning_keys) + len(test_keys)}")
+            self.print_to_log_file("=" * 70 + "\n")
         
         return train_keys, test_keys
     
@@ -3672,11 +3869,24 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     # Load preprocessed data (FULL volume, no cropping)
                     data, seg, seg_prev, properties = dataset.load_case(key)
                     
-                    # seg shape: (1, D, H, W) or (D, H, W)
-                    seg_np = seg[0] if seg.ndim == 4 else seg
-                    volume_shape = tuple(seg_np.shape)  # (D, H, W)
+                    # Store original for metric computation
+                    seg_orig = seg
+                    original_shape = tuple((seg[0] if seg.ndim == 4 else seg).shape)
                     
-                    # Get or compute foreground box info (CACHED)
+                    # PAD data and seg to at least patch_size (critical for UNet residual connections)
+                    # This mirrors what nnUNet predictor does in predict_sliding_window_return_logits
+                    data_padded, slicer_revert = pad_nd_image(
+                        np.asarray(data), patch_size, 'constant', {'value': 0}, True, None
+                    )
+                    seg_padded, _ = pad_nd_image(
+                        np.asarray(seg), patch_size, 'constant', {'value': 0}, True, None
+                    )
+                    
+                    # Use PADDED shapes for sliding window computation
+                    seg_np = seg_padded[0] if seg_padded.ndim == 4 else seg_padded
+                    volume_shape = tuple(seg_np.shape)  # (D, H, W) after padding
+                    
+                    # Get or compute foreground box info (CACHED) - based on PADDED volume
                     box_info = self._get_cached_foreground_boxes(
                         seg_np, volume_shape, cache_key=key
                     )
@@ -3771,9 +3981,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                         patch_size = self.configuration_manager.patch_size
                         num_classes = self.label_manager.num_segmentation_heads
                         
-                        # Convert data to tensor but DON'T move to GPU yet
-                        data_np = np.asarray(data)
-                        seg_np_full = np.asarray(seg)
+                        # Use PADDED data for inference (patches will be correctly sized)
+                        data_np = np.asarray(data_padded)
+                        seg_np_full = np.asarray(seg_padded)
                         if seg_np_full.ndim == 4:
                             seg_np_full = seg_np_full[0]
                         
@@ -3839,11 +4049,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                         # =====================================================================
                         # FULL-VOLUME PATH: Used for test set (complete evaluation)
                         # =====================================================================
-                        # Convert to tensor (FULL volume)
-                        # Use np.asarray() to handle NDArray/memmap types from dataset.load_case()
-                        data_tensor = torch.from_numpy(np.asarray(data)).float()
-                        # Keep seg_tensor on CPU - metrics will be computed on CPU
-                        seg_tensor = torch.from_numpy(np.asarray(seg)).long()
+                        # Use PADDED data for inference (ensures all patches are correctly sized)
+                        data_tensor = torch.from_numpy(np.asarray(data_padded)).float()
                         
                         # Run selective sliding window inference (on GPU)
                         # Only processes foreground boxes, returns valid_mask for metric computation
@@ -3854,6 +4061,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                         # Move predictions to CPU for metric computation (saves GPU memory)
                         predicted_logits = predicted_logits.cpu()
                         valid_mask = valid_mask.cpu()
+                        
+                        # REVERT PADDING on predictions and valid_mask to match original volume
+                        # slicer_revert is for spatial dims, need to add channel dim for predicted_logits
+                        predicted_logits = predicted_logits[(slice(None),) + slicer_revert[1:]]
+                        valid_mask = valid_mask[slicer_revert[1:]]
+                        
+                        # Use ORIGINAL (unpadded) seg for metric computation
+                        seg_tensor = torch.from_numpy(np.asarray(seg_orig)).long()
                         
                         # Compute metrics on CPU - more memory efficient for large volumes
                         # valid_mask excludes pure-background regions from metric computation
@@ -3977,11 +4192,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         Compute tuning metrics using dual-crop evaluation (legacy method).
         
         For each sample, creates two patches: one anatomy-centered, one tumor-centered.
+        This means each sample generates 2 patches, so total patches = 2 * num_samples.
         """
         self.network.eval()
         
-        # Determine number of batches (similar to validation)
-        num_batches = max(1, len(self.tuning_keys) // self.batch_size)
+        # Determine number of batches
+        # Dual-crop generates 2 patches per sample (1 anatomy + 1 tumor)
+        total_patches = len(self.tuning_keys) * 2
+        num_batches = max(1, total_patches // self.batch_size)
         num_batches = min(num_batches, 50)  # Cap at 50 batches for efficiency
         
         tuning_outputs = []
@@ -4350,25 +4568,38 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         if ASYNC_TEST_EVAL and self._async_eval_process is not None:
             result = self._check_async_eval_result()
             if result:
-                self.print_to_log_file(f"\n[Async] *** Received results from epoch {result.get('epoch', '?')} evaluation ***")
+                self.print_to_log_file(f"\n[MP] *** Received results from epoch {result.get('epoch', '?')} evaluation ***")
                 self._handle_async_eval_result(result)
         
         # =====================================================================
-        # NOT AN EVALUATION EPOCH: Use cached results
+        # NOT AN EVALUATION EPOCH: Use cached or placeholder results
         # =====================================================================
-        if not is_eval_epoch and self._last_eval_results is not None:
-            global_dc_per_class = self._last_eval_results['dice_per_class']
-            recall_per_class = self._last_eval_results['recall_per_class']
-            precision_per_class = self._last_eval_results['precision_per_class']
-            f1_per_class = self._last_eval_results['f1_per_class']
-            fpr_per_class = self._last_eval_results['fpr_per_class']
-            loss_here = self._last_eval_results['loss']
-            self.print_to_log_file(f"  Using cached test metrics from epoch {self._last_eval_epoch}")
+        if not is_eval_epoch:
+            if self._last_eval_results is not None:
+                global_dc_per_class = self._last_eval_results['dice_per_class']
+                recall_per_class = self._last_eval_results['recall_per_class']
+                precision_per_class = self._last_eval_results['precision_per_class']
+                f1_per_class = self._last_eval_results['f1_per_class']
+                fpr_per_class = self._last_eval_results['fpr_per_class']
+                loss_here = self._last_eval_results['loss']
+                self.print_to_log_file(f"  Using cached test metrics from epoch {self._last_eval_epoch}")
+            else:
+                # No cached results yet (async eval from epoch 0 hasn't finished)
+                # Use placeholder values - DO NOT run sync evaluation
+                num_classes = len(self.label_manager.foreground_labels)
+                global_dc_per_class = [0.0] * num_classes
+                recall_per_class = [0.0] * num_classes
+                precision_per_class = [0.0] * num_classes
+                f1_per_class = [0.0] * num_classes
+                fpr_per_class = [0.0] * num_classes
+                loss_here = 0.0
+                self.print_to_log_file(f"  No cached test metrics yet (async eval in progress)")
+            self._async_eval_in_progress = False  # Not spawning new subprocess
             
         # =====================================================================
         # ASYNC TEST EVAL: Spawn subprocess and use cached metrics
         # =====================================================================
-        elif is_eval_epoch and ASYNC_TEST_EVAL and self.test_eval_mode == 'sliding_window':
+        elif ASYNC_TEST_EVAL and self.test_eval_mode == 'sliding_window':
             test_keys = list(self._dl_val._data.identifiers)
             
             # Spawn async evaluation subprocess
@@ -4548,10 +4779,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # Async test eval is running - checkpoint saving is handled by subprocess
             # Check if subprocess is still alive
             if self._async_eval_process is not None and self._async_eval_process.is_alive():
-                self.print_to_log_file(f"  [Async] Test eval still running in background (epoch {self._async_eval_epoch})")
+                self.print_to_log_file(f"  [MP] Test eval still running in background (epoch {self._async_eval_epoch})")
             else:
-                self.print_to_log_file(f"  [Async] Test eval spawned for epoch {self._async_eval_epoch}")
-            self.print_to_log_file(f"  [Async] Checkpoint saving will be handled by subprocess")
+                self.print_to_log_file(f"  [MP] Test eval spawned for epoch {self._async_eval_epoch}")
+            self.print_to_log_file(f"  [MP] Checkpoint saving will be handled by subprocess")
         elif self._should_run_evaluation():
             # Use single-epoch tumor dice for checkpoint ranking (NOT EMA)
             # mean_fg_dice is actually tumor_dice for this trainer (see on_validation_epoch_end)
