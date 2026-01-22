@@ -101,9 +101,10 @@ from nnunetv2.inference.sliding_window_prediction import compute_steps_for_slidi
 # Set these before training to control behavior
 
 # Pre-training evaluation: run sliding window eval before first epoch
-# Useful for debugging, but slows down startup
-ENABLE_PRE_TRAINING_EVAL = False  # Set to True for debugging
-ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET = True
+# Useful for debugging, catches evaluation bugs early before wasting training time
+ENABLE_PRE_TRAINING_EVAL = True  # Test set pre-training eval (sliding window)
+ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET = True  # Tuning set pre-training eval (dual-crop)
+PRE_TRAINING_EVAL_MAX_SAMPLES = 5  # Limit samples for faster pre-training sanity check
 
 # Async test evaluation: run test set evaluation in a subprocess
 # This allows training to continue while test evaluation runs in parallel
@@ -116,7 +117,21 @@ ASYNC_TEST_EVAL = True  # Set to False to use synchronous evaluation
 ASYNC_EVAL_GPU_ID = None  # Set to a different GPU ID if available
 
 # Timeout for async evaluation (seconds)
-ASYNC_EVAL_TIMEOUT = 3600  # 2 hours default
+ASYNC_EVAL_TIMEOUT = 3600  # 1 hour default
+
+# Minimum success rate for subprocess evaluation
+# If fewer than this fraction of samples are successfully processed, the evaluation is considered unreliable
+# With timeout support, we lower this to 50% since timeout can legitimately reduce sample count
+ASYNC_EVAL_MIN_SUCCESS_RATE = 0.50  # 50% of samples must succeed (lowered to accommodate timeout)
+
+# Maximum time (in minutes) for subprocess to run before timing out
+# When timeout is reached, metrics are computed from already-processed samples
+ASYNC_EVAL_TIMEOUT_MINUTES = 60  # 50 minutes max
+
+# Whether to exit main process when subprocess evaluation fails
+# If True, main process will raise RuntimeError and exit gracefully
+# If False, main process logs error and continues training
+ASYNC_EVAL_EXIT_ON_FAILURE = True
 
 
 # =============================================================================
@@ -178,10 +193,17 @@ def _async_test_eval_worker(
     import sys
     import json
     import traceback
+    from datetime import datetime
+    
+    # Helper for timestamped logging in subprocess
+    def _mp_log(msg: str):
+        """Print with timestamp and [MP] prefix for subprocess logs."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print(f"{timestamp}: [MP] {msg}", flush=True)
     
     # Verify GPU setting (for debugging)
     actual_gpu = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
-    print(f"[MP] CUDA_VISIBLE_DEVICES={actual_gpu}")
+    _mp_log(f"CUDA_VISIBLE_DEVICES={actual_gpu}")
     
     try:
         # All imports happen AFTER CUDA_VISIBLE_DEVICES is set by initializer
@@ -203,7 +225,7 @@ def _async_test_eval_worker(
         
         # Now initialize CUDA - this creates a fresh CUDA context for this subprocess
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"[MP] Using device: {device}, torch.cuda.device_count()={torch.cuda.device_count() if torch.cuda.is_available() else 0}")
+        _mp_log(f"Using device: {device}, torch.cuda.device_count()={torch.cuda.device_count() if torch.cuda.is_available() else 0}")
         
         # Load checkpoint
         checkpoint = torch.load(temp_ckpt_path, map_location='cpu', weights_only=False)
@@ -256,12 +278,31 @@ def _async_test_eval_worker(
         current_epoch = eval_config['current_epoch']
         num_classes = label_manager.num_segmentation_heads
         enable_deep_supervision = eval_config.get('enable_deep_supervision', True)
+        timeout_minutes = eval_config.get('timeout_minutes', 50)  # Default 50 min timeout
         
-        # Run sliding window evaluation
+        # Run sliding window evaluation with timeout tracking
+        import time
+        start_time = time.time()
+        timeout_seconds = timeout_minutes * 60
+        timed_out = False
+        skipped_samples = []  # Track samples skipped due to timeout
+        
         all_outputs = []
+        failed_samples = []  # Track failed sample keys
+        total_samples = len(test_keys)
         
         with torch.no_grad():
-            for key in tqdm(test_keys, desc=f"[MP] Test SW Eval (epoch {current_epoch})"):
+            for sample_idx, key in enumerate(tqdm(test_keys, desc=f"[MP] Test SW Eval (epoch {current_epoch})")):
+                # Check for timeout at the start of each sample
+                elapsed_time = time.time() - start_time
+                if elapsed_time >= timeout_seconds:
+                    remaining_keys = test_keys[sample_idx:]  # Use index directly, O(1)
+                    skipped_samples.extend(remaining_keys)
+                    timed_out = True
+                    _mp_log(f"TIMEOUT: Reached {timeout_minutes} min limit after {len(all_outputs)} samples. "
+                            f"Skipping remaining {len(remaining_keys)} samples.")
+                    break
+                
                 try:
                     data, seg, seg_prev, properties = test_dataset.load_case(key)
                     
@@ -271,12 +312,14 @@ def _async_test_eval_worker(
                     
                     # PAD data and seg to at least patch_size (critical for UNet residual connections)
                     # This mirrors what nnUNet predictor does in predict_sliding_window_return_logits
+                    # NOTE: pad_nd_image uses np.pad for numpy arrays (expects 'constant_values')
+                    #       and torch.nn.functional.pad for tensors (expects 'value')
                     from acvl_utils.cropping_and_padding.padding import pad_nd_image
                     data_padded, slicer_revert = pad_nd_image(
-                        np.asarray(data), patch_size, 'constant', {'value': 0}, True, None
+                        np.asarray(data), patch_size, 'constant', {'constant_values': 0}, True, None
                     )
                     seg_padded, _ = pad_nd_image(
-                        np.asarray(seg), patch_size, 'constant', {'value': 0}, True, None
+                        np.asarray(seg), patch_size, 'constant', {'constant_values': 0}, True, None
                     )
                     
                     # Use padded shapes for sliding window computation
@@ -419,16 +462,67 @@ def _async_test_eval_worker(
                     torch.cuda.empty_cache()
                     
                 except Exception as e:
-                    print(f"[MP] Warning: Failed to process {key}: {e}")
+                    _mp_log(f"Warning: Failed to process {key}: {e}")
                     traceback.print_exc()
+                    failed_samples.append(key)
                     continue
         
+        # Check success rate
+        # When timed_out, calculate rate from attempted samples only (exclude skipped)
+        attempted_samples = total_samples - len(skipped_samples)
+        successful_samples = attempted_samples - len(failed_samples)
+        success_rate = successful_samples / attempted_samples if attempted_samples > 0 else 0.0
+        min_success_rate = eval_config.get('min_success_rate', 0.5)  # Lowered to 50%
+        
+        elapsed_minutes = (time.time() - start_time) / 60
+        _mp_log(f"Completed in {elapsed_minutes:.1f} min. "
+                f"Processed {successful_samples}/{attempted_samples} attempted samples successfully ({success_rate*100:.1f}%)")
+        if timed_out:
+            _mp_log(f"Timed out: {len(skipped_samples)} samples skipped due to {timeout_minutes} min limit")
+        if failed_samples:
+            _mp_log(f"Failed samples: {failed_samples[:10]}{'...' if len(failed_samples) > 10 else ''}")
+        
         # Aggregate results
+        # We now compute metrics even with low success rate, but mark them as unreliable
         if not all_outputs:
             result = {
                 'success': False,
-                'error': 'No outputs collected',
+                'error': 'No outputs collected - all samples failed or skipped',
                 'epoch': current_epoch,
+                'total_samples': total_samples,
+                'attempted_samples': attempted_samples,
+                'failed_samples': failed_samples,
+                'skipped_samples': len(skipped_samples),
+                'timed_out': timed_out,
+            }
+        elif success_rate < min_success_rate:
+            # Low success rate - compute metrics anyway but mark as unreliable
+            # Main process will decide whether to use these metrics
+            _mp_log(f"Warning: Low success rate ({success_rate*100:.1f}% < {min_success_rate*100:.1f}%). "
+                    f"Computing metrics from {successful_samples} samples anyway.")
+            
+            outputs_collated = collate_outputs(all_outputs)
+            tp = np.sum(outputs_collated['tp_hard'], 0)
+            fp = np.sum(outputs_collated['fp_hard'], 0)
+            fn = np.sum(outputs_collated['fn_hard'], 0)
+            tn = np.sum(outputs_collated['tn_hard'], 0)
+            
+            dice_per_class = [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0.0 
+                             for i, j, k in zip(tp, fp, fn)]
+            
+            result = {
+                'success': True,  # Mark as success but with warning flag
+                'unreliable': True,  # Flag for main process to decide
+                'warning': f'Low success rate: {success_rate*100:.1f}% < {min_success_rate*100:.1f}% threshold',
+                'epoch': current_epoch,
+                'dice_per_class': dice_per_class,
+                'total_samples': total_samples,
+                'attempted_samples': attempted_samples,
+                'successful_samples': successful_samples,
+                'failed_samples': len(failed_samples),
+                'skipped_samples': len(skipped_samples),
+                'success_rate': success_rate,
+                'timed_out': timed_out,
             }
         else:
             outputs_collated = collate_outputs(all_outputs)
@@ -469,7 +563,7 @@ def _async_test_eval_worker(
                         try:
                             os.rename(src_path, dst_path)
                         except Exception as e:
-                            print(f"[MP] Warning: Could not rename {src_name} to {dst_name}: {e}")
+                            _mp_log(f"Warning: Could not rename {src_name} to {dst_name}: {e}")
                 
                 # Remove old last rank if list was full
                 if len(top_k_dices) >= top_k_checkpoints:
@@ -490,10 +584,11 @@ def _async_test_eval_worker(
                 checkpoint['_best_ema'] = tumor_dice
                 torch.save(checkpoint, ckpt_path)
                 checkpoint_saved = ckpt_name
-                print(f"[MP] Saved checkpoint: {ckpt_name} (Dice: {tumor_dice:.4f}, Rank: {achieved_rank})")
+                _mp_log(f"Saved checkpoint: {ckpt_name} (Dice: {tumor_dice:.4f}, Rank: {achieved_rank})")
             
             result = {
                 'success': True,
+                'unreliable': False,  # High success rate, metrics are reliable
                 'epoch': current_epoch,
                 'dice_per_class': dice_per_class,
                 'recall_per_class': recall_per_class,
@@ -503,13 +598,20 @@ def _async_test_eval_worker(
                 'tumor_dice': tumor_dice,
                 'achieved_rank': achieved_rank,
                 'checkpoint_saved': checkpoint_saved,
+                'total_samples': total_samples,
+                'attempted_samples': attempted_samples,
+                'successful_samples': successful_samples,
+                'failed_samples': len(failed_samples),
+                'skipped_samples': len(skipped_samples),
+                'success_rate': success_rate,
+                'timed_out': timed_out,
             }
         
         # Write result
         with open(result_path, 'w') as f:
             json.dump(result, f, indent=2)
         
-        print(f"[MP] Evaluation complete. Tumor Dice: {result.get('tumor_dice', 'N/A')}")
+        _mp_log(f"Evaluation complete. Tumor Dice: {result.get('tumor_dice', 'N/A')}")
         
     except Exception as e:
         error_result = {
@@ -520,7 +622,7 @@ def _async_test_eval_worker(
         }
         with open(result_path, 'w') as f:
             json.dump(error_result, f, indent=2)
-        print(f"[MP] Evaluation FAILED: {e}")
+        _mp_log(f"Evaluation FAILED: {e}")
 
 
 # =============================================================================
@@ -2314,6 +2416,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             'max_patches_per_sample': self.test_max_patches_per_sample,
             'current_epoch': epoch,
             'enable_deep_supervision': self.enable_deep_supervision,
+            'min_success_rate': ASYNC_EVAL_MIN_SUCCESS_RATE,  # Minimum sample success rate
+            'timeout_minutes': ASYNC_EVAL_TIMEOUT_MINUTES,  # Max time before timeout
         }
         
         # Get plans identifier for checkpoint naming
@@ -2453,7 +2557,11 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             self._async_eval_process.join(timeout=5)
             if self._async_eval_process.is_alive():
                 self._async_eval_process.kill()
-            return None
+            return {
+                'success': False, 
+                'error': f'Evaluation timed out after {timeout}s and was terminated',
+                'epoch': self._async_eval_epoch
+            }
         
         # Check for result
         if self._async_eval_result_path and isfile(self._async_eval_result_path):
@@ -2462,9 +2570,18 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     return json.load(f)
             except Exception as e:
                 self.print_to_log_file(f"[MP] Warning: Could not read result: {e}")
-                return None
+                return {
+                    'success': False,
+                    'error': f'Could not read result file: {e}',
+                    'epoch': self._async_eval_epoch
+                }
         
-        return None
+        # Process finished but no result file
+        return {
+            'success': False,
+            'error': 'Process finished without writing result file (likely crashed)',
+            'epoch': self._async_eval_epoch
+        }
     
     def _handle_async_eval_result(self, result: dict) -> None:
         """
@@ -2478,39 +2595,101 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         IMPORTANT: To ensure consistency, we re-scan checkpoint files after
         the subprocess saves. This handles race conditions where the subprocess
         might have saved/renamed checkpoints.
+        
+        Raises:
+            RuntimeError: If evaluation failed and ASYNC_EVAL_EXIT_ON_FAILURE is True
         """
         epoch = result.get('epoch', self._async_eval_epoch)
         
         if not result.get('success', False):
-            self.print_to_log_file(f"[MP] Epoch {epoch} evaluation FAILED: {result.get('error', 'Unknown error')}")
+            error_msg = result.get('error', 'Unknown error')
+            self.print_to_log_file(f"[MP] Epoch {epoch} evaluation FAILED: {error_msg}")
+            
+            # Log additional failure details
+            if 'total_samples' in result:
+                self.print_to_log_file(f"[MP]   Total samples: {result['total_samples']}")
+            if 'successful_samples' in result:
+                self.print_to_log_file(f"[MP]   Successful samples: {result['successful_samples']}")
+            if 'success_rate' in result:
+                self.print_to_log_file(f"[MP]   Success rate: {result['success_rate']*100:.1f}%")
+            if 'failed_samples' in result:
+                failed = result['failed_samples']
+                self.print_to_log_file(f"[MP]   Failed samples ({len(failed)}): {failed[:5]}{'...' if len(failed) > 5 else ''}")
             if 'traceback' in result:
                 self.print_to_log_file(f"[MP] Traceback:\n{result['traceback']}")
+            
+            # Cleanup temp files before potentially raising
+            self._cleanup_temp_checkpoint(epoch)
+            
+            # Reset state
+            self._async_eval_process = None
+            self._async_eval_epoch = -1
+            self._async_eval_result_path = None
+            
+            # Raise error to stop main process if configured
+            if ASYNC_EVAL_EXIT_ON_FAILURE:
+                raise RuntimeError(
+                    f"Test set evaluation failed (epoch {epoch}): {error_msg}. "
+                    f"Set ASYNC_EVAL_EXIT_ON_FAILURE=False to continue training despite evaluation failures."
+                )
+            return
+        
+        # Success case - log sample success rate and handle unreliable results
+        tumor_dice = result.get('tumor_dice', 0)
+        achieved_rank = result.get('achieved_rank', 0)
+        checkpoint_saved = result.get('checkpoint_saved', None)
+        is_unreliable = result.get('unreliable', False)
+        timed_out = result.get('timed_out', False)
+        
+        self.print_to_log_file(f"[MP] Epoch {epoch} evaluation complete:")
+        
+        # Log timeout and sample statistics
+        if timed_out:
+            self.print_to_log_file(f"  ⚠ TIMED OUT after {ASYNC_EVAL_TIMEOUT_MINUTES} min")
+            self.print_to_log_file(f"  Skipped {result.get('skipped_samples', 0)} samples due to timeout")
+        
+        if 'success_rate' in result:
+            attempted = result.get('attempted_samples', result.get('total_samples', '?'))
+            successful = result.get('successful_samples', '?')
+            total = result.get('total_samples', '?')
+            self.print_to_log_file(f"  Sample success rate: {result['success_rate']*100:.1f}% ({successful}/{attempted} attempted, {total} total)")
+        
+        # Handle unreliable results
+        if is_unreliable:
+            warning_msg = result.get('warning', 'Low sample success rate')
+            self.print_to_log_file(f"  ⚠ UNRELIABLE METRICS: {warning_msg}")
+            self.print_to_log_file(f"  → Metrics computed but may not be representative")
+            self.print_to_log_file(f"  → Skipping checkpoint save for this epoch")
+            # For unreliable results, we log the dice but don't save checkpoints
+            if 'dice_per_class' in result:
+                self.print_to_log_file(f"  Dice per class (unreliable): {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
+            # Cleanup and return without checkpoint operations
+            self._cleanup_temp_checkpoint(epoch)
+            self._async_eval_process = None
+            self._async_eval_epoch = -1
+            self._async_eval_result_path = None
+            return
+        
+        self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+        self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
+        
+        if achieved_rank > 0:
+            self.print_to_log_file(f"  → Achieved rank {achieved_rank}! Checkpoint: {checkpoint_saved}")
+            
+            # Re-scan checkpoint files to ensure consistency
+            # The subprocess has modified checkpoint files, so we need to
+            # refresh our view of the top-k list from disk
+            self.print_to_log_file(f"  → Re-scanning top-k checkpoints from disk for consistency...")
+            self.top_k_dices = self._scan_existing_top_k_checkpoints()
+            
+            # Update _best_dice if rank 1
+            if achieved_rank == 1:
+                self._best_dice = tumor_dice
+                self._best_ema = tumor_dice
+                
+            self.print_to_log_file(f"  → Top-k list updated: {[(np.round(d, 4), e) for d, e in self.top_k_dices]}")
         else:
-            tumor_dice = result.get('tumor_dice', 0)
-            achieved_rank = result.get('achieved_rank', 0)
-            checkpoint_saved = result.get('checkpoint_saved', None)
-            
-            self.print_to_log_file(f"[MP] Epoch {epoch} evaluation complete:")
-            self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
-            self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
-            
-            if achieved_rank > 0:
-                self.print_to_log_file(f"  → Achieved rank {achieved_rank}! Checkpoint: {checkpoint_saved}")
-                
-                # Re-scan checkpoint files to ensure consistency
-                # The subprocess has modified checkpoint files, so we need to
-                # refresh our view of the top-k list from disk
-                self.print_to_log_file(f"  → Re-scanning top-k checkpoints from disk for consistency...")
-                self.top_k_dices = self._scan_existing_top_k_checkpoints()
-                
-                # Update _best_dice if rank 1
-                if achieved_rank == 1:
-                    self._best_dice = tumor_dice
-                    self._best_ema = tumor_dice
-                    
-                self.print_to_log_file(f"  → Top-k list updated: {[(np.round(d, 4), e) for d, e in self.top_k_dices]}")
-            else:
-                self.print_to_log_file(f"  → Did not qualify for top-{self.top_k_checkpoints}")
+            self.print_to_log_file(f"  → Did not qualify for top-{self.top_k_checkpoints}")
             
             # Cache results
             self._last_eval_results = {
@@ -2613,19 +2792,31 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             try:
                 self.network.eval()
                 
+                # Limit samples for faster sanity check
+                tuning_keys_for_pretraining = self.tuning_keys
+                if PRE_TRAINING_EVAL_MAX_SAMPLES is not None and len(self.tuning_keys) > PRE_TRAINING_EVAL_MAX_SAMPLES:
+                    rng = np.random.default_rng(seed=42)  # Deterministic for reproducibility
+                    tuning_keys_for_pretraining = rng.choice(
+                        self.tuning_keys, size=PRE_TRAINING_EVAL_MAX_SAMPLES, replace=False
+                    ).tolist()
+                    self.print_to_log_file(f"  Limiting to {PRE_TRAINING_EVAL_MAX_SAMPLES}/{len(self.tuning_keys)} random samples for sanity check")
+                
                 if self.tuning_eval_mode == 'sliding_window':
-                    self.print_to_log_file(f"Running sliding window evaluation on {len(self.tuning_keys)} tuning samples...")
+                    self.print_to_log_file(f"Running sliding window evaluation on {len(tuning_keys_for_pretraining)} tuning samples...")
                     self.print_to_log_file(f"  Max patches per sample: {self.tuning_max_patches_per_sample or 'ALL'}")
                     pre_train_tuning_metrics = self.compute_metrics_sliding_window(
                         self.tuning_dataset,
-                        self.tuning_keys,
+                        tuning_keys_for_pretraining,
                         num_samples=None,
                         max_patches_per_sample=self.tuning_max_patches_per_sample,
                         progress_desc="Pre-train Tuning SW Eval"
                     )
                 else:
-                    self.print_to_log_file(f"Running dual-crop evaluation on {len(self.tuning_keys)} tuning samples ({len(self.tuning_keys) * 2} patches)...")
-                    pre_train_tuning_metrics = self._compute_tuning_metrics_dual_crop()
+                    # For pre-training sanity check, limit batches (not specific samples)
+                    # ~3 batches covers roughly 5-6 samples with typical batch_size=2
+                    max_batches_for_pretraining = max(1, (PRE_TRAINING_EVAL_MAX_SAMPLES * 2 + self.batch_size - 1) // self.batch_size)
+                    self.print_to_log_file(f"Running dual-crop evaluation ({max_batches_for_pretraining} batches, batch_size={self.batch_size})...")
+                    pre_train_tuning_metrics = self._compute_tuning_metrics_dual_crop(max_batches=max_batches_for_pretraining)
                 
                 # Log the metrics
                 self.print_to_log_file("\nPre-training tuning set metrics:")
@@ -2661,53 +2852,65 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 self.network.train()
         
         # ---------------------------------------------------------------------
-        # MAIN PRE-TRAINING EVALUATION (test set, full sliding window)
+        # MAIN PRE-TRAINING EVALUATION (test set, sliding window sanity check)
         # ---------------------------------------------------------------------
         if ENABLE_PRE_TRAINING_EVAL:
             self.print_to_log_file("\n" + "=" * 70)
             self.print_to_log_file("PRE-TRAINING TEST SET EVALUATION (before epoch 0)")
             self.print_to_log_file("=" * 70)
-            self.print_to_log_file("Purpose: Verify test evaluation works correctly")
-            self.print_to_log_file("         and establish baseline metrics before training")
+            self.print_to_log_file("Purpose: Verify test evaluation (sliding window) works correctly")
+            self.print_to_log_file("         and catch bugs before wasting training time")
             self.print_to_log_file("-" * 70)
             
             try:
                 self.network.eval()
                 test_keys = list(self._dl_val._data.identifiers)
                 
+                # Limit samples for faster sanity check
+                test_keys_for_pretraining = test_keys
+                if PRE_TRAINING_EVAL_MAX_SAMPLES is not None and len(test_keys) > PRE_TRAINING_EVAL_MAX_SAMPLES:
+                    rng = np.random.default_rng(seed=42)  # Deterministic for reproducibility
+                    test_keys_for_pretraining = rng.choice(
+                        test_keys, size=PRE_TRAINING_EVAL_MAX_SAMPLES, replace=False
+                    ).tolist()
+                    self.print_to_log_file(f"  Limiting to {PRE_TRAINING_EVAL_MAX_SAMPLES}/{len(test_keys)} random samples for sanity check")
+                
                 if self.test_eval_mode == 'sliding_window':
-                    self.print_to_log_file(f"Running sliding window evaluation on {len(test_keys)} test samples...")
+                    self.print_to_log_file(f"Running sliding window evaluation on {len(test_keys_for_pretraining)} test samples...")
                     self.print_to_log_file(f"  Max patches per sample: {self.test_max_patches_per_sample or 'ALL'}")
                     pre_train_test_metrics = self.compute_metrics_sliding_window(
                         self._dl_val._data,
-                        test_keys,
+                        test_keys_for_pretraining,
                         num_samples=None,
                         max_patches_per_sample=self.test_max_patches_per_sample,
                         progress_desc="Pre-train Test SW Eval"
                     )
                 else:
-                    # Dual-crop for test set (rare case)
-                    self.print_to_log_file(f"Running dual-crop evaluation on {len(test_keys)} test samples ({len(test_keys) * 2} patches)...")
-                    # Would need a separate dual-crop method for test set
-                    # For now, use the tuning dual-crop method with test keys
-                    pre_train_test_metrics = self._compute_tuning_metrics_dual_crop()
+                    # Dual-crop for test set (rare case) - skip pre-training check
+                    # The tuning dataloader is used for dual-crop, so we can't use it for test set
+                    # This is acceptable since test_eval_mode is typically 'sliding_window'
+                    self.print_to_log_file(f"Skipping pre-training dual-crop evaluation for test set")
+                    self.print_to_log_file(f"  (dual-crop uses tuning_dataloader; test set uses sliding_window by default)")
+                    pre_train_test_metrics = None
                 
-                # Log the metrics
-                self.print_to_log_file("\nPre-training test set metrics:")
-                self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in pre_train_test_metrics['dice_per_class']]}")
-                self.print_to_log_file(f"  Mean FG Dice: {np.round(pre_train_test_metrics['mean_fg_dice'], 4)}")
+                # Log the metrics (if available)
+                if pre_train_test_metrics is not None:
+                    self.print_to_log_file("\nPre-training test set metrics:")
+                    self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in pre_train_test_metrics['dice_per_class']]}")
+                    self.print_to_log_file(f"  Mean FG Dice: {np.round(pre_train_test_metrics['mean_fg_dice'], 4)}")
+                    
+                    if len(pre_train_test_metrics['dice_per_class']) > 1:
+                        tumor_dice = pre_train_test_metrics['dice_per_class'][1]
+                        self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+                    
+                    if 'recall_per_class' in pre_train_test_metrics:
+                        self.print_to_log_file(f"  Recall (%): {[np.round(r, 2) for r in pre_train_test_metrics['recall_per_class']]}")
+                        self.print_to_log_file(f"  Precision (%): {[np.round(p, 2) for p in pre_train_test_metrics['precision_per_class']]}")
+                    
+                    self.print_to_log_file("-" * 70)
+                    self.print_to_log_file("✓ Pre-training TEST evaluation completed successfully!")
+                    self.print_to_log_file(f"  {self.test_eval_mode.upper()} evaluation is working correctly.")
                 
-                if len(pre_train_test_metrics['dice_per_class']) > 1:
-                    tumor_dice = pre_train_test_metrics['dice_per_class'][1]
-                    self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
-                
-                if 'recall_per_class' in pre_train_test_metrics:
-                    self.print_to_log_file(f"  Recall (%): {[np.round(r, 2) for r in pre_train_test_metrics['recall_per_class']]}")
-                    self.print_to_log_file(f"  Precision (%): {[np.round(p, 2) for p in pre_train_test_metrics['precision_per_class']]}")
-                
-                self.print_to_log_file("-" * 70)
-                self.print_to_log_file("✓ Pre-training TEST evaluation completed successfully!")
-                self.print_to_log_file(f"  {self.test_eval_mode.upper()} evaluation is working correctly.")
                 self.print_to_log_file("=" * 70 + "\n")
                 
                 # Store pre-training test metrics
@@ -3875,11 +4078,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     
                     # PAD data and seg to at least patch_size (critical for UNet residual connections)
                     # This mirrors what nnUNet predictor does in predict_sliding_window_return_logits
+                    # NOTE: pad_nd_image uses np.pad for numpy arrays (expects 'constant_values')
+                    #       and torch.nn.functional.pad for tensors (expects 'value')
                     data_padded, slicer_revert = pad_nd_image(
-                        np.asarray(data), patch_size, 'constant', {'value': 0}, True, None
+                        np.asarray(data), patch_size, 'constant', {'constant_values': 0}, True, None
                     )
                     seg_padded, _ = pad_nd_image(
-                        np.asarray(seg), patch_size, 'constant', {'value': 0}, True, None
+                        np.asarray(seg), patch_size, 'constant', {'constant_values': 0}, True, None
                     )
                     
                     # Use PADDED shapes for sliding window computation
@@ -4187,26 +4392,44 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # Use dual-crop evaluation (fast, default for tuning)
             return self._compute_tuning_metrics_dual_crop()
     
-    def _compute_tuning_metrics_dual_crop(self) -> dict:
+    def _compute_tuning_metrics_dual_crop(self, max_batches: int = None) -> dict:
         """
         Compute tuning metrics using dual-crop evaluation (legacy method).
         
         For each sample, creates two patches: one anatomy-centered, one tumor-centered.
         This means each sample generates 2 patches, so total patches = 2 * num_samples.
+        
+        Uses the existing self.tuning_dataloader which is already properly configured
+        with transforms and augmentation.
+        
+        Args:
+            max_batches: If set, stop after this many batches (for pre-training sanity check).
+                        If None, runs full evaluation on all tuning samples.
         """
         self.network.eval()
         
+        # Use existing tuning dataloader directly - no need to create temporary one
+        dataloader_to_use = self.tuning_dataloader
+        
         # Determine number of batches
-        # Dual-crop generates 2 patches per sample (1 anatomy + 1 tumor)
-        total_patches = len(self.tuning_keys) * 2
-        num_batches = max(1, total_patches // self.batch_size)
-        num_batches = min(num_batches, 50)  # Cap at 50 batches for efficiency
+        if max_batches is not None:
+            # Limited evaluation for pre-training sanity check
+            num_batches = max_batches
+            desc = f"Pre-train Dual-Crop Eval ({max_batches} batches)"
+        else:
+            # Full evaluation: dual-crop generates 2 patches per sample
+            total_patches = len(self.tuning_keys) * 2
+            num_batches = max(1, total_patches // self.batch_size)
+            num_batches = min(num_batches, 50)  # Cap at 50 batches for efficiency
+            desc = f"Tuning Dual-Crop Eval ({len(self.tuning_keys)} samples)"
         
         tuning_outputs = []
         
         with torch.no_grad():
-            for _ in tqdm(range(num_batches), desc="Tuning Dual-Crop Eval", disable=self.local_rank != 0):
-                batch = next(self.tuning_dataloader)
+            for batch_idx, batch in enumerate(tqdm(dataloader_to_use, total=num_batches, 
+                                                    desc=desc, disable=self.local_rank != 0)):
+                if batch_idx >= num_batches:
+                    break
                 output = self._tuning_step(batch)
                 tuning_outputs.append(output)
         
