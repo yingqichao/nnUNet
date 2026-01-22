@@ -129,6 +129,17 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
                     # Support both _best_dice (new) and _best_ema (legacy)
                     dice = checkpoint.get('_best_dice', checkpoint.get('_best_ema', None))
                     epoch = checkpoint.get('current_epoch', 'unknown')
+                    
+                    # If dice is None, try to recover from logging history
+                    if dice is None and 'logging' in checkpoint:
+                        logging_data = checkpoint['logging']
+                        if 'mean_fg_dice' in logging_data and len(logging_data['mean_fg_dice']) > 0:
+                            dice_history = logging_data['mean_fg_dice']
+                            if isinstance(epoch, int) and epoch > 0 and epoch <= len(dice_history):
+                                dice = dice_history[epoch - 1]
+                            elif len(dice_history) > 0:
+                                dice = dice_history[-1]
+                    
                     found_checkpoints.append((rank, checkpoint_path, dice, epoch))
                 except Exception as e:
                     found_checkpoints.append((rank, checkpoint_path, None, f"Error: {e}"))
@@ -145,6 +156,17 @@ def check_everything_before_training(nnunet_trainer: nnUNetTrainer, skip_confirm
                     # Support both _best_dice (new) and _best_ema (legacy)
                     dice = checkpoint.get('_best_dice', checkpoint.get('_best_ema', None))
                     epoch = checkpoint.get('current_epoch', 'unknown')
+                    
+                    # If dice is None, try to recover from logging history
+                    if dice is None and 'logging' in checkpoint:
+                        logging_data = checkpoint['logging']
+                        if 'mean_fg_dice' in logging_data and len(logging_data['mean_fg_dice']) > 0:
+                            dice_history = logging_data['mean_fg_dice']
+                            if isinstance(epoch, int) and epoch > 0 and epoch <= len(dice_history):
+                                dice = dice_history[epoch - 1]
+                            elif len(dice_history) > 0:
+                                dice = dice_history[-1]
+                    
                     found_checkpoints.append((1, candidate, dice, epoch))
                 except Exception as e:
                     found_checkpoints.append((1, candidate, None, f"Error: {e}"))

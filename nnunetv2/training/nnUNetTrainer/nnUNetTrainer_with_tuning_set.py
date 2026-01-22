@@ -992,8 +992,9 @@ class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
         if self.transforms is not None:
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
-                    data_all = torch.from_numpy(data_all).float()
-                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    # Use np.asarray() to handle NDArray/memmap types
+                    data_all = torch.from_numpy(np.asarray(data_all)).float()
+                    seg_all = torch.from_numpy(np.asarray(seg_all)).to(torch.int16)
                     images = []
                     segs = []
                     for b in range(self.batch_size):
@@ -1172,8 +1173,9 @@ class nnUNetDataLoaderDualCropEval(nnUNetDataLoader):
         if self.transforms is not None:
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
-                    data_all = torch.from_numpy(data_all).float()
-                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    # Use np.asarray() to handle NDArray/memmap types
+                    data_all = torch.from_numpy(np.asarray(data_all)).float()
+                    seg_all = torch.from_numpy(np.asarray(seg_all)).to(torch.int16)
                     images = []
                     segs = []
                     # Process all 2*batch_size patches
@@ -1313,9 +1315,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # dual_crop: Two random patches per sample (faster, legacy)
         self.eval_mode = 'sliding_window'  # Default to sliding window for better accuracy
         self.sliding_window_step_size = 0.5  # Step size for sliding window (0.5 = 50% overlap)
-        # Cache for anatomy bounding boxes (computed once, reused across epochs)
-        # Format: {case_key: (bbox_lbs, bbox_ubs)}
-        self._anatomy_bbox_cache: Dict[str, Tuple[List[int], List[int]]] = {}
+        # Cache for sliding window box classifications (computed once, reused across epochs)
+        # Format: {case_key: {'volume_shape': tuple, 'box_slicers': list, 'foreground_indices': list}}
+        # This caches which sliding window boxes contain foreground (anatomy or tumor)
+        self._sliding_window_box_cache: Dict[str, Dict] = {}
         
         # Simulate perfect anatomy: Zero predictions outside GT anatomy region
         # This makes tumor metrics more meaningful by removing FP from outside anatomy
@@ -1395,6 +1398,16 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         This provides backward compatibility when loading checkpoints that don't
         have top_k_dices stored, or when resuming training with existing checkpoints.
         
+        Recovery strategy for dice value:
+        1. Try '_best_dice' (new checkpoints)
+        2. Try '_best_ema' (legacy checkpoints)
+        3. Try to recover from logging history (checkpoints saved before fix)
+        4. Use -1.0 as fallback (ensures file is tracked but ranked lowest)
+        
+        IMPORTANT: All existing checkpoint FILES are included in the list to ensure
+        proper file management. Checkpoints with unknown dice use -1.0 as fallback
+        so they're ranked lowest but still tracked.
+        
         Returns:
             List of (dice, epoch) tuples sorted descending by dice
         """
@@ -1408,11 +1421,36 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     # Try to get single-epoch dice first, fall back to _best_ema for compatibility
                     dice = checkpoint.get('_best_dice', checkpoint.get('_best_ema', None))
                     epoch = checkpoint.get('current_epoch', 0)
-                    if dice is not None:
-                        top_k_list.append((dice, epoch, rank))
+                    
+                    # If dice is None, try to recover from logging history
+                    if dice is None and 'logging' in checkpoint:
+                        logging_data = checkpoint['logging']
+                        if 'mean_fg_dice' in logging_data and len(logging_data['mean_fg_dice']) > 0:
+                            # Use the last logged dice value (most recent before checkpoint was saved)
+                            # The epoch in checkpoint is current_epoch + 1, so we need epoch - 1 index
+                            dice_history = logging_data['mean_fg_dice']
+                            if epoch > 0 and epoch <= len(dice_history):
+                                dice = dice_history[epoch - 1]
+                                self.print_to_log_file(f"  Recovered dice from logging history for rank {rank}")
+                            elif len(dice_history) > 0:
+                                dice = dice_history[-1]
+                                self.print_to_log_file(f"  Recovered dice from last logged value for rank {rank}")
+                    
+                    # IMPORTANT: Always include checkpoint files in the list to ensure proper management
+                    # Use -1.0 as fallback for unknown dice (ranks lowest but still tracked)
+                    if dice is None:
+                        dice = -1.0  # Fallback value: will be ranked lowest
+                        self.print_to_log_file(f"  Warning: Could not recover dice for rank {rank}, epoch={epoch}, using -1.0 as fallback")
+                    else:
                         self.print_to_log_file(f"  Found existing checkpoint rank {rank}: Dice={dice:.4f}, epoch={epoch}")
+                    
+                    top_k_list.append((dice, epoch, rank))
+                    
                 except Exception as e:
                     self.print_to_log_file(f"  Warning: Could not load checkpoint at rank {rank}: {e}")
+                    # Still track the file even if we can't load it (might be corrupted)
+                    # This prevents orphaned files
+                    top_k_list.append((-1.0, 0, rank))
         
         # Sort by dice descending and drop rank info (used only for logging)
         top_k_list.sort(key=lambda x: x[0], reverse=True)
@@ -1508,11 +1546,15 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Store the dice value for this checkpoint
         old_best_dice = getattr(self, '_best_dice', None)
         self._best_dice = current_dice
+        # Also update _best_ema for backward compatibility (some code expects this)
+        self._best_ema = current_dice
         self.save_checkpoint(checkpoint_path)
         
         # Update _best_dice only if this is rank 1
         if insert_rank != 1:
             self._best_dice = old_best_dice
+            # Also restore _best_ema if not rank 1
+            self._best_ema = old_best_dice if old_best_dice is not None else self._best_ema
         
         # Update the in-memory list
         # Insert at correct position (0-indexed)
@@ -1707,10 +1749,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         self.print_to_log_file("=" * 70 + "\n")
         
-        # Store for reference (accumulate across calls)
-        if not hasattr(self, 'excluded_no_tumor_keys') or self.excluded_no_tumor_keys is None:
-            self.excluded_no_tumor_keys = []
-        self.excluded_no_tumor_keys.extend(excluded_keys)
+        # Store for reference (replace, not extend, to avoid duplicates on multiple calls)
+        self.excluded_no_tumor_keys = excluded_keys
         
         return valid_keys, excluded_keys
     
@@ -1719,76 +1759,33 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         Override to create 3-way split: train/tuning/test.
         
         Processing order:
-        1. SANITY CHECK: Run on ALL keys BEFORE any splitting to get valid keys set
-        2. Get 2-way split from parent (train/test)
-        3. Filter both splits to only include valid keys
-        4. Classify remaining samples as original vs synthetic
-        5. Create tuning set from original samples only
-        6. Cap synthetic data ratio at max_synthetic_ratio (default 50%)
+        1. Get 2-way split from parent (train/test)
+        2. Classify train samples as original vs synthetic
+        3. Determine which synthetic samples will be used (based on max_synthetic_ratio)
+        4. SANITY CHECK: Run ONLY on samples that will actually be used
+           - Skips synthetic samples that will be excluded (saves time!)
+        5. Filter splits to only include valid keys (those with tumor)
+        6. Create tuning set from original samples only
         7. Log final split statistics
         
-        The sanity check runs FIRST on ALL keys so that:
-        - All splits are created from the same filtered pool
-        - No imbalanced set sizes due to different exclusion rates
+        OPTIMIZATION: Sanity check runs AFTER synthetic data decision, so we
+        skip checking synthetic samples that won't be used anyway (e.g., when
+        --ignore_synthetic is set, max_synthetic_ratio=0).
         
         The tuning keys are stored in self.tuning_keys.
         Returns (train_keys, test_keys) - tuning is handled separately.
         """
-        # =====================================================================
-        # STEP 0: SANITY CHECK - Run on ALL keys BEFORE splitting
-        # =====================================================================
-        # Get ALL keys from the preprocessed folder first
-        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
         import os
         
-        # List all sample keys in the preprocessed folder
-        # nnUNet stores samples as <key>.npz or <key>.b2nd (or similar)
-        dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
-        
-        # Get all keys by listing the folder (dataset class handles file extensions)
-        all_files = os.listdir(self.preprocessed_dataset_folder)
-        # Filter to get unique sample keys (remove extensions and _seg suffix)
-        all_keys = set()
-        for f in all_files:
-            # Skip non-data files
-            if f.endswith('.json') or f.endswith('.pkl'):
-                continue
-            # Remove common suffixes to get base key
-            key = f.replace('_seg.b2nd', '').replace('.b2nd', '').replace('_seg.npz', '').replace('.npz', '').replace('.pkl', '')
-            if key and not key.startswith('.'):
-                all_keys.add(key)
-        all_keys = sorted(list(all_keys))
-        
-        self.print_to_log_file(f"\nFound {len(all_keys)} unique samples in preprocessed folder")
-        
-        # Run sanity check on ALL keys at once
-        valid_keys, excluded_keys = self._sanity_check_samples_for_tumor(
-            all_keys, self.preprocessed_dataset_folder
-        )
-        valid_keys_set = set(valid_keys)  # For fast lookup
-        
         # =====================================================================
-        # STEP 1: Get original 2-way split from parent, then filter
+        # STEP 1: Get original 2-way split from parent
         # =====================================================================
         original_tr_keys, test_keys = super().do_split()
         
-        # Filter to only include valid keys (those with tumor)
-        original_tr_keys_before = len(original_tr_keys)
-        test_keys_before = len(test_keys)
-        
-        original_tr_keys = [k for k in original_tr_keys if k in valid_keys_set]
-        test_keys = [k for k in test_keys if k in valid_keys_set]
-        
-        excluded_from_train = original_tr_keys_before - len(original_tr_keys)
-        excluded_from_test = test_keys_before - len(test_keys)
-        
-        if excluded_from_train > 0 or excluded_from_test > 0:
-            self.print_to_log_file(f"*** Applied sanity check filter to splits:")
-            self.print_to_log_file(f"    Train pool: {original_tr_keys_before} → {len(original_tr_keys)} ({excluded_from_train} excluded)")
-            self.print_to_log_file(f"    Test set:   {test_keys_before} → {len(test_keys)} ({excluded_from_test} excluded)")
+        self.print_to_log_file(f"\nParent split: {len(original_tr_keys)} train, {len(test_keys)} test")
         
         # =====================================================================
-        # STEP 2: Classify samples as original vs synthetic
+        # STEP 2: Classify train samples as original vs synthetic
         # =====================================================================
         original_keys = []
         synthetic_keys = []
@@ -1813,11 +1810,99 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file("-" * 70)
         
         # =====================================================================
-        # STEP 3: Create tuning set from ORIGINAL samples only
+        # STEP 3: Determine which synthetic samples will be used
         # =====================================================================
-        # Use fixed seed for deterministic tuning set selection across runs
+        # Use fixed seed for deterministic selection across runs
         rng = np.random.RandomState(seed=12345 + self.fold)
         
+        # Calculate max synthetic samples allowed based on original count
+        # Note: we use full original count here (before tuning set is carved out)
+        # This is a preliminary estimate; final ratio is computed after tuning set
+        if self.max_synthetic_ratio < 1.0 and self.max_synthetic_ratio > 0:
+            # Estimate: assume roughly 80% of original will remain after tuning set
+            estimated_original_in_train = int(len(original_keys) * 0.8)
+            max_synthetic = int(estimated_original_in_train * self.max_synthetic_ratio / (1 - self.max_synthetic_ratio))
+        elif self.max_synthetic_ratio == 0:
+            max_synthetic = 0  # No synthetic data
+        else:
+            max_synthetic = len(synthetic_keys)  # No cap
+        
+        # Determine which synthetic samples will be used
+        if len(synthetic_keys) > max_synthetic:
+            shuffled_synthetic = rng.permutation(synthetic_keys).tolist()
+            synthetic_to_use = shuffled_synthetic[:max_synthetic]
+            synthetic_to_skip = shuffled_synthetic[max_synthetic:]
+        else:
+            synthetic_to_use = synthetic_keys
+            synthetic_to_skip = []
+        
+        # Log synthetic data decision
+        if self.max_synthetic_ratio == 0:
+            self.print_to_log_file(f"\n*** SYNTHETIC DATA DISABLED (max_synthetic_ratio=0) ***")
+            self.print_to_log_file(f"  Skipping {len(synthetic_keys)} synthetic samples from sanity check")
+        elif len(synthetic_to_skip) > 0:
+            self.print_to_log_file(f"\n*** SYNTHETIC DATA CAP PREVIEW ***")
+            self.print_to_log_file(f"  Max synthetic ratio: {self.max_synthetic_ratio:.0%}")
+            self.print_to_log_file(f"  Synthetic to use: {len(synthetic_to_use)}")
+            self.print_to_log_file(f"  Synthetic to skip: {len(synthetic_to_skip)} (will skip sanity check)")
+        
+        # =====================================================================
+        # STEP 4: SANITY CHECK - Only on samples that will actually be used
+        # =====================================================================
+        # Keys to check: test + original + synthetic_to_use
+        # Skip: synthetic_to_skip (saves time when --ignore_synthetic is set!)
+        keys_to_check = list(set(test_keys) | set(original_keys) | set(synthetic_to_use))
+        n_skipped_check = len(synthetic_to_skip)
+        
+        # Check if we already have sanity check results from a loaded checkpoint
+        if self.excluded_no_tumor_keys and len(self.excluded_no_tumor_keys) > 0:
+            # Use cached sanity check results from checkpoint
+            self.print_to_log_file(f"\n*** Using cached sanity check from checkpoint ***")
+            self.print_to_log_file(f"  Excluded samples (no tumor): {len(self.excluded_no_tumor_keys)}")
+            
+            excluded_keys_set = set(self.excluded_no_tumor_keys)
+            valid_keys = [k for k in keys_to_check if k not in excluded_keys_set]
+            excluded_keys = [k for k in keys_to_check if k in excluded_keys_set]
+            
+            self.print_to_log_file(f"  Applied to current keys: {len(keys_to_check)} total, "
+                                   f"{len(valid_keys)} valid, {len(excluded_keys)} excluded")
+        else:
+            # Run sanity check (first time or no checkpoint)
+            self.print_to_log_file(f"\nSanity check: {len(keys_to_check)} samples to check")
+            if n_skipped_check > 0:
+                self.print_to_log_file(f"  Skipping {n_skipped_check} synthetic samples (won't be used)")
+            
+            valid_keys, excluded_keys = self._sanity_check_samples_for_tumor(
+                keys_to_check, self.preprocessed_dataset_folder
+            )
+        
+        valid_keys_set = set(valid_keys)  # For fast lookup
+        
+        # =====================================================================
+        # STEP 5: Filter splits to only include valid keys
+        # =====================================================================
+        test_keys_before = len(test_keys)
+        original_keys_before = len(original_keys)
+        synthetic_to_use_before = len(synthetic_to_use)
+        
+        test_keys = [k for k in test_keys if k in valid_keys_set]
+        original_keys = [k for k in original_keys if k in valid_keys_set]
+        synthetic_to_use = [k for k in synthetic_to_use if k in valid_keys_set]
+        
+        excluded_from_test = test_keys_before - len(test_keys)
+        excluded_from_original = original_keys_before - len(original_keys)
+        excluded_from_synthetic = synthetic_to_use_before - len(synthetic_to_use)
+        
+        if excluded_from_test > 0 or excluded_from_original > 0 or excluded_from_synthetic > 0:
+            self.print_to_log_file(f"*** Applied sanity check filter:")
+            self.print_to_log_file(f"    Test set:   {test_keys_before} → {len(test_keys)} ({excluded_from_test} excluded)")
+            self.print_to_log_file(f"    Original:   {original_keys_before} → {len(original_keys)} ({excluded_from_original} excluded)")
+            if synthetic_to_use_before > 0:
+                self.print_to_log_file(f"    Synthetic:  {synthetic_to_use_before} → {len(synthetic_to_use)} ({excluded_from_synthetic} excluded)")
+        
+        # =====================================================================
+        # STEP 6: Create tuning set from ORIGINAL samples only
+        # =====================================================================
         # IMPORTANT: Sort original_keys first to ensure determinism
         # (order from parent class may vary, but sorted order is always the same)
         sorted_original = sorted(original_keys)
@@ -1836,41 +1921,39 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.tuning_keys = shuffled_original[:n_tuning]
         remaining_original = shuffled_original[n_tuning:]
         
-        self.print_to_log_file(f"Tuning set: {len(self.tuning_keys)} cases (= test set size, from original samples only)")
+        self.print_to_log_file(f"\nTuning set: {len(self.tuning_keys)} cases (= test set size, from original samples only)")
         self.print_to_log_file(f"  [Deterministic] Seed=12345+fold={12345 + self.fold}, sorted before shuffle")
         
         # =====================================================================
-        # STEP 4: Cap synthetic ratio in training set
+        # STEP 7: Finalize synthetic ratio in training set
         # =====================================================================
-        # Training = remaining original + (possibly capped) synthetic
+        # Training = remaining original + synthetic_to_use (already filtered)
         n_remaining_original = len(remaining_original)
         
-        # Calculate max synthetic samples allowed
-        # If synthetic_ratio = 0.5, then synthetic <= original
-        # max_synthetic = original * synthetic_ratio / (1 - synthetic_ratio)
-        if self.max_synthetic_ratio < 1.0:
+        # Re-calculate max synthetic based on actual remaining original
+        if self.max_synthetic_ratio < 1.0 and self.max_synthetic_ratio > 0:
             max_synthetic = int(n_remaining_original * self.max_synthetic_ratio / (1 - self.max_synthetic_ratio))
+        elif self.max_synthetic_ratio == 0:
+            max_synthetic = 0
         else:
-            max_synthetic = len(synthetic_keys)  # No cap
+            max_synthetic = len(synthetic_to_use)
         
-        # Randomly select synthetic samples if we have too many
-        if len(synthetic_keys) > max_synthetic:
-            shuffled_synthetic = rng.permutation(synthetic_keys).tolist()
-            synthetic_for_training = shuffled_synthetic[:max_synthetic]
-            self.removed_synthetic_keys = shuffled_synthetic[max_synthetic:]
-            self.n_synthetic_removed = len(self.removed_synthetic_keys)
-            
+        # Apply final cap (may differ from preliminary estimate)
+        if len(synthetic_to_use) > max_synthetic:
+            synthetic_for_training = synthetic_to_use[:max_synthetic]
+            additional_removed = synthetic_to_use[max_synthetic:]
+            self.removed_synthetic_keys = synthetic_to_skip + additional_removed
+        else:
+            synthetic_for_training = synthetic_to_use
+            self.removed_synthetic_keys = synthetic_to_skip
+        
+        self.n_synthetic_removed = len(self.removed_synthetic_keys)
+        
+        if self.n_synthetic_removed > 0 and self.max_synthetic_ratio > 0:
             self.print_to_log_file(f"\n*** SYNTHETIC DATA CAP APPLIED ***")
             self.print_to_log_file(f"  Max synthetic ratio: {self.max_synthetic_ratio:.0%}")
-            self.print_to_log_file(f"  Synthetic samples allowed: {max_synthetic}")
+            self.print_to_log_file(f"  Synthetic samples used: {len(synthetic_for_training)}")
             self.print_to_log_file(f"  Synthetic samples removed: {self.n_synthetic_removed}")
-            self.print_to_log_file(f"  Removed samples:")
-            for key in self.removed_synthetic_keys:
-                self.print_to_log_file(f"    - {key}")
-        else:
-            synthetic_for_training = synthetic_keys
-            self.removed_synthetic_keys = []
-            self.n_synthetic_removed = 0
         
         # Combine remaining original + allowed synthetic for training
         train_keys = remaining_original + synthetic_for_training
@@ -1879,7 +1962,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         train_keys = rng.permutation(train_keys).tolist()
         
         # =====================================================================
-        # STEP 5: Log final split statistics
+        # STEP 8: Log final split statistics
         # =====================================================================
         n_original_in_train = len(remaining_original)
         n_synthetic_in_train = len(synthetic_for_training)
@@ -1887,8 +1970,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         self.print_to_log_file(f"\n3-way split for fold {self.fold}:")
         self.print_to_log_file(f"  - Training: {len(train_keys)} cases")
-        self.print_to_log_file(f"      Original:  {n_original_in_train} ({100*n_original_in_train/len(train_keys):.1f}%)")
-        self.print_to_log_file(f"      Synthetic: {n_synthetic_in_train} ({100*actual_synthetic_ratio:.1f}%)")
+        if len(train_keys) > 0:
+            self.print_to_log_file(f"      Original:  {n_original_in_train} ({100*n_original_in_train/len(train_keys):.1f}%)")
+            self.print_to_log_file(f"      Synthetic: {n_synthetic_in_train} ({100*actual_synthetic_ratio:.1f}%)")
         self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases (100% original)")
         self.print_to_log_file(f"  - Test:     {len(test_keys)} cases (original val fold)")
         self.print_to_log_file("-" * 70 + "\n")
@@ -2109,206 +2193,43 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         super().on_train_epoch_end(train_outputs)
     
     # =========================================================================
-    # SLIDING WINDOW EVALUATION METHODS
+    # SLIDING WINDOW EVALUATION METHODS (Full-Volume with Box Filtering)
+    # =========================================================================
+    # 
+    # New approach (more realistic, closer to real inference):
+    # 1. Pre-compute ALL sliding window box positions for the full volume
+    # 2. Classify each box: does it contain ANY foreground (label 1 or 2)?
+    # 3. Only run inference on boxes that contain foreground (skip pure-background)
+    # 4. Compute metrics on the UNION of processed boxes only
+    # 5. Cache box positions and classifications to avoid recalculation
+    #
+    # Benefits:
+    # - Deterministic: same boxes every time for same volume shape
+    # - Efficient: skips pure-background boxes (especially for small tumors)
+    # - Realistic: mirrors real inference which processes full volumes
+    # - Cacheable: box info computed once per sample, reused across epochs
     # =========================================================================
     
-    def _get_anatomy_center_and_size(self, segmentation: np.ndarray, 
-                                      anatomy_label: int = 1,
-                                      margin: int = 10,
-                                      cache_key: str = None) -> Tuple[List[int], List[int]]:
+    def _compute_all_sliding_window_boxes(self, 
+                                           volume_shape: Tuple[int, ...],
+                                           patch_size: Tuple[int, ...],
+                                           step_size: float = 0.5) -> List[Tuple[slice, ...]]:
         """
-        Get the CENTER and SIZE of the anatomy bounding box from GT segmentation.
+        Compute ALL sliding window box positions for a full volume.
         
-        Uses caching to avoid recomputation across epochs since GT doesn't change.
-        
-        Args:
-            segmentation: Ground truth segmentation array (no channel dim), shape (D, H, W)
-            anatomy_label: Label value for anatomy (default 1)
-            margin: Margin to add around the bounding box in voxels
-            cache_key: Optional key for caching (e.g., case_id)
-            
-        Returns:
-            center: Center coordinates [cz, cy, cx] of the anatomy bounding box
-            size: Size [sz, sy, sx] of the anatomy bounding box (with margin)
-        """
-        # Check cache first
-        if cache_key is not None and cache_key in self._anatomy_bbox_cache:
-            return self._anatomy_bbox_cache[cache_key]
-        
-        # Find where anatomy exists
-        anatomy_mask = (segmentation == anatomy_label)
-        
-        if not np.any(anatomy_mask):
-            # No anatomy found, use image center
-            center = [s // 2 for s in segmentation.shape]
-            size = list(segmentation.shape)
-        else:
-            # Get coordinates where anatomy exists
-            coords = np.where(anatomy_mask)
-            
-            center = []
-            size = []
-            
-            for dim in range(len(segmentation.shape)):
-                dim_coords = coords[dim]
-                dim_min = int(np.min(dim_coords))
-                dim_max = int(np.max(dim_coords))
-                
-                # Center of anatomy in this dimension
-                dim_center = (dim_min + dim_max) // 2
-                center.append(dim_center)
-                
-                # Size with margin
-                dim_size = dim_max - dim_min + 1 + 2 * margin
-                size.append(dim_size)
-        
-        # Cache the result
-        if cache_key is not None:
-            self._anatomy_bbox_cache[cache_key] = (center, size)
-        
-        return center, size
-    
-    def _compute_divisible_crop_region(self, 
-                                        volume_shape: Tuple[int, ...],
-                                        center: List[int],
-                                        min_size: List[int],
-                                        patch_size: Tuple[int, ...]) -> Tuple[List[int], List[int], List[int]]:
-        """
-        Compute a crop region centered on `center` with dimensions divisible by patch_size.
-        
-        The crop region:
-        1. Is centered on `center` (anatomy bbox center)
-        2. Has dimensions >= `min_size` (anatomy bbox size)
-        3. Has dimensions that are multiples of `patch_size`
-        4. Returns both the crop bounds within the volume AND the target size
-           (which may require zero-padding if crop extends beyond volume)
+        This is deterministic: given the same volume_shape, patch_size, and step_size,
+        the exact same box positions will always be returned.
         
         Args:
             volume_shape: Shape of the full volume (D, H, W)
-            center: Center coordinates [cz, cy, cx] to center the crop on
-            min_size: Minimum size [sz, sy, sx] the crop must cover
-            patch_size: Patch size for sliding window (must be divisible by this)
-            
-        Returns:
-            crop_lbs: Lower bounds for cropping from volume [z0, y0, x0]
-            crop_ubs: Upper bounds for cropping from volume [z1, y1, x1]
-            target_size: Final size of the region [D, H, W] (divisible by patch_size)
-                         This may be larger than (crop_ubs - crop_lbs) if padding is needed
-        """
-        ndim = len(volume_shape)
-        crop_lbs = []
-        crop_ubs = []
-        target_size = []
-        
-        for dim in range(ndim):
-            # Calculate target size: ceiling to next multiple of patch_size
-            # But at least patch_size (for very small anatomies)
-            raw_size = max(min_size[dim], patch_size[dim])
-            
-            # Round up to nearest multiple of patch_size
-            n_patches = int(np.ceil(raw_size / patch_size[dim]))
-            final_size = n_patches * patch_size[dim]
-            target_size.append(final_size)
-            
-            # Compute crop bounds centered on `center`
-            half_size = final_size // 2
-            lb = center[dim] - half_size
-            ub = center[dim] + (final_size - half_size)  # handles odd sizes
-            
-            # Clamp to volume bounds (we'll zero-pad later if needed)
-            lb_clamped = max(0, lb)
-            ub_clamped = min(volume_shape[dim], ub)
-            
-            crop_lbs.append(lb_clamped)
-            crop_ubs.append(ub_clamped)
-        
-        return crop_lbs, crop_ubs, target_size
-    
-    def _crop_and_pad_to_target_size(self,
-                                      data: np.ndarray,
-                                      crop_lbs: List[int],
-                                      crop_ubs: List[int],
-                                      target_size: List[int],
-                                      center: List[int],
-                                      pad_value: float = 0) -> np.ndarray:
-        """
-        Crop data from volume and pad to target_size with zeros.
-        
-        This handles the case where the crop region (centered on `center`) 
-        extends beyond the volume boundaries.
-        
-        Args:
-            data: Input array with shape (C, D, H, W) or (D, H, W)
-            crop_lbs: Lower bounds for cropping [z0, y0, x0]
-            crop_ubs: Upper bounds for cropping [z1, y1, x1]
-            target_size: Target output size [D, H, W]
-            center: Original center coordinates [cz, cy, cx]
-            pad_value: Value to use for padding
-            
-        Returns:
-            Cropped and padded array with spatial dimensions = target_size
-        """
-        has_channel = data.ndim == 4
-        
-        if has_channel:
-            num_channels = data.shape[0]
-            spatial_data = data
-        else:
-            num_channels = 1
-            spatial_data = data[None]  # Add channel dim
-        
-        # Create output array
-        output_shape = (num_channels,) + tuple(target_size)
-        output = np.full(output_shape, pad_value, dtype=data.dtype)
-        
-        # Create slicer for the crop region
-        crop_slicer = (slice(None),) + tuple(slice(lb, ub) for lb, ub in zip(crop_lbs, crop_ubs))
-        cropped = spatial_data[crop_slicer]
-        
-        # Compute where to place the cropped data in the output
-        # The output is centered on the same `center`, so we need to figure out
-        # the offset based on how much the crop was clamped
-        ndim = len(target_size)
-        output_lbs = []
-        for dim in range(ndim):
-            half_size = target_size[dim] // 2
-            ideal_lb = center[dim] - half_size
-            actual_lb = crop_lbs[dim]
-            # Offset in output where cropped data starts
-            offset = actual_lb - ideal_lb
-            output_lbs.append(offset)
-        
-        # Place cropped data into output
-        cropped_size = [crop_ubs[d] - crop_lbs[d] for d in range(ndim)]
-        output_slicer = (slice(None),) + tuple(
-            slice(output_lbs[d], output_lbs[d] + cropped_size[d]) 
-            for d in range(ndim)
-        )
-        output[output_slicer] = cropped
-        
-        if has_channel:
-            return output
-        else:
-            return output[0]  # Remove channel dim
-    
-    def _get_sliding_window_slicers(self, image_size: Tuple[int, ...], 
-                                     patch_size: Tuple[int, ...],
-                                     step_size: float = 0.5) -> List[Tuple]:
-        """
-        Compute sliding window positions for inference.
-        
-        Args:
-            image_size: Size of the image region (D, H, W)
             patch_size: Size of patches for inference
             step_size: Overlap between patches (0.5 = 50% overlap)
             
         Returns:
-            List of slicers for extracting patches
+            List of slicers (tuples of slices) for each box position
         """
-        # Ensure image is at least patch size (pad if needed)
-        adjusted_size = [max(i, p) for i, p in zip(image_size, patch_size)]
-        
-        steps = compute_steps_for_sliding_window(tuple(adjusted_size), tuple(patch_size), step_size)
+        # Compute step positions for each dimension
+        steps = compute_steps_for_sliding_window(tuple(volume_shape), tuple(patch_size), step_size)
         
         slicers = []
         for sx in steps[0]:
@@ -2320,58 +2241,140 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         return slicers
     
-    @torch.inference_mode()
-    def _sliding_window_inference(self, data: torch.Tensor, 
-                                   target_size: Tuple[int, ...],
-                                   use_gaussian: bool = True) -> torch.Tensor:
+    def _classify_boxes_by_foreground(self,
+                                       segmentation: np.ndarray,
+                                       box_slicers: List[Tuple[slice, ...]],
+                                       foreground_labels: List[int] = [1, 2]) -> List[int]:
         """
-        Perform sliding window inference on preprocessed data.
-        
-        IMPORTANT: Input data is expected to have spatial dimensions that are 
-        multiples of patch_size. This is guaranteed by _compute_divisible_crop_region.
+        Classify which boxes contain ANY foreground voxels.
         
         Args:
-            data: Input tensor of shape (C, D, H, W) with divisible spatial dims
-            target_size: Expected output spatial size (D, H, W) - same as input spatial dims
-            use_gaussian: Whether to use Gaussian weighting for aggregation
+            segmentation: Ground truth segmentation array (D, H, W), no channel dim
+            box_slicers: List of slicers defining each box position
+            foreground_labels: Labels to consider as foreground (default: anatomy=1, tumor=2)
             
         Returns:
-            Predicted logits of shape (num_classes, D, H, W) matching target_size
+            List of indices of boxes that contain at least one foreground voxel
         """
+        foreground_indices = []
+        
+        for idx, sl in enumerate(box_slicers):
+            # Extract the box region from segmentation
+            box_seg = segmentation[sl]
+            
+            # Check if any foreground label exists in this box
+            has_foreground = False
+            for label in foreground_labels:
+                if np.any(box_seg == label):
+                    has_foreground = True
+                    break
+            
+            if has_foreground:
+                foreground_indices.append(idx)
+        
+        return foreground_indices
+    
+    def _get_cached_foreground_boxes(self,
+                                      segmentation: np.ndarray,
+                                      volume_shape: Tuple[int, ...],
+                                      cache_key: str) -> Dict:
+        """
+        Get or compute foreground box information with caching.
+        
+        Cache structure:
+        {
+            'volume_shape': Tuple[int, ...],
+            'box_slicers': List[Tuple[slice, ...]],  # ALL box positions
+            'foreground_indices': List[int],  # Indices of boxes with foreground
+            'n_total_boxes': int,
+            'n_foreground_boxes': int,
+        }
+        
+        Args:
+            segmentation: GT segmentation array (D, H, W)
+            volume_shape: Shape of the full volume
+            cache_key: Unique key for this sample (e.g., case_id)
+            
+        Returns:
+            Dict with cached box information
+        """
+        # Check cache
+        if cache_key in self._sliding_window_box_cache:
+            cached = self._sliding_window_box_cache[cache_key]
+            # Verify volume shape matches (sanity check)
+            if cached['volume_shape'] == volume_shape:
+                return cached
+        
+        # Compute box positions
         patch_size = self.configuration_manager.patch_size
         step_size = self.sliding_window_step_size
         
-        input_spatial_shape = data.shape[1:]  # (D, H, W)
+        box_slicers = self._compute_all_sliding_window_boxes(volume_shape, patch_size, step_size)
         
-        # Verify input dimensions are divisible by patch size (they should be!)
-        for dim, (inp_size, p_size) in enumerate(zip(input_spatial_shape, patch_size)):
-            if inp_size % p_size != 0:
-                # Log warning but continue - the new crop logic should prevent this
-                self.print_to_log_file(f"  WARNING: Input dim {dim} ({inp_size}) not divisible by patch ({p_size})")
+        # Classify boxes
+        foreground_indices = self._classify_boxes_by_foreground(
+            segmentation, box_slicers, foreground_labels=[1, 2]
+        )
         
-        # Get slicers - input should already be properly sized
-        slicers = self._get_sliding_window_slicers(input_spatial_shape, patch_size, step_size)
+        # Build cache entry
+        cache_entry = {
+            'volume_shape': volume_shape,
+            'box_slicers': box_slicers,
+            'foreground_indices': foreground_indices,
+            'n_total_boxes': len(box_slicers),
+            'n_foreground_boxes': len(foreground_indices),
+        }
         
-        # Initialize prediction arrays at input size
+        # Store in cache
+        self._sliding_window_box_cache[cache_key] = cache_entry
+        
+        return cache_entry
+    
+    @torch.inference_mode()
+    def _sliding_window_inference_selective(self,
+                                             data: torch.Tensor,
+                                             box_slicers: List[Tuple[slice, ...]],
+                                             foreground_indices: List[int],
+                                             use_gaussian: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Perform sliding window inference ONLY on specified foreground boxes.
+        
+        Args:
+            data: Input tensor of shape (C, D, H, W) - FULL volume, no cropping
+            box_slicers: List of ALL box slicers for this volume
+            foreground_indices: Indices of boxes to actually process (foreground boxes)
+            use_gaussian: Whether to use Gaussian weighting for aggregation
+            
+        Returns:
+            predicted_logits: Predicted logits (num_classes, D, H, W) for full volume
+            valid_mask: Boolean mask (D, H, W) indicating regions that were processed
+                        (True where at least one box contributed a prediction)
+        """
+        patch_size = self.configuration_manager.patch_size
+        spatial_shape = data.shape[1:]  # (D, H, W)
+        
+        # Initialize prediction arrays at full volume size
         predicted_logits = torch.zeros(
-            (self.label_manager.num_segmentation_heads, *input_spatial_shape),
+            (self.label_manager.num_segmentation_heads, *spatial_shape),
             dtype=torch.half,
             device=self.device
         )
-        n_predictions = torch.zeros(input_spatial_shape, dtype=torch.half, device=self.device)
+        n_predictions = torch.zeros(spatial_shape, dtype=torch.half, device=self.device)
         
         # Gaussian weighting
         if use_gaussian:
             gaussian = compute_gaussian(tuple(patch_size), sigma_scale=1./8, 
                                         value_scaling_factor=10, device=self.device)
         else:
-            gaussian = 1
+            gaussian = torch.ones(tuple(patch_size), dtype=torch.half, device=self.device)
         
         # Move data to device
         data = data.to(self.device)
         
-        # Process each patch
-        for sl in slicers:
+        # Process ONLY foreground boxes
+        for box_idx in foreground_indices:
+            sl = box_slicers[box_idx]
+            
             # Extract patch: sl is for spatial dims, need to add channel dim
             patch = data[(slice(None),) + sl][None]  # Add batch dim
             
@@ -2381,41 +2384,60 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             if self.enable_deep_supervision:
                 pred = pred[0]  # Take first output (highest resolution)
             
-            if use_gaussian:
-                pred = pred * gaussian
+            # Apply Gaussian weighting
+            pred = pred * gaussian
             
-            # Aggregate
+            # Aggregate into full-volume arrays
             predicted_logits[(slice(None),) + sl] += pred
             n_predictions[sl] += gaussian
         
-        # Normalize by prediction counts
-        # Avoid division by zero
-        n_predictions = torch.clamp(n_predictions, min=1e-8)
-        torch.div(predicted_logits, n_predictions, out=predicted_logits)
+        # Create valid mask: regions where at least one box contributed
+        valid_mask = n_predictions > 0
         
-        # Output shape should match target_size (which equals input spatial shape)
-        # No need for additional cropping/padding since we designed input to be divisible
-        return predicted_logits
+        # Normalize by prediction counts (only where valid)
+        # Avoid division by zero by clamping
+        n_predictions_safe = torch.clamp(n_predictions, min=1e-8)
+        torch.div(predicted_logits, n_predictions_safe, out=predicted_logits)
+        
+        return predicted_logits, valid_mask
     
     def _compute_metrics_from_prediction(self, 
                                          predicted_logits: torch.Tensor,
                                          target_seg: torch.Tensor,
+                                         valid_mask: torch.Tensor = None,
                                          loss_fn = None,
-                                         simulate_perfect_anatomy: bool = True) -> dict:
+                                         simulate_perfect_anatomy: bool = True,
+                                         compute_on_cpu: bool = False) -> dict:
         """
         Compute TP/FP/FN/TN from predicted logits and target segmentation.
         
         Args:
             predicted_logits: Predicted logits (num_classes, D, H, W)
             target_seg: Target segmentation (1, D, H, W) or (D, H, W)
+            valid_mask: Optional boolean mask (D, H, W) indicating regions to include
+                        in metric computation. If None, all regions are included.
+                        This is used to exclude background-only regions that were
+                        not processed during selective sliding window inference.
             loss_fn: Optional loss function to compute loss
             simulate_perfect_anatomy: If True, zero out predictions where GT is background.
                 This simulates "perfect anatomy detection" - tumor metrics are only
                 computed within the GT anatomy region, reducing FP from outside anatomy.
+            compute_on_cpu: If True, perform all metric computation on CPU.
+                This is more memory-efficient for large volumes and avoids GPU OOM.
             
         Returns:
             Dict with tp_hard, fp_hard, fn_hard, tn_hard, loss
         """
+        # Determine computation device
+        if compute_on_cpu:
+            device = torch.device('cpu')
+            predicted_logits = predicted_logits.to(device)
+            target_seg = target_seg.to(device)
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device)
+        else:
+            device = predicted_logits.device
+        
         num_classes = self.label_manager.num_segmentation_heads
         
         # Ensure target has channel dimension
@@ -2432,7 +2454,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             raise RuntimeError(
                 f"Spatial dimension mismatch! "
                 f"Prediction: {pred_spatial}, Target: {target_spatial}. "
-                f"This should not happen with divisible crop regions."
+                f"This should not happen."
             )
         # =====================================================================
         
@@ -2491,8 +2513,23 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         else:
             target_onehot = target_seg.bool()
         
+        # =====================================================================
+        # APPLY VALID_MASK: Exclude regions not processed by sliding window
+        # =====================================================================
+        # valid_mask indicates regions where inference was performed (foreground boxes)
+        # Regions outside valid_mask are excluded from metric computation entirely
+        if valid_mask is not None:
+            # Ensure valid_mask has correct shape: (1, D, H, W) to match target_seg
+            if valid_mask.ndim == 3:
+                valid_mask = valid_mask.unsqueeze(0)
+            # Convert to float for use as mask in get_tp_fp_fn_tn
+            metric_mask = valid_mask.float().unsqueeze(0)  # (1, 1, D, H, W)
+        else:
+            metric_mask = None
+        # =====================================================================
+        
         axes = [0] + list(range(2, predicted_seg_onehot.ndim))
-        tp, fp, fn, tn = get_tp_fp_fn_tn(predicted_seg_onehot, target_onehot, axes=axes, mask=None)
+        tp, fp, fn, tn = get_tp_fp_fn_tn(predicted_seg_onehot, target_onehot, axes=axes, mask=metric_mask)
         
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
@@ -2523,20 +2560,20 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                                         num_samples: int = None,
                                         progress_desc: str = "Sliding Window Eval") -> dict:
         """
-        Compute metrics using sliding window inference within GT anatomy region.
+        Compute metrics using FULL-VOLUME sliding window inference with box filtering.
         
-        For each sample:
-        1. Load preprocessed data
-        2. Get anatomy bbox CENTER and SIZE (cached)
-        3. Compute a crop region with dimensions DIVISIBLE by patch_size
-        4. Crop data and seg, zero-padding if crop exceeds volume bounds
-        5. Run sliding window inference (guaranteed clean dimensions)
-        6. Compute metrics on the cropped region
+        New approach (more realistic, closer to real inference):
+        1. Compute ALL sliding window box positions for the FULL volume
+        2. Classify each box: does it contain ANY foreground (label 1 or 2)?
+        3. Only run inference on boxes that contain foreground (skip pure-background)
+        4. Compute metrics on the UNION of processed boxes only
+        5. Box positions and classifications are CACHED to avoid recalculation
         
-        This approach guarantees:
-        - Crop dimensions are always divisible by patch_size
-        - Prediction and target have IDENTICAL spatial dimensions
-        - No scatter index out-of-bounds errors
+        Benefits:
+        - Deterministic: same boxes every time for same volume shape
+        - Efficient: skips pure-background boxes (especially for small tumors)
+        - Realistic: mirrors real inference which processes full volumes
+        - Cacheable: box info computed once per sample, reused across epochs
         
         Args:
             dataset: nnUNet dataset with preprocessed data
@@ -2555,93 +2592,110 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         all_outputs = []
         patch_size = self.configuration_manager.patch_size
         
-        # Check cache status
-        cached_keys = [k for k in keys if k in self._anatomy_bbox_cache]
+        # Check cache status for sliding window boxes
+        cached_keys = [k for k in keys if k in self._sliding_window_box_cache]
         if cached_keys:
-            self.print_to_log_file(f"  Using {len(cached_keys)}/{len(keys)} cached anatomy centers")
+            self.print_to_log_file(f"  Using {len(cached_keys)}/{len(keys)} cached box classifications")
         
         # Log first sample details for debugging
         first_sample_logged = False
         
-        # Track samples with ignore labels for summary logging
+        # Track statistics
+        total_boxes_processed = 0
+        total_boxes_skipped = 0
         samples_with_ignore_label = []
         
         with torch.no_grad():
             # Only show progress bar on main process (local_rank == 0)
             for key in tqdm(keys, desc=progress_desc, disable=self.local_rank != 0):
                 try:
-                    # Load preprocessed data
+                    # Load preprocessed data (FULL volume, no cropping)
                     data, seg, seg_prev, properties = dataset.load_case(key)
                     
-                    # Get GT anatomy center and size (cached)
                     # seg shape: (1, D, H, W) or (D, H, W)
                     seg_np = seg[0] if seg.ndim == 4 else seg
-                    volume_shape = seg_np.shape  # (D, H, W)
+                    volume_shape = tuple(seg_np.shape)  # (D, H, W)
                     
-                    center, min_size = self._get_anatomy_center_and_size(
-                        seg_np, anatomy_label=1, margin=10, cache_key=key
+                    # Get or compute foreground box info (CACHED)
+                    box_info = self._get_cached_foreground_boxes(
+                        seg_np, volume_shape, cache_key=key
                     )
                     
-                    # Compute crop region with divisible dimensions
-                    crop_lbs, crop_ubs, target_size = self._compute_divisible_crop_region(
-                        volume_shape, center, min_size, patch_size
-                    )
+                    box_slicers = box_info['box_slicers']
+                    foreground_indices = box_info['foreground_indices']
+                    n_total = box_info['n_total_boxes']
+                    n_foreground = box_info['n_foreground_boxes']
+                    
+                    # Update statistics
+                    total_boxes_processed += n_foreground
+                    total_boxes_skipped += (n_total - n_foreground)
                     
                     # Log details for first sample
                     if not first_sample_logged and self.local_rank == 0:
                         self.print_to_log_file(f"  [Debug] First sample: {key}")
                         self.print_to_log_file(f"    Volume shape: {volume_shape}")
-                        self.print_to_log_file(f"    Anatomy center: {center}, size: {min_size}")
-                        self.print_to_log_file(f"    Crop: lbs={crop_lbs}, ubs={crop_ubs}")
-                        self.print_to_log_file(f"    Target size (divisible): {target_size}")
                         self.print_to_log_file(f"    Patch size: {patch_size}")
+                        self.print_to_log_file(f"    Total boxes: {n_total}, Foreground boxes: {n_foreground} ({100*n_foreground/n_total:.1f}%)")
                         self.print_to_log_file(f"    Seg unique values: {np.unique(seg_np)}")
                         first_sample_logged = True
                     
-                    # Crop and pad data to target_size (handles boundary cases)
-                    data_cropped = self._crop_and_pad_to_target_size(
-                        data, crop_lbs, crop_ubs, target_size, center, pad_value=0
-                    )
-                    seg_cropped = self._crop_and_pad_to_target_size(
-                        seg, crop_lbs, crop_ubs, target_size, center, pad_value=0
-                    )
-                    
                     # Track ignore labels (-1) for summary logging
-                    if np.any(seg_cropped < 0):
-                        n_ignore = np.sum(seg_cropped < 0)
+                    if np.any(seg_np < 0):
+                        n_ignore = np.sum(seg_np < 0)
                         samples_with_ignore_label.append((key, n_ignore))
                     
-                    # Convert to tensor
-                    data_tensor = torch.from_numpy(data_cropped).float()
-                    seg_tensor = torch.from_numpy(seg_cropped).long().to(self.device)
+                    # Skip if no foreground boxes (shouldn't happen if sanity check passed)
+                    if n_foreground == 0:
+                        self.print_to_log_file(f"  Warning: No foreground boxes for {key}, skipping")
+                        continue
                     
-                    # Run sliding window inference
-                    # target_size is guaranteed to be divisible by patch_size
-                    predicted_logits = self._sliding_window_inference(
-                        data_tensor, target_size=tuple(target_size)
+                    # Convert to tensor (FULL volume)
+                    # Use np.asarray() to handle NDArray/memmap types from dataset.load_case()
+                    data_tensor = torch.from_numpy(np.asarray(data)).float()
+                    # Keep seg_tensor on CPU - metrics will be computed on CPU
+                    seg_tensor = torch.from_numpy(np.asarray(seg)).long()
+                    
+                    # Run selective sliding window inference (on GPU)
+                    # Only processes foreground boxes, returns valid_mask for metric computation
+                    predicted_logits, valid_mask = self._sliding_window_inference_selective(
+                        data_tensor, box_slicers, foreground_indices, use_gaussian=True
                     )
                     
-                    # Both predicted_logits and seg_tensor now have shape (..., *target_size)
-                    # which are guaranteed to match
+                    # Move predictions to CPU for metric computation (saves GPU memory)
+                    predicted_logits = predicted_logits.cpu()
+                    valid_mask = valid_mask.cpu()
                     
-                    # Compute metrics (with optional "simulate perfect anatomy" postprocessing)
+                    # Compute metrics on CPU - more memory efficient for large volumes
+                    # valid_mask excludes pure-background regions from metric computation
                     metrics = self._compute_metrics_from_prediction(
-                        predicted_logits, seg_tensor, loss_fn=None,
-                        simulate_perfect_anatomy=self.simulate_perfect_anatomy
+                        predicted_logits, seg_tensor, valid_mask=valid_mask,
+                        loss_fn=None, simulate_perfect_anatomy=self.simulate_perfect_anatomy,
+                        compute_on_cpu=True  # Force CPU computation to avoid GPU OOM
                     )
                     all_outputs.append(metrics)
+                    
+                    # Clear GPU cache after each sample to prevent memory fragmentation
+                    torch.cuda.empty_cache()
                     
                 except Exception as e:
                     self.print_to_log_file(f"  Warning: Failed to process {key}: {e}")
                     import traceback
                     self.print_to_log_file(f"    Traceback: {traceback.format_exc()}")
+                    # Still clear cache even on error
+                    torch.cuda.empty_cache()
                     continue
         
         self.network.train()
         
-        # Log summary of samples with ignore labels
-        if samples_with_ignore_label and self.local_rank == 0:
-            self.print_to_log_file(f"  [Info] {len(samples_with_ignore_label)}/{len(keys)} samples had ignore label (-1) regions")
+        # Log summary statistics
+        if self.local_rank == 0:
+            total_boxes = total_boxes_processed + total_boxes_skipped
+            if total_boxes > 0:
+                self.print_to_log_file(f"  [Summary] Boxes processed: {total_boxes_processed}, "
+                                       f"skipped (background): {total_boxes_skipped} "
+                                       f"({100*total_boxes_skipped/total_boxes:.1f}% saved)")
+            if samples_with_ignore_label:
+                self.print_to_log_file(f"  [Info] {len(samples_with_ignore_label)}/{len(keys)} samples had ignore label (-1) regions")
         
         if not all_outputs:
             # Return empty metrics
@@ -3207,8 +3261,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Index 1 = tumor (label 2)
         tumor_dice = global_dc_per_class[1] if len(global_dc_per_class) > 1 else np.nanmean(global_dc_per_class)
         
-        # Log tumor_dice as 'mean_fg_dice' - used for checkpoint selection
-        # Note: Logger will still compute EMA, but we use single-epoch dice for checkpointing
+        # Log metrics every epoch (needed for on_epoch_end printing)
+        # Checkpoint saving is restricted to evaluation epochs in on_epoch_end
         self.logger.log('mean_fg_dice', tumor_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
@@ -3258,36 +3312,40 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
 
         # =====================================================================
         # TOP-K CHECKPOINT HANDLING
+        # Only run on evaluation epochs to avoid saving checkpoints with stale metrics
         # =====================================================================
-        # Use single-epoch tumor dice for checkpoint ranking (NOT EMA)
-        # mean_fg_dice is actually tumor_dice for this trainer (see on_validation_epoch_end)
-        current_dice = self.logger.my_fantastic_logging['mean_fg_dice'][-1]
-        
-        # Initialize top_k_dices from existing checkpoints if empty (e.g., first epoch or after loading)
-        if not self.top_k_dices:
-            self.print_to_log_file("Scanning for existing top-k checkpoints...")
-            self.top_k_dices = self._scan_existing_top_k_checkpoints()
-            if self.top_k_dices:
-                self.print_to_log_file(f"  Reconstructed top-{len(self.top_k_dices)} list from existing files")
-            else:
-                self.print_to_log_file("  No existing top-k checkpoints found")
-        
-        # Check if _skip_existing_best_comparison is set (--ignore_existing_best with --c)
-        skip_comparison = getattr(self, '_skip_existing_best_comparison', False)
-        if skip_comparison:
-            self.print_to_log_file(f"Skipping top-k comparison (--ignore_existing_best). Current Dice: {np.round(current_dice, decimals=4)}")
-            # Clear top_k_dices to start fresh
-            self.top_k_dices = []
-            self._skip_existing_best_comparison = False
-        
-        # Try to update top-k checkpoints
-        achieved_rank = self._update_top_k_checkpoints(current_dice, current_epoch)
-        
-        if achieved_rank > 0:
-            if achieved_rank == 1:
-                self.print_to_log_file(f"Yayy! New best pseudo Dice: {np.round(current_dice, decimals=4)} (top-1)")
-            else:
-                self.print_to_log_file(f"New top-{achieved_rank} checkpoint! Dice: {np.round(current_dice, decimals=4)}")
+        if self._should_run_evaluation():
+            # Use single-epoch tumor dice for checkpoint ranking (NOT EMA)
+            # mean_fg_dice is actually tumor_dice for this trainer (see on_validation_epoch_end)
+            current_dice = self.logger.my_fantastic_logging['mean_fg_dice'][-1]
+            
+            # Initialize top_k_dices from existing checkpoints if empty (e.g., first epoch or after loading)
+            if not self.top_k_dices:
+                self.print_to_log_file("Scanning for existing top-k checkpoints...")
+                self.top_k_dices = self._scan_existing_top_k_checkpoints()
+                if self.top_k_dices:
+                    self.print_to_log_file(f"  Reconstructed top-{len(self.top_k_dices)} list from existing files")
+                else:
+                    self.print_to_log_file("  No existing top-k checkpoints found")
+            
+            # Check if _skip_existing_best_comparison is set (--ignore_existing_best with --c)
+            skip_comparison = getattr(self, '_skip_existing_best_comparison', False)
+            if skip_comparison:
+                self.print_to_log_file(f"Skipping top-k comparison (--ignore_existing_best). Current Dice: {np.round(current_dice, decimals=4)}")
+                # Clear top_k_dices to start fresh
+                self.top_k_dices = []
+                self._skip_existing_best_comparison = False
+            
+            # Try to update top-k checkpoints
+            achieved_rank = self._update_top_k_checkpoints(current_dice, current_epoch)
+            
+            if achieved_rank > 0:
+                if achieved_rank == 1:
+                    self.print_to_log_file(f"Yayy! New best pseudo Dice: {np.round(current_dice, decimals=4)} (top-1)")
+                else:
+                    self.print_to_log_file(f"New top-{achieved_rank} checkpoint! Dice: {np.round(current_dice, decimals=4)}")
+        else:
+            self.print_to_log_file(f"  (Skipping checkpoint comparison - not an evaluation epoch)")
         # =====================================================================
 
         if self.local_rank == 0:
@@ -3299,49 +3357,77 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         """
         Override to also save tuning metrics, centering probabilities, and 
         original/synthetic sample handling info in checkpoint.
-        """
-        # Store tuning info and centering probabilities before saving
-        self._tuning_checkpoint_data = {
-            'tuning_keys': self.tuning_keys,
-            'tuning_metrics': self.tuning_metrics,
-            'tuning_ratio': self.tuning_ratio,
-            # 3-way centering probabilities
-            'train_prob_random': self.train_prob_random,
-            'train_prob_anatomy': self.train_prob_anatomy,
-            'train_prob_tumor': self.train_prob_tumor,
-            'tuning_prob_random': self.tuning_prob_random,
-            'tuning_prob_anatomy': self.tuning_prob_anatomy,
-            'tuning_prob_tumor': self.tuning_prob_tumor,
-            'test_prob_random': self.test_prob_random,
-            'test_prob_anatomy': self.test_prob_anatomy,
-            'test_prob_tumor': self.test_prob_tumor,
-            # Original vs synthetic sample handling
-            'pattern_original_samples': self.pattern_original_samples,
-            'max_synthetic_ratio': self.max_synthetic_ratio,
-            'n_original_total': self.n_original_total,
-            'n_synthetic_total': self.n_synthetic_total,
-            'n_synthetic_removed': self.n_synthetic_removed,
-            'removed_synthetic_keys': self.removed_synthetic_keys,
-            'excluded_no_tumor_keys': self.excluded_no_tumor_keys,
-            # Dynamic sampling strategy state
-            'enable_dynamic_sampling': self.enable_dynamic_sampling,
-            'probability_history': self.probability_history,
-            'dynamic_sampling_history': self.dynamic_sampling_strategy.get_history() if self.dynamic_sampling_strategy else None,
-            # Top-K checkpoint tracking
-            'top_k_checkpoints': self.top_k_checkpoints,
-            'top_k_dices': self.top_k_dices,
-            '_best_dice': getattr(self, '_best_dice', None),
-            # Evaluation mode
-            'eval_mode': self.eval_mode,
-            'sliding_window_step_size': self.sliding_window_step_size,
-            'simulate_perfect_anatomy': self.simulate_perfect_anatomy,
-            # Evaluation frequency
-            'eval_every_n_epochs': self.eval_every_n_epochs,
-            '_last_eval_results': self._last_eval_results,
-            '_last_eval_epoch': self._last_eval_epoch,
-        }
         
-        super().save_checkpoint(filename)
+        Note: We completely override the parent's save_checkpoint to ensure
+        our custom data is included in the checkpoint dictionary.
+        """
+        if self.local_rank == 0:
+            if not self.disable_checkpointing:
+                from torch._dynamo import OptimizedModule
+                
+                if self.is_ddp:
+                    mod = self.network.module
+                else:
+                    mod = self.network
+                if isinstance(mod, OptimizedModule):
+                    mod = mod._orig_mod
+                
+                # Build checkpoint with base class data
+                checkpoint = {
+                    'network_weights': mod.state_dict(),
+                    'optimizer_state': self.optimizer.state_dict(),
+                    'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+                    'logging': self.logger.get_checkpoint(),
+                    '_best_ema': self._best_ema,
+                    'current_epoch': self.current_epoch + 1,
+                    'init_args': self.my_init_kwargs,
+                    'trainer_name': self.__class__.__name__,
+                    'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+                    
+                    # =========================================================
+                    # TUNING SET TRAINER CUSTOM DATA
+                    # =========================================================
+                    'tuning_keys': self.tuning_keys,
+                    'tuning_metrics': self.tuning_metrics,
+                    'tuning_ratio': self.tuning_ratio,
+                    # 3-way centering probabilities
+                    'train_prob_random': self.train_prob_random,
+                    'train_prob_anatomy': self.train_prob_anatomy,
+                    'train_prob_tumor': self.train_prob_tumor,
+                    'tuning_prob_random': self.tuning_prob_random,
+                    'tuning_prob_anatomy': self.tuning_prob_anatomy,
+                    'tuning_prob_tumor': self.tuning_prob_tumor,
+                    'test_prob_random': self.test_prob_random,
+                    'test_prob_anatomy': self.test_prob_anatomy,
+                    'test_prob_tumor': self.test_prob_tumor,
+                    # Original vs synthetic sample handling
+                    'pattern_original_samples': self.pattern_original_samples,
+                    'max_synthetic_ratio': self.max_synthetic_ratio,
+                    'n_original_total': self.n_original_total,
+                    'n_synthetic_total': self.n_synthetic_total,
+                    'n_synthetic_removed': self.n_synthetic_removed,
+                    'removed_synthetic_keys': self.removed_synthetic_keys,
+                    'excluded_no_tumor_keys': self.excluded_no_tumor_keys,
+                    # Dynamic sampling strategy state
+                    'enable_dynamic_sampling': self.enable_dynamic_sampling,
+                    'probability_history': self.probability_history,
+                    'dynamic_sampling_history': self.dynamic_sampling_strategy.get_history() if self.dynamic_sampling_strategy else None,
+                    # Top-K checkpoint tracking
+                    'top_k_checkpoints': self.top_k_checkpoints,
+                    'top_k_dices': self.top_k_dices,
+                    '_best_dice': getattr(self, '_best_dice', None),
+                    # Evaluation mode
+                    'eval_mode': self.eval_mode,
+                    'sliding_window_step_size': self.sliding_window_step_size,
+                    'simulate_perfect_anatomy': self.simulate_perfect_anatomy,
+                    # Evaluation frequency
+                    'eval_every_n_epochs': self.eval_every_n_epochs,
+                    '_last_eval_results': self._last_eval_results,
+                    '_last_eval_epoch': self._last_eval_epoch,
+                }
+                torch.save(checkpoint, filename)
+            else:
+                self.print_to_log_file('No checkpoint written, checkpointing is disabled')
     
     def load_checkpoint(self, filename_or_checkpoint) -> None:
         """
