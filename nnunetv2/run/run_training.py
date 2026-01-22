@@ -360,7 +360,8 @@ def cleanup_ddp():
 def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkpointing, c, val,
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
             checkpoint_path=None, skip_manual_confirm=False, pattern_original_samples=None,
-            ignore_existing_best=False, skip_val=False, ignore_synthetic=False):
+            ignore_existing_best=False, skip_val=False, ignore_synthetic=False,
+            main_gpu_id=None, backup_gpu_id=None):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -378,6 +379,10 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     # If ignore_synthetic is set, exclude all synthetic data from training
     if ignore_synthetic and hasattr(nnunet_trainer, 'max_synthetic_ratio'):
         nnunet_trainer.max_synthetic_ratio = 0.0
+    
+    # Set backup GPU for async test evaluation (used by nnUNetTrainer_WithTuningSet)
+    if hasattr(nnunet_trainer, 'backup_gpu_id'):
+        nnunet_trainer.backup_gpu_id = backup_gpu_id
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -454,7 +459,9 @@ def run_training(
     skip_manual_confirm: bool = False,               # args.skip_manual_confirm
     pattern_original_samples: Optional[str] = None,  # args.pattern_original_samples
     ignore_existing_best: bool = False,              # args.ignore_existing_best
-    ignore_synthetic: bool = False                   # args.ignore_synthetic
+    ignore_synthetic: bool = False,                  # args.ignore_synthetic
+    main_gpu_id: Optional[int] = None,               # args.main_gpu_id
+    backup_gpu_id: Optional[int] = None              # args.backup_gpu_id
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -503,10 +510,19 @@ def run_training(
                      pattern_original_samples,
                      ignore_existing_best,
                      skip_val,
-                     ignore_synthetic),
+                     ignore_synthetic,
+                     main_gpu_id,
+                     backup_gpu_id),
                  nprocs=num_gpus,
                  join=True)
     else:
+        # =====================================================================
+        # GPU CONFIGURATION: Set main GPU before creating trainer
+        # =====================================================================
+        if main_gpu_id is not None:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(main_gpu_id)
+            print(f"*** Set CUDA_VISIBLE_DEVICES={main_gpu_id} for main training process")
+        
         nnunet_trainer = get_trainer_from_args(dataset_name_or_id, configuration, fold, trainer_class_name,
                                                plans_identifier, device=device,
                                                checkpoint_signature=checkpoint_signature,
@@ -522,6 +538,12 @@ def run_training(
         # If ignore_synthetic is set, exclude all synthetic data from training
         if ignore_synthetic and hasattr(nnunet_trainer, 'max_synthetic_ratio'):
             nnunet_trainer.max_synthetic_ratio = 0.0
+        
+        # Set backup GPU for async test evaluation (used by nnUNetTrainer_WithTuningSet)
+        if hasattr(nnunet_trainer, 'backup_gpu_id'):
+            nnunet_trainer.backup_gpu_id = backup_gpu_id
+            if backup_gpu_id is not None:
+                print(f"*** Set backup GPU ID={backup_gpu_id} for async test evaluation")
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -641,6 +663,13 @@ def run_training_entry():
                         help='[OPTIONAL] If set, all synthetic samples (those NOT matching --pattern_original_samples) '
                              'will be excluded from training. Requires --pattern_original_samples to be set. '
                              'Only used by nnUNetTrainer_WithTuningSet.')
+    parser.add_argument('--main_gpu_id', type=int, required=False, default=None,
+                        help='[OPTIONAL] GPU ID for main training process. Sets CUDA_VISIBLE_DEVICES before training. '
+                             'If not specified, uses current CUDA_VISIBLE_DEVICES setting.')
+    parser.add_argument('--backup_gpu_id', type=int, required=False, default=None,
+                        help='[OPTIONAL] GPU ID for async test evaluation subprocess. '
+                             'Only used by nnUNetTrainer_WithTuningSet with async evaluation. '
+                             'If not specified, uses same GPU as main training (may cause OOM).')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -662,7 +691,9 @@ def run_training_entry():
                  checkpoint_path=args.checkpoint_path, skip_manual_confirm=args.skip_manual_confirm,
                  pattern_original_samples=args.pattern_original_samples,
                  ignore_existing_best=args.ignore_existing_best,
-                 ignore_synthetic=args.ignore_synthetic)
+                 ignore_synthetic=args.ignore_synthetic,
+                 main_gpu_id=args.main_gpu_id,
+                 backup_gpu_id=args.backup_gpu_id)
 
 
 if __name__ == '__main__':

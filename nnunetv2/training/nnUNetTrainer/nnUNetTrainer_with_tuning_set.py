@@ -25,14 +25,18 @@ Evaluation order each epoch:
 2. TEST SET: Compute pseudo dice (logged, for checkpoint selection)
 3. Checkpoint: "Yayy! New best pseudo Dice" if improved (based on TEST tumor dice only)
 
-Evaluation modes (configurable via self.eval_mode):
-- 'sliding_window': Full sliding window inference within GT anatomy bounding box
-  - More accurate, closer to real inference
-  - Computes metrics on full prediction within anatomy region
-- 'dual_crop': Two random patches per sample (legacy)
-  - 1 patch centered on random anatomy voxel (evaluates FP control)
-  - 1 patch centered on random tumor voxel (evaluates tumor detection)
-  - Faster but less representative of real inference
+Evaluation modes (separate for tuning vs test):
+- TUNING SET (self.tuning_eval_mode):
+  - 'dual_crop' (DEFAULT): Two random patches per sample (fast)
+    - 1 patch centered on random anatomy voxel (evaluates FP control)
+    - 1 patch centered on random tumor voxel (evaluates tumor detection)
+    - Fast feedback for adaptive sampling strategy
+  - 'sliding_window': Full sliding window inference (slower, more accurate)
+- TEST SET (self.test_eval_mode):
+  - 'sliding_window' (DEFAULT): Full sliding window within GT foreground boxes
+    - More accurate, closer to real inference
+    - Computes metrics on full prediction within anatomy region
+  - 'dual_crop': Two random patches per sample (faster)
 
 Patch centering strategy for TRAINING:
 - Configurable 3-way probabilistic centering (random / anatomy / tumor)
@@ -49,30 +53,505 @@ Usage:
 """
 
 import re
+import os
+import glob
+import json
+import signal
 import numpy as np
 import torch
+import torch._dynamo as _dynamo
+import multiprocessing as mp
+from multiprocessing import Pool
 from typing import List, Tuple, Union, Dict, Optional, Callable
 from threadpoolctl import threadpool_limits
 from collections import defaultdict
 from dataclasses import dataclass
 from queue import Queue
 from threading import Thread
+from time import time
 from tqdm import tqdm
-from batchgenerators.utilities.file_and_folder_operations import join, isfile
+from scipy.special import softmax as scipy_softmax
+
+from torch.amp import autocast
+from torch import distributed as dist
+from torch._dynamo import OptimizedModule
+
+from batchgenerators.utilities.file_and_folder_operations import join, isfile, maybe_mkdir_p
+from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
+from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
+from acvl_utils.cropping_and_padding.padding import pad_nd_image
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset
+from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset, infer_dataset_class
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
+from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
+from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.inference.sliding_window_prediction import compute_steps_for_sliding_window, compute_gaussian
-from nnunetv2.utilities.helpers import empty_cache
-from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
-from acvl_utils.cropping_and_padding.padding import pad_nd_image
 
-from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
-from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
+# =============================================================================
+# MODULE-LEVEL CONFIGURATION FLAGS
+# =============================================================================
+# Set these before training to control behavior
+
+# Pre-training evaluation: run sliding window eval before first epoch
+# Useful for debugging, but slows down startup
+ENABLE_PRE_TRAINING_EVAL = False  # Set to True for debugging
+ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET = True
+
+# Async test evaluation: run test set evaluation in a subprocess
+# This allows training to continue while test evaluation runs in parallel
+ASYNC_TEST_EVAL = True  # Set to False to use synchronous evaluation
+
+# GPU for async evaluation subprocess
+# None = use same GPU as training (may cause OOM if memory is tight)
+# Integer = specific GPU ID (e.g., 6 for cuda:6)
+# This is the ACTUAL GPU ID, not the CUDA_VISIBLE_DEVICES index
+ASYNC_EVAL_GPU_ID = None  # Set to a different GPU ID if available
+
+# Timeout for async evaluation (seconds)
+ASYNC_EVAL_TIMEOUT = 3600  # 2 hours default
+
+
+# =============================================================================
+# ASYNC EVALUATION WORKER FUNCTION (must be at module level for pickling)
+# =============================================================================
+# 
+# GPU CONFIGURATION FOR SUBPROCESS:
+# We set CUDA_VISIBLE_DEVICES in the parent process BEFORE spawning. The 'spawn'
+# context creates a fresh Python interpreter that inherits the environment at
+# spawn time. After spawning, we immediately restore the parent's original
+# CUDA_VISIBLE_DEVICES. This ensures:
+# 1. The subprocess uses the configured GPU (ASYNC_EVAL_GPU_ID)
+# 2. The parent process continues using its original GPU
+# 3. No CUDA context is shared between processes (avoiding crashes)
+#
+# =============================================================================
+
+def _async_test_eval_worker(
+    temp_ckpt_path: str,
+    result_path: str,
+    preprocessed_folder: str,
+    test_keys: list,  # Changed from List[str] to avoid import issues
+    top_k_dices: list,  # Changed from List[Tuple[float, int]]
+    top_k_checkpoints: int,
+    output_folder: str,
+    plans_identifier: str,
+    eval_config: dict,
+    gpu_id: int = None,  # Changed from Optional[int] to avoid import issues
+):
+    """
+    Standalone worker function for async test evaluation.
+    
+    This function runs in a separate process and:
+    1. Sets up the GPU environment (via initializer function)
+    2. Loads the model from temp checkpoint
+    3. Runs sliding window evaluation on test set
+    4. Determines if result qualifies for top-k
+    5. If yes, saves checkpoint with appropriate rank
+    6. Writes result JSON to result_path
+    
+    IMPORTANT: CUDA_VISIBLE_DEVICES is set by _async_subprocess_initializer
+    BEFORE this function is called, ensuring correct GPU selection.
+    
+    Args:
+        temp_ckpt_path: Path to temporary checkpoint with model weights
+        result_path: Path to write result JSON
+        preprocessed_folder: Path to preprocessed dataset
+        test_keys: List of test sample keys
+        top_k_dices: Current top-k dice values [(dice, epoch), ...]
+        top_k_checkpoints: Number of top checkpoints to maintain
+        output_folder: Folder to save checkpoints
+        plans_identifier: Identifier for checkpoint naming
+        eval_config: Dict with evaluation configuration
+        gpu_id: GPU ID (for logging only - already set by initializer)
+    """
+    # Import everything inside the function to ensure clean subprocess environment
+    # This avoids inheriting any CUDA context from parent process
+    import os
+    import sys
+    import json
+    import traceback
+    
+    # Verify GPU setting (for debugging)
+    actual_gpu = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
+    print(f"[MP] CUDA_VISIBLE_DEVICES={actual_gpu}")
+    
+    try:
+        # All imports happen AFTER CUDA_VISIBLE_DEVICES is set by initializer
+        import torch
+        import torch._dynamo as _dynamo
+        import numpy as np
+        from tqdm import tqdm
+        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+        from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
+        from nnunetv2.utilities.label_handling.label_handling import LabelManager
+        from nnunetv2.inference.sliding_window_prediction import compute_steps_for_sliding_window, compute_gaussian
+        from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
+        from nnunetv2.utilities.collate_outputs import collate_outputs
+        from batchgenerators.utilities.file_and_folder_operations import join, isfile
+        
+        # Suppress dynamo errors to avoid shape mismatch in residual connections
+        # This allows dynamo to fall back to eager mode when shapes are dynamic
+        _dynamo.config.suppress_errors = True
+        
+        # Now initialize CUDA - this creates a fresh CUDA context for this subprocess
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"[MP] Using device: {device}, torch.cuda.device_count()={torch.cuda.device_count() if torch.cuda.is_available() else 0}")
+        
+        # Load checkpoint
+        checkpoint = torch.load(temp_ckpt_path, map_location='cpu', weights_only=False)
+        
+        # Reconstruct model from init_args
+        init_args = checkpoint['init_args']
+        plans = init_args['plans']
+        configuration = init_args['configuration']
+        dataset_json = init_args['dataset_json']
+        
+        # Get model architecture
+        plans_manager = PlansManager(plans)
+        config_manager = plans_manager.get_configuration(configuration)
+        label_manager = plans_manager.get_label_manager(dataset_json)
+        
+        # Determine number of input channels
+        from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+        num_input_channels = determine_num_input_channels(plans_manager, config_manager, dataset_json)
+        num_output_channels = label_manager.num_segmentation_heads
+        
+        # Build network using correct function signature
+        from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+        
+        network = get_network_from_plans(
+            arch_class_name=config_manager.network_arch_class_name,
+            arch_kwargs=config_manager.network_arch_init_kwargs,
+            arch_kwargs_req_import=config_manager.network_arch_init_kwargs_req_import,
+            input_channels=num_input_channels,
+            output_channels=num_output_channels,
+            allow_init=True,
+            deep_supervision=eval_config.get('enable_deep_supervision', True)
+        )
+        network.load_state_dict(checkpoint['network_weights'])
+        network = network.to(device)
+        network.eval()
+        
+        # Create dataset
+        dataset_class = infer_dataset_class(preprocessed_folder)
+        test_dataset = dataset_class(
+            preprocessed_folder,
+            test_keys,
+            folder_with_segs_from_previous_stage=None
+        )
+        
+        # Extract eval config
+        patch_size = tuple(eval_config['patch_size'])
+        step_size = eval_config['step_size']
+        simulate_perfect_anatomy = eval_config.get('simulate_perfect_anatomy', True)
+        max_patches_per_sample = eval_config.get('max_patches_per_sample', None)
+        current_epoch = eval_config['current_epoch']
+        num_classes = label_manager.num_segmentation_heads
+        enable_deep_supervision = eval_config.get('enable_deep_supervision', True)
+        
+        # Run sliding window evaluation
+        all_outputs = []
+        
+        with torch.no_grad():
+            for key in tqdm(test_keys, desc=f"[MP] Test SW Eval (epoch {current_epoch})"):
+                try:
+                    data, seg, seg_prev, properties = test_dataset.load_case(key)
+                    
+                    seg_np = seg[0] if seg.ndim == 4 else seg
+                    volume_shape = tuple(seg_np.shape)
+                    
+                    # Compute sliding window boxes
+                    steps = compute_steps_for_sliding_window(volume_shape, patch_size, step_size)
+                    
+                    slicers = []
+                    for sx in steps[0]:
+                        for sy in steps[1]:
+                            for sz in steps[2]:
+                                slicers.append(
+                                    tuple([slice(si, si + ti) for si, ti in zip((sx, sy, sz), patch_size)])
+                                )
+                    
+                    # Classify boxes by foreground
+                    tumor_indices = []
+                    anatomy_only_indices = []
+                    
+                    for idx, sl in enumerate(slicers):
+                        box_seg = seg_np[sl]
+                        has_tumor = np.any(box_seg == 2)
+                        has_anatomy = np.any(box_seg == 1)
+                        
+                        if has_tumor:
+                            tumor_indices.append(idx)
+                        elif has_anatomy:
+                            anatomy_only_indices.append(idx)
+                    
+                    foreground_indices = tumor_indices + anatomy_only_indices
+                    
+                    # Priority sampling if max_patches set
+                    if max_patches_per_sample is not None and max_patches_per_sample > 0:
+                        selected = []
+                        rng = np.random.default_rng(seed=42)
+                        
+                        if len(tumor_indices) > 0:
+                            if len(tumor_indices) <= max_patches_per_sample:
+                                selected.extend(tumor_indices)
+                            else:
+                                selected.extend(rng.choice(tumor_indices, size=max_patches_per_sample, replace=False).tolist())
+                        
+                        remaining = max_patches_per_sample - len(selected)
+                        if remaining > 0 and len(anatomy_only_indices) > 0:
+                            if len(anatomy_only_indices) <= remaining:
+                                selected.extend(anatomy_only_indices)
+                            else:
+                                selected.extend(rng.choice(anatomy_only_indices, size=remaining, replace=False).tolist())
+                        
+                        foreground_indices = selected
+                    
+                    if len(foreground_indices) == 0:
+                        continue
+                    
+                    # Run inference
+                    data_tensor = torch.from_numpy(np.asarray(data)).float().to(device)
+                    
+                    predicted_logits = torch.zeros(
+                        (num_classes, *volume_shape), dtype=torch.half, device=device
+                    )
+                    n_predictions = torch.zeros(volume_shape, dtype=torch.half, device=device)
+                    gaussian = compute_gaussian(patch_size, sigma_scale=1./8, value_scaling_factor=10, device=device)
+                    
+                    for box_idx in foreground_indices:
+                        sl = slicers[box_idx]
+                        patch = data_tensor[(slice(None),) + sl][None]
+                        
+                        # Forward pass (dynamo errors suppressed, will fall back to eager)
+                        pred = network(patch)[0]
+                        if enable_deep_supervision:
+                            pred = pred[0]
+                        
+                        pred = pred * gaussian
+                        predicted_logits[(slice(None),) + sl] += pred
+                        n_predictions[sl] += gaussian
+                    
+                    valid_mask = n_predictions > 0
+                    n_predictions_safe = torch.clamp(n_predictions, min=1e-8)
+                    predicted_logits = predicted_logits / n_predictions_safe
+                    
+                    # Move to CPU for metrics
+                    predicted_logits = predicted_logits.cpu()
+                    valid_mask = valid_mask.cpu()
+                    seg_tensor = torch.from_numpy(np.asarray(seg)).long()
+                    
+                    if seg_tensor.ndim == 3:
+                        seg_tensor = seg_tensor.unsqueeze(0)
+                    
+                    # Handle ignore label
+                    if seg_tensor.min() < 0:
+                        seg_tensor = seg_tensor.clone()
+                        seg_tensor[seg_tensor < 0] = 0
+                    if seg_tensor.max() >= num_classes:
+                        seg_tensor = torch.clamp(seg_tensor, 0, num_classes - 1)
+                    
+                    # Convert to segmentation
+                    output_seg = predicted_logits.argmax(0, keepdim=True)
+                    
+                    if simulate_perfect_anatomy:
+                        gt_is_background = (seg_tensor == 0)
+                        output_seg = output_seg.clone()
+                        output_seg[gt_is_background] = 0
+                    
+                    # One-hot encoding
+                    pred_onehot = torch.zeros(predicted_logits.shape, dtype=torch.float32)
+                    pred_onehot.scatter_(0, output_seg, 1)
+                    pred_onehot = pred_onehot.unsqueeze(0)
+                    seg_tensor = seg_tensor.unsqueeze(0)
+                    
+                    target_onehot = torch.zeros(pred_onehot.shape, dtype=torch.bool)
+                    target_onehot.scatter_(1, seg_tensor, 1)
+                    
+                    valid_mask_expanded = valid_mask.unsqueeze(0).unsqueeze(0).float()
+                    
+                    axes = [0] + list(range(2, pred_onehot.ndim))
+                    tp, fp, fn, tn = get_tp_fp_fn_tn(pred_onehot, target_onehot, axes=axes, mask=valid_mask_expanded)
+                    
+                    tp_hard = tp.numpy()[1:]  # Skip background
+                    fp_hard = fp.numpy()[1:]
+                    fn_hard = fn.numpy()[1:]
+                    tn_hard = tn.numpy()[1:]
+                    
+                    all_outputs.append({
+                        'tp_hard': tp_hard,
+                        'fp_hard': fp_hard,
+                        'fn_hard': fn_hard,
+                        'tn_hard': tn_hard,
+                        'loss': 0.0
+                    })
+                    
+                    torch.cuda.empty_cache()
+                    
+                except Exception as e:
+                    print(f"[MP] Warning: Failed to process {key}: {e}")
+                    traceback.print_exc()
+                    continue
+        
+        # Aggregate results
+        if not all_outputs:
+            result = {
+                'success': False,
+                'error': 'No outputs collected',
+                'epoch': current_epoch,
+            }
+        else:
+            outputs_collated = collate_outputs(all_outputs)
+            tp = np.sum(outputs_collated['tp_hard'], 0)
+            fp = np.sum(outputs_collated['fp_hard'], 0)
+            fn = np.sum(outputs_collated['fn_hard'], 0)
+            tn = np.sum(outputs_collated['tn_hard'], 0)
+            
+            dice_per_class = [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0.0 
+                             for i, j, k in zip(tp, fp, fn)]
+            recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fn)]
+            precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fp)]
+            f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
+                           for p, r in zip(precision_per_class, recall_per_class)]
+            fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 for f, t in zip(fp, tn)]
+            
+            tumor_dice = dice_per_class[1] if len(dice_per_class) > 1 else np.nanmean(dice_per_class)
+            
+            # Check if this qualifies for top-k
+            achieved_rank = 0
+            for i, (dice, _) in enumerate(top_k_dices):
+                if tumor_dice > dice:
+                    achieved_rank = i + 1
+                    break
+            if achieved_rank == 0 and len(top_k_dices) < top_k_checkpoints:
+                achieved_rank = len(top_k_dices) + 1
+            
+            # Save checkpoint if qualified
+            checkpoint_saved = None
+            if achieved_rank > 0:
+                # Shift existing checkpoints down
+                for rank in range(min(len(top_k_dices), top_k_checkpoints - 1), achieved_rank - 1, -1):
+                    src_name = f"checkpoint_best_{plans_identifier}.pth" if rank == 1 else f"checkpoint_best_{plans_identifier}.pth.{rank}"
+                    dst_name = f"checkpoint_best_{plans_identifier}.pth.{rank + 1}"
+                    src_path = join(output_folder, src_name)
+                    dst_path = join(output_folder, dst_name)
+                    if isfile(src_path):
+                        try:
+                            os.rename(src_path, dst_path)
+                        except Exception as e:
+                            print(f"[MP] Warning: Could not rename {src_name} to {dst_name}: {e}")
+                
+                # Remove old last rank if list was full
+                if len(top_k_dices) >= top_k_checkpoints:
+                    last_name = f"checkpoint_best_{plans_identifier}.pth.{top_k_checkpoints}"
+                    last_path = join(output_folder, last_name)
+                    if isfile(last_path):
+                        try:
+                            os.remove(last_path)
+                        except:
+                            pass
+                
+                # Save new checkpoint at achieved rank
+                ckpt_name = f"checkpoint_best_{plans_identifier}.pth" if achieved_rank == 1 else f"checkpoint_best_{plans_identifier}.pth.{achieved_rank}"
+                ckpt_path = join(output_folder, ckpt_name)
+                
+                # Update checkpoint with dice info
+                checkpoint['_best_dice'] = tumor_dice
+                checkpoint['_best_ema'] = tumor_dice
+                torch.save(checkpoint, ckpt_path)
+                checkpoint_saved = ckpt_name
+                print(f"[MP] Saved checkpoint: {ckpt_name} (Dice: {tumor_dice:.4f}, Rank: {achieved_rank})")
+            
+            result = {
+                'success': True,
+                'epoch': current_epoch,
+                'dice_per_class': dice_per_class,
+                'recall_per_class': recall_per_class,
+                'precision_per_class': precision_per_class,
+                'f1_per_class': f1_per_class,
+                'fpr_per_class': fpr_per_class,
+                'tumor_dice': tumor_dice,
+                'achieved_rank': achieved_rank,
+                'checkpoint_saved': checkpoint_saved,
+            }
+        
+        # Write result
+        with open(result_path, 'w') as f:
+            json.dump(result, f, indent=2)
+        
+        print(f"[MP] Evaluation complete. Tumor Dice: {result.get('tumor_dice', 'N/A')}")
+        
+    except Exception as e:
+        error_result = {
+            'success': False,
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+            'epoch': eval_config.get('current_epoch', -1),
+        }
+        with open(result_path, 'w') as f:
+            json.dump(error_result, f, indent=2)
+        print(f"[MP] Evaluation FAILED: {e}")
+
+
+# =============================================================================
+# SANITY CHECK WORKER FUNCTION (for multiprocessing)
+# =============================================================================
+
+def _check_single_sample_for_tumor(args: tuple) -> tuple:
+    """
+    Worker function to check if a single sample contains tumor (label 2).
+    
+    This function is designed for multiprocessing.Pool.map() and must be
+    at module level to be picklable.
+    
+    Args:
+        args: Tuple of (key, dataset_folder, tumor_label)
+        
+    Returns:
+        Tuple of (key, has_tumor, has_ignore, n_ignore, error_msg)
+        - key: Sample key
+        - has_tumor: True if sample contains tumor_label
+        - has_ignore: True if sample contains ignore label (-1)
+        - n_ignore: Number of ignore label voxels
+        - error_msg: Error message if failed, None otherwise
+    """
+    key, dataset_folder, tumor_label = args
+    
+    try:
+        # Import inside function to avoid issues with multiprocessing
+        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+        import numpy as np
+        
+        # Create dataset for this single key
+        dataset_class = infer_dataset_class(dataset_folder)
+        temp_dataset = dataset_class(dataset_folder, [key], None)
+        
+        # Load the sample
+        data, seg, seg_prev, properties = temp_dataset.load_case(key)
+        
+        # Get segmentation array
+        seg_np = seg[0] if seg.ndim == 4 else seg
+        
+        # Check for ignore label (-1)
+        has_ignore = bool(np.any(seg_np < 0))
+        n_ignore = int(np.sum(seg_np < 0)) if has_ignore else 0
+        
+        # Check if tumor label exists
+        has_tumor = bool(np.any(seg_np == tumor_label))
+        
+        return (key, has_tumor, has_ignore, n_ignore, None)
+        
+    except Exception as e:
+        return (key, False, False, 0, str(e))
+
+
+# Default number of workers for sanity check multiprocessing
+SANITY_CHECK_NUM_WORKERS = 16
 
 
 # =============================================================================
@@ -252,8 +731,7 @@ def soft_pred_to_segmentation_np(
         Hard segmentation array with shape (D, H, W) containing class indices
     """
     if apply_softmax:
-        from scipy.special import softmax
-        probs = softmax(soft_pred, axis=0)
+        probs = scipy_softmax(soft_pred, axis=0)
     else:
         probs = soft_pred
     
@@ -1313,7 +1791,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         # sliding_window: Full inference within GT anatomy bounding box (more accurate)
         # dual_crop: Two random patches per sample (faster, legacy)
-        self.eval_mode = 'sliding_window'  # Default to sliding window for better accuracy
+        # Separate settings for TUNING (fast feedback) vs TEST (accurate final metrics)
+        self.tuning_eval_mode = 'dual_crop'  # TUNING: Fast dual-crop for adaptive decisions
+        self.test_eval_mode = 'sliding_window'  # TEST: Accurate sliding window for final metrics
+        self.eval_mode = 'sliding_window'  # Legacy: backward compatibility (prefer specific modes)
         self.sliding_window_step_size = 0.5  # Step size for sliding window (0.5 = 50% overlap)
         # Cache for sliding window box classifications (computed once, reused across epochs)
         # Format: {case_key: {'volume_shape': tuple, 'box_slicers': list, 'foreground_indices': list}}
@@ -1326,13 +1807,42 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.simulate_perfect_anatomy = True  # Default: enabled for fairer tumor metrics
         
         # =====================================================================
-        # EVALUATION FREQUENCY
+        # EVALUATION FREQUENCY AND SPEED
         # =====================================================================
         # Since sliding window evaluation is time-consuming, only run every N epochs
         # Still runs on: epoch 0 (pre-training), first epoch, and every N epochs
         self.eval_every_n_epochs = 5  # Evaluate tuning/test sets every N epochs
         self._last_eval_results = None  # Cache last evaluation results for non-eval epochs
         self._last_eval_epoch = -1  # Track which epoch was last evaluated
+        
+        # Max patches per sample (for speed vs accuracy tradeoff)
+        # Priority sampling: tumor boxes first, then anatomy-only boxes
+        # Set to None for full evaluation (slower but more accurate)
+        self.tuning_max_patches_per_sample = 5   # TUNING: Limited for faster adaptive decisions
+        self.test_max_patches_per_sample = None  # TEST: Full evaluation for accurate final metrics
+        # =====================================================================
+        
+        # =====================================================================
+        # ASYNC TEST EVALUATION (runs in subprocess, doesn't block training)
+        # =====================================================================
+        # Configuration is controlled by:
+        # - Module-level: ASYNC_TEST_EVAL, ASYNC_EVAL_TIMEOUT, ENABLE_PRE_TRAINING_EVAL
+        # - Instance-level: self.backup_gpu_id (set by run_training.py via --backup_gpu_id)
+        #
+        # GPU selection priority for subprocess:
+        # 1. self.backup_gpu_id (from --backup_gpu_id argument)
+        # 2. ASYNC_EVAL_GPU_ID (module-level fallback)
+        # 3. None (same GPU as training - may cause OOM)
+        
+        # Subprocess state tracking
+        self._async_eval_process: Optional[mp.Process] = None
+        self._async_eval_epoch: int = -1  # Which epoch is being evaluated
+        self._async_eval_result_path: Optional[str] = None
+        self._pending_async_results: Dict[int, dict] = {}  # epoch -> result
+        
+        # Backup GPU ID for async evaluation (set externally by run_training.py)
+        # This takes precedence over ASYNC_EVAL_GPU_ID module constant
+        self.backup_gpu_id: Optional[int] = None
         # =====================================================================
         
         self.print_to_log_file("\n" + "=" * 70)
@@ -1346,13 +1856,17 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file("Patch centering strategy (TRAINING):")
         self.print_to_log_file(f"  3-way probabilistic ({self.train_prob_random:.2f} / {self.train_prob_anatomy:.2f} / {self.train_prob_tumor:.2f})")
         self.print_to_log_file("-" * 70)
-        self.print_to_log_file(f"Evaluation mode: {self.eval_mode.upper()}")
-        if self.eval_mode == 'sliding_window':
-            self.print_to_log_file(f"  → Sliding window inference within GT anatomy bounding box")
-            self.print_to_log_file(f"  → Step size: {self.sliding_window_step_size} (overlap: {(1-self.sliding_window_step_size)*100:.0f}%)")
+        self.print_to_log_file(f"Evaluation modes:")
+        self.print_to_log_file(f"  TUNING: {self.tuning_eval_mode.upper()}")
+        if self.tuning_eval_mode == 'dual_crop':
+            self.print_to_log_file(f"    → 1 anatomy + 1 tumor patch per sample (fast)")
         else:
-            self.print_to_log_file(f"  → Dual-crop: 1 anatomy + 1 tumor patch per sample")
-            self.print_to_log_file(f"  → N samples → 2N patches (balanced FP control + tumor detection)")
+            self.print_to_log_file(f"    → Sliding window, step {self.sliding_window_step_size}")
+        self.print_to_log_file(f"  TEST:   {self.test_eval_mode.upper()}")
+        if self.test_eval_mode == 'sliding_window':
+            self.print_to_log_file(f"    → Sliding window, step {self.sliding_window_step_size} (accurate)")
+        else:
+            self.print_to_log_file(f"    → 1 anatomy + 1 tumor patch per sample")
         self.print_to_log_file(f"Simulate perfect anatomy: {'ENABLED' if self.simulate_perfect_anatomy else 'DISABLED'}")
         if self.simulate_perfect_anatomy:
             self.print_to_log_file(f"  → Predictions outside GT anatomy are zeroed for tumor metrics")
@@ -1362,6 +1876,18 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             self.print_to_log_file("  → Training probabilities will be adjusted based on tuning metrics")
         self.print_to_log_file(f"Top-K checkpoints: Maintaining top {self.top_k_checkpoints} by single-epoch tumor Dice")
         self.print_to_log_file(f"Evaluation frequency: Every {self.eval_every_n_epochs} epochs")
+        # Show patches per sample only for sliding window mode
+        if self.test_eval_mode == 'sliding_window':
+            self.print_to_log_file(f"Test patches per sample: {self.test_max_patches_per_sample or 'ALL (full evaluation)'}")
+        self.print_to_log_file("-" * 70)
+        self.print_to_log_file(f"Async test evaluation: {'ENABLED' if ASYNC_TEST_EVAL else 'DISABLED'}")
+        if ASYNC_TEST_EVAL:
+            # backup_gpu_id will be set by run_training.py after __init__, so show placeholder
+            self.print_to_log_file(f"  → Backup GPU: (set via --backup_gpu_id, fallback: {ASYNC_EVAL_GPU_ID})")
+            self.print_to_log_file(f"  → Training continues while test eval runs in parallel")
+        self.print_to_log_file(f"Pre-training evaluation:")
+        self.print_to_log_file(f"  TUNING: {'ENABLED' if ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET else 'DISABLED'}")
+        self.print_to_log_file(f"  TEST:   {'ENABLED' if ENABLE_PRE_TRAINING_EVAL else 'DISABLED'}")
         self.print_to_log_file("=" * 70 + "\n")
     
     # =========================================================================
@@ -1490,8 +2016,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         Args:
             insert_rank: The rank where the new checkpoint will be saved (1-based)
         """
-        import os
-        
         # Only shift if we have enough checkpoints that would be affected
         max_existing_rank = min(len(self.top_k_dices), self.top_k_checkpoints)
         
@@ -1567,6 +2091,384 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         return insert_rank
     
     # =========================================================================
+    # ASYNC TEST EVALUATION METHODS
+    # =========================================================================
+    
+    def _get_temp_checkpoint_path(self, epoch: int) -> str:
+        """Get path for temporary checkpoint used by async eval subprocess."""
+        return join(self.output_folder, f'checkpoint_eval_temp_epoch{epoch}.pth')
+    
+    def _get_async_result_path(self, epoch: int) -> str:
+        """Get path for async evaluation result JSON."""
+        return join(self.output_folder, f'eval_result_epoch{epoch}.json')
+    
+    def _save_temp_eval_checkpoint(self, epoch: int) -> str:
+        """
+        Save a temporary checkpoint for async evaluation subprocess.
+        
+        This saves only the necessary data for inference:
+        - Network weights
+        - Init args (for model reconstruction)
+        - Configuration
+        
+        Returns:
+            Path to the saved temporary checkpoint
+        """
+        if self.is_ddp:
+            mod = self.network.module
+        else:
+            mod = self.network
+        if isinstance(mod, OptimizedModule):
+            mod = mod._orig_mod
+        
+        temp_ckpt_path = self._get_temp_checkpoint_path(epoch)
+        
+        # Save minimal checkpoint for inference
+        checkpoint = {
+            'network_weights': mod.state_dict(),
+            'init_args': self.my_init_kwargs,
+            'current_epoch': epoch,
+            '_best_dice': getattr(self, '_best_dice', None),
+            '_best_ema': getattr(self, '_best_ema', None),
+            'trainer_name': self.__class__.__name__,
+            'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+        }
+        
+        torch.save(checkpoint, temp_ckpt_path)
+        return temp_ckpt_path
+    
+    def _cleanup_temp_checkpoint(self, epoch: int) -> None:
+        """Remove temporary checkpoint after async eval completes."""
+        temp_ckpt_path = self._get_temp_checkpoint_path(epoch)
+        if isfile(temp_ckpt_path):
+            try:
+                os.remove(temp_ckpt_path)
+                self.print_to_log_file(f"[Async] Cleaned up temp checkpoint: {os.path.basename(temp_ckpt_path)}")
+            except Exception as e:
+                self.print_to_log_file(f"[Async] Warning: Could not remove temp checkpoint: {e}")
+        
+        # Also clean up result file
+        result_path = self._get_async_result_path(epoch)
+        if isfile(result_path):
+            try:
+                os.remove(result_path)
+            except:
+                pass
+    
+    def _cleanup_orphaned_temp_files(self) -> None:
+        """
+        Clean up any orphaned temp checkpoints and result files from previous runs.
+        
+        This is called during initialization to ensure a clean state.
+        Orphaned files can occur if the training process was killed while
+        async eval was running.
+        """
+        # Find and remove orphaned temp checkpoints
+        pattern = join(self.output_folder, 'checkpoint_eval_temp_epoch*.pth')
+        for temp_file in glob.glob(pattern):
+            try:
+                os.remove(temp_file)
+                self.print_to_log_file(f"[Async] Cleaned up orphaned temp file: {os.path.basename(temp_file)}")
+            except Exception as e:
+                self.print_to_log_file(f"[Async] Warning: Could not remove orphaned temp file: {e}")
+        
+        # Find and remove orphaned result files
+        pattern = join(self.output_folder, 'eval_result_epoch*.json')
+        for result_file in glob.glob(pattern):
+            try:
+                os.remove(result_file)
+            except:
+                pass
+    
+    def _spawn_async_test_eval(self, epoch: int, test_keys: List[str]) -> bool:
+        """
+        Spawn a subprocess for async test evaluation.
+        
+        IMPORTANT: Only one subprocess can run at a time. If there's already
+        a running subprocess, this method will WAIT for it to complete first.
+        
+        Args:
+            epoch: Current epoch number
+            test_keys: List of test sample keys
+            
+        Returns:
+            True if subprocess was spawned, False if async eval is disabled
+        """
+        if not ASYNC_TEST_EVAL:
+            return False
+        
+        # Check if there's already a running subprocess - if so, wait for it
+        if self._async_eval_process is not None and self._async_eval_process.is_alive():
+            self.print_to_log_file(f"[Async] Previous eval still running (epoch {self._async_eval_epoch}), waiting...")
+            result = self._wait_for_async_eval(timeout=ASYNC_EVAL_TIMEOUT)
+            if result:
+                self._handle_async_eval_result(result)
+        
+        # Save temporary checkpoint
+        self.print_to_log_file(f"[Async] Saving temp checkpoint for epoch {epoch}...")
+        temp_ckpt_path = self._save_temp_eval_checkpoint(epoch)
+        
+        # Prepare result path
+        result_path = self._get_async_result_path(epoch)
+        
+        # Remove old result file if exists
+        if isfile(result_path):
+            os.remove(result_path)
+        
+        # Prepare eval config
+        eval_config = {
+            'patch_size': list(self.configuration_manager.patch_size),
+            'step_size': self.sliding_window_step_size,
+            'simulate_perfect_anatomy': self.simulate_perfect_anatomy,
+            'max_patches_per_sample': self.test_max_patches_per_sample,
+            'current_epoch': epoch,
+            'enable_deep_supervision': self.enable_deep_supervision,
+        }
+        
+        # Get plans identifier for checkpoint naming
+        plans_identifier = self.plans_manager.plans_name
+        
+        # =====================================================================
+        # SPAWN SUBPROCESS WITH CORRECT GPU CONFIGURATION
+        # =====================================================================
+        # We use 'spawn' context to create a fresh Python interpreter, avoiding
+        # CUDA context inheritance from the parent process.
+        #
+        # IMPORTANT: To ensure the subprocess uses the correct GPU, we must set
+        # CUDA_VISIBLE_DEVICES BEFORE spawning. The 'spawn' method inherits the
+        # parent's environment at spawn time, so we:
+        # 1. Save the current CUDA_VISIBLE_DEVICES
+        # 2. Set CUDA_VISIBLE_DEVICES for the subprocess (if configured)
+        # 3. Spawn the subprocess
+        # 4. Restore the parent's CUDA_VISIBLE_DEVICES
+        #
+        # This ensures:
+        # - Parent process continues using its original GPU
+        # - Subprocess uses the configured GPU (ASYNC_EVAL_GPU_ID)
+        # =====================================================================
+        
+        ctx = mp.get_context('spawn')
+        
+        # Save current CUDA_VISIBLE_DEVICES (may be None if not set)
+        original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        
+        # Determine which GPU to use for subprocess:
+        # Priority: self.backup_gpu_id > ASYNC_EVAL_GPU_ID > None (same as main)
+        subprocess_gpu_id = self.backup_gpu_id if self.backup_gpu_id is not None else ASYNC_EVAL_GPU_ID
+        
+        try:
+            # Set CUDA_VISIBLE_DEVICES for subprocess if configured
+            if subprocess_gpu_id is not None:
+                os.environ['CUDA_VISIBLE_DEVICES'] = str(subprocess_gpu_id)
+                self.print_to_log_file(f"[Async] Subprocess will use GPU {subprocess_gpu_id}")
+            else:
+                self.print_to_log_file(f"[Async] Subprocess will use same GPU as training (CUDA_VISIBLE_DEVICES={original_cuda_visible})")
+            
+            # Create and start the subprocess
+            # Note: The subprocess inherits CUDA_VISIBLE_DEVICES at this moment
+            # daemon=True: subprocess will be automatically killed if main process exits/crashes
+            self._async_eval_process = ctx.Process(
+                target=_async_test_eval_worker,
+                kwargs={
+                    'temp_ckpt_path': temp_ckpt_path,
+                    'result_path': result_path,
+                    'preprocessed_folder': self.preprocessed_dataset_folder,
+                    'test_keys': list(test_keys),  # Ensure it's a plain list for pickling
+                    'top_k_dices': list(self.top_k_dices),  # Copy to avoid race conditions
+                    'top_k_checkpoints': self.top_k_checkpoints,
+                    'output_folder': self.output_folder,
+                    'plans_identifier': plans_identifier,
+                    'eval_config': eval_config,
+                    'gpu_id': subprocess_gpu_id,  # Passed for logging only
+                },
+                daemon=True  # Auto-terminate if main process exits
+            )
+            
+            self._async_eval_epoch = epoch
+            self._async_eval_result_path = result_path
+            self._async_eval_process.start()
+            
+        finally:
+            # CRITICAL: Restore parent's CUDA_VISIBLE_DEVICES immediately after spawn
+            # This ensures the training process continues on its original GPU
+            if original_cuda_visible is not None:
+                os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible
+            elif subprocess_gpu_id is not None:
+                # Original was not set, but we modified it - remove the modification
+                del os.environ['CUDA_VISIBLE_DEVICES']
+        
+        self.print_to_log_file(f"[Async] Spawned test eval subprocess for epoch {epoch} (PID: {self._async_eval_process.pid})")
+        
+        return True
+    
+    def _check_async_eval_result(self) -> Optional[dict]:
+        """
+        Non-blocking check for completed async evaluation result.
+        
+        Returns:
+            Result dict if evaluation completed, None otherwise
+        """
+        if self._async_eval_process is None:
+            return None
+        
+        # Check if result file exists
+        if self._async_eval_result_path and isfile(self._async_eval_result_path):
+            try:
+                with open(self._async_eval_result_path, 'r') as f:
+                    result = json.load(f)
+                
+                # Wait for process to fully terminate
+                self._async_eval_process.join(timeout=5)
+                
+                return result
+            except Exception as e:
+                self.print_to_log_file(f"[Async] Warning: Could not read result: {e}")
+                return None
+        
+        # Check if process is still alive
+        if not self._async_eval_process.is_alive():
+            # Process finished but no result file - something went wrong
+            self.print_to_log_file(f"[Async] Warning: Process finished without result file")
+            self._async_eval_process.join()
+            return {'success': False, 'error': 'Process finished without result', 'epoch': self._async_eval_epoch}
+        
+        return None
+    
+    def _wait_for_async_eval(self, timeout: float = None) -> Optional[dict]:
+        """
+        Blocking wait for async evaluation to complete.
+        
+        Args:
+            timeout: Max seconds to wait (None = use ASYNC_EVAL_TIMEOUT)
+            
+        Returns:
+            Result dict if evaluation completed, None if timeout/error
+        """
+        if self._async_eval_process is None:
+            return None
+        
+        if timeout is None:
+            timeout = ASYNC_EVAL_TIMEOUT
+        
+        self.print_to_log_file(f"[Async] Waiting for epoch {self._async_eval_epoch} evaluation (timeout: {timeout}s)...")
+        
+        # Wait for process to complete
+        self._async_eval_process.join(timeout=timeout)
+        
+        if self._async_eval_process.is_alive():
+            # Timeout - kill the process
+            self.print_to_log_file(f"[Async] WARNING: Evaluation timed out after {timeout}s, terminating...")
+            self._async_eval_process.terminate()
+            self._async_eval_process.join(timeout=5)
+            if self._async_eval_process.is_alive():
+                self._async_eval_process.kill()
+            return None
+        
+        # Check for result
+        if self._async_eval_result_path and isfile(self._async_eval_result_path):
+            try:
+                with open(self._async_eval_result_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                self.print_to_log_file(f"[Async] Warning: Could not read result: {e}")
+                return None
+        
+        return None
+    
+    def _handle_async_eval_result(self, result: dict) -> None:
+        """
+        Handle the result from async evaluation.
+        
+        Updates:
+        - top_k_dices list (if subprocess saved a new checkpoint)
+        - Last eval results cache
+        - Cleanup temp files
+        
+        IMPORTANT: To ensure consistency, we re-scan checkpoint files after
+        the subprocess saves. This handles race conditions where the subprocess
+        might have saved/renamed checkpoints.
+        """
+        epoch = result.get('epoch', self._async_eval_epoch)
+        
+        if not result.get('success', False):
+            self.print_to_log_file(f"[Async] Epoch {epoch} evaluation FAILED: {result.get('error', 'Unknown error')}")
+            if 'traceback' in result:
+                self.print_to_log_file(f"[Async] Traceback:\n{result['traceback']}")
+        else:
+            tumor_dice = result.get('tumor_dice', 0)
+            achieved_rank = result.get('achieved_rank', 0)
+            checkpoint_saved = result.get('checkpoint_saved', None)
+            
+            self.print_to_log_file(f"[Async] Epoch {epoch} evaluation complete:")
+            self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+            self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
+            
+            if achieved_rank > 0:
+                self.print_to_log_file(f"  → Achieved rank {achieved_rank}! Checkpoint: {checkpoint_saved}")
+                
+                # Re-scan checkpoint files to ensure consistency
+                # The subprocess has modified checkpoint files, so we need to
+                # refresh our view of the top-k list from disk
+                self.print_to_log_file(f"  → Re-scanning top-k checkpoints from disk for consistency...")
+                self.top_k_dices = self._scan_existing_top_k_checkpoints()
+                
+                # Update _best_dice if rank 1
+                if achieved_rank == 1:
+                    self._best_dice = tumor_dice
+                    self._best_ema = tumor_dice
+                    
+                self.print_to_log_file(f"  → Top-k list updated: {[(np.round(d, 4), e) for d, e in self.top_k_dices]}")
+            else:
+                self.print_to_log_file(f"  → Did not qualify for top-{self.top_k_checkpoints}")
+            
+            # Cache results
+            self._last_eval_results = {
+                'dice_per_class': result.get('dice_per_class', []),
+                'recall_per_class': result.get('recall_per_class', []),
+                'precision_per_class': result.get('precision_per_class', []),
+                'f1_per_class': result.get('f1_per_class', []),
+                'fpr_per_class': result.get('fpr_per_class', []),
+                'loss': 0.0,
+            }
+            self._last_eval_epoch = epoch
+            
+            # Store additional metrics for logging
+            self._test_additional_metrics = {
+                'recall_per_class': result.get('recall_per_class', []),
+                'precision_per_class': result.get('precision_per_class', []),
+                'f1_per_class': result.get('f1_per_class', []),
+                'fpr_per_class': result.get('fpr_per_class', []),
+            }
+        
+        # Cleanup temp files
+        self._cleanup_temp_checkpoint(epoch)
+        
+        # Reset state
+        self._async_eval_process = None
+        self._async_eval_epoch = -1
+        self._async_eval_result_path = None
+    
+    def on_train_end(self):
+        """
+        Override to ensure async evaluation completes before training ends.
+        """
+        # Wait for any pending async evaluation
+        if self._async_eval_process is not None and self._async_eval_process.is_alive():
+            self.print_to_log_file("\n" + "=" * 70)
+            self.print_to_log_file("WAITING FOR ASYNC TEST EVALUATION TO COMPLETE")
+            self.print_to_log_file("=" * 70)
+            
+            result = self._wait_for_async_eval(timeout=ASYNC_EVAL_TIMEOUT)
+            if result:
+                self._handle_async_eval_result(result)
+            
+            self.print_to_log_file("=" * 70 + "\n")
+        
+        # Call parent's on_train_end if it exists
+        if hasattr(super(), 'on_train_end'):
+            super().on_train_end()
+    
+    # =========================================================================
     
     def on_train_start(self):
         """
@@ -1578,74 +2480,203 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         Flow:
         1. Call parent's on_train_start (initialization, dataloader creation, etc.)
-        2. Run evaluation on tuning set using current model state
-        3. Log the pre-training metrics
+        2. Clean up any orphaned temp files from previous runs
+        3. Run evaluation on tuning set using current model state (if enabled)
+        4. Log the pre-training metrics
         """
         # Call parent's on_train_start first (creates dataloaders, etc.)
         super().on_train_start()
         
         # =====================================================================
-        # PRE-TRAINING EVALUATION: Catch sliding window bugs early
+        # CLEANUP: Remove orphaned temp files from previous runs
         # =====================================================================
-        self.print_to_log_file("\n" + "=" * 70)
-        self.print_to_log_file("PRE-TRAINING EVALUATION (before epoch 0)")
-        self.print_to_log_file("=" * 70)
-        self.print_to_log_file("Purpose: Verify sliding window inference works correctly")
-        self.print_to_log_file("         and establish baseline metrics before training")
-        self.print_to_log_file("-" * 70)
+        if ASYNC_TEST_EVAL:
+            self._cleanup_orphaned_temp_files()
         
-        try:
-            # Run evaluation on tuning set
-            self.network.eval()
-            
-            if self.eval_mode == 'sliding_window':
-                self.print_to_log_file(f"Running sliding window evaluation on {len(self.tuning_keys)} tuning samples...")
-                pre_train_metrics = self.compute_metrics_sliding_window(
-                    self.tuning_dataset,
-                    self.tuning_keys,
-                    num_samples=None,  # Use all tuning samples
-                    progress_desc="Pre-train SW Eval"
-                )
-            else:
-                self.print_to_log_file(f"Running dual-crop evaluation on {len(self.tuning_keys)} tuning samples...")
-                pre_train_metrics = self._compute_tuning_metrics_dual_crop()
-            
-            # Log the metrics
-            self.print_to_log_file("\nPre-training tuning set metrics:")
-            self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in pre_train_metrics['dice_per_class']]}")
-            self.print_to_log_file(f"  Mean FG Dice: {np.round(pre_train_metrics['mean_fg_dice'], 4)}")
-            
-            # Log tumor-specific metrics if available
-            if len(pre_train_metrics['dice_per_class']) > 1:
-                tumor_dice = pre_train_metrics['dice_per_class'][1]
-                self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
-            
-            if 'recall_per_class' in pre_train_metrics:
-                self.print_to_log_file(f"  Recall (%): {[np.round(r, 2) for r in pre_train_metrics['recall_per_class']]}")
-                self.print_to_log_file(f"  Precision (%): {[np.round(p, 2) for p in pre_train_metrics['precision_per_class']]}")
-            
-            self.print_to_log_file("-" * 70)
-            self.print_to_log_file("✓ Pre-training evaluation completed successfully!")
-            self.print_to_log_file("  Sliding window inference is working correctly.")
-            self.print_to_log_file("=" * 70 + "\n")
-            
-            # Store pre-training metrics for reference
-            self._pre_training_metrics = pre_train_metrics
-            
-        except Exception as e:
-            self.print_to_log_file("-" * 70)
-            self.print_to_log_file(f"✗ PRE-TRAINING EVALUATION FAILED!")
-            self.print_to_log_file(f"  Error: {e}")
-            self.print_to_log_file("-" * 70)
-            self.print_to_log_file("This error would have occurred during the first validation epoch.")
-            self.print_to_log_file("Please fix the issue before proceeding with training.")
-            self.print_to_log_file("=" * 70 + "\n")
-            # Re-raise to stop training immediately
-            raise RuntimeError(f"Pre-training evaluation failed: {e}") from e
+        # =====================================================================
+        # PRE-TRAINING EVALUATION: Catch evaluation bugs early
+        # =====================================================================
+        # Two separate flags:
+        # - ENABLE_PRE_TRAINING_EVAL: Main pre-training eval (test set, if enabled)
+        # - ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET: Tuning set eval (fast, for strategy verification)
         
-        finally:
-            # Ensure network is back in training mode
-            self.network.train()
+        if not ENABLE_PRE_TRAINING_EVAL and not ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET:
+            self.print_to_log_file("\n" + "=" * 70)
+            self.print_to_log_file("PRE-TRAINING EVALUATION: SKIPPED (all disabled)")
+            self.print_to_log_file("  Set ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET = True for tuning eval")
+            self.print_to_log_file("  Set ENABLE_PRE_TRAINING_EVAL = True for full eval")
+            self.print_to_log_file("=" * 70 + "\n")
+            return
+        
+        # ---------------------------------------------------------------------
+        # TUNING SET PRE-TRAINING EVALUATION (fast, for adaptive strategy)
+        # ---------------------------------------------------------------------
+        if ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET:
+            self.print_to_log_file("\n" + "=" * 70)
+            self.print_to_log_file("PRE-TRAINING TUNING SET EVALUATION (before epoch 0)")
+            self.print_to_log_file("=" * 70)
+            self.print_to_log_file("Purpose: Verify tuning evaluation works correctly")
+            self.print_to_log_file("         and establish baseline metrics for adaptive strategy")
+            self.print_to_log_file("-" * 70)
+            
+            try:
+                self.network.eval()
+                
+                if self.tuning_eval_mode == 'sliding_window':
+                    self.print_to_log_file(f"Running sliding window evaluation on {len(self.tuning_keys)} tuning samples...")
+                    self.print_to_log_file(f"  Max patches per sample: {self.tuning_max_patches_per_sample or 'ALL'}")
+                    pre_train_tuning_metrics = self.compute_metrics_sliding_window(
+                        self.tuning_dataset,
+                        self.tuning_keys,
+                        num_samples=None,
+                        max_patches_per_sample=self.tuning_max_patches_per_sample,
+                        progress_desc="Pre-train Tuning SW Eval"
+                    )
+                else:
+                    self.print_to_log_file(f"Running dual-crop evaluation on {len(self.tuning_keys)} tuning samples...")
+                    pre_train_tuning_metrics = self._compute_tuning_metrics_dual_crop()
+                
+                # Log the metrics
+                self.print_to_log_file("\nPre-training tuning set metrics:")
+                self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in pre_train_tuning_metrics['dice_per_class']]}")
+                self.print_to_log_file(f"  Mean FG Dice: {np.round(pre_train_tuning_metrics['mean_fg_dice'], 4)}")
+                
+                if len(pre_train_tuning_metrics['dice_per_class']) > 1:
+                    tumor_dice = pre_train_tuning_metrics['dice_per_class'][1]
+                    self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+                
+                if 'recall_per_class' in pre_train_tuning_metrics:
+                    self.print_to_log_file(f"  Recall (%): {[np.round(r, 2) for r in pre_train_tuning_metrics['recall_per_class']]}")
+                    self.print_to_log_file(f"  Precision (%): {[np.round(p, 2) for p in pre_train_tuning_metrics['precision_per_class']]}")
+                
+                self.print_to_log_file("-" * 70)
+                self.print_to_log_file("✓ Pre-training TUNING evaluation completed successfully!")
+                self.print_to_log_file(f"  {self.tuning_eval_mode.upper()} evaluation is working correctly.")
+                self.print_to_log_file("=" * 70 + "\n")
+                
+                # Store pre-training tuning metrics
+                self._pre_training_tuning_metrics = pre_train_tuning_metrics
+                
+            except Exception as e:
+                self.print_to_log_file("-" * 70)
+                self.print_to_log_file(f"✗ PRE-TRAINING TUNING EVALUATION FAILED!")
+                self.print_to_log_file(f"  Error: {e}")
+                self.print_to_log_file("-" * 70)
+                self.print_to_log_file("Please fix the issue before proceeding with training.")
+                self.print_to_log_file("=" * 70 + "\n")
+                raise RuntimeError(f"Pre-training tuning evaluation failed: {e}") from e
+            
+            finally:
+                self.network.train()
+        
+        # ---------------------------------------------------------------------
+        # MAIN PRE-TRAINING EVALUATION (test set, full sliding window)
+        # ---------------------------------------------------------------------
+        if ENABLE_PRE_TRAINING_EVAL:
+            self.print_to_log_file("\n" + "=" * 70)
+            self.print_to_log_file("PRE-TRAINING TEST SET EVALUATION (before epoch 0)")
+            self.print_to_log_file("=" * 70)
+            self.print_to_log_file("Purpose: Verify test evaluation works correctly")
+            self.print_to_log_file("         and establish baseline metrics before training")
+            self.print_to_log_file("-" * 70)
+            
+            try:
+                self.network.eval()
+                test_keys = list(self._dl_val._data.identifiers)
+                
+                if self.test_eval_mode == 'sliding_window':
+                    self.print_to_log_file(f"Running sliding window evaluation on {len(test_keys)} test samples...")
+                    self.print_to_log_file(f"  Max patches per sample: {self.test_max_patches_per_sample or 'ALL'}")
+                    pre_train_test_metrics = self.compute_metrics_sliding_window(
+                        self._dl_val._data,
+                        test_keys,
+                        num_samples=None,
+                        max_patches_per_sample=self.test_max_patches_per_sample,
+                        progress_desc="Pre-train Test SW Eval"
+                    )
+                else:
+                    # Dual-crop for test set (rare case)
+                    self.print_to_log_file(f"Running dual-crop evaluation on {len(test_keys)} test samples...")
+                    # Would need a separate dual-crop method for test set
+                    # For now, use the tuning dual-crop method with test keys
+                    pre_train_test_metrics = self._compute_tuning_metrics_dual_crop()
+                
+                # Log the metrics
+                self.print_to_log_file("\nPre-training test set metrics:")
+                self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in pre_train_test_metrics['dice_per_class']]}")
+                self.print_to_log_file(f"  Mean FG Dice: {np.round(pre_train_test_metrics['mean_fg_dice'], 4)}")
+                
+                if len(pre_train_test_metrics['dice_per_class']) > 1:
+                    tumor_dice = pre_train_test_metrics['dice_per_class'][1]
+                    self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+                
+                if 'recall_per_class' in pre_train_test_metrics:
+                    self.print_to_log_file(f"  Recall (%): {[np.round(r, 2) for r in pre_train_test_metrics['recall_per_class']]}")
+                    self.print_to_log_file(f"  Precision (%): {[np.round(p, 2) for p in pre_train_test_metrics['precision_per_class']]}")
+                
+                self.print_to_log_file("-" * 70)
+                self.print_to_log_file("✓ Pre-training TEST evaluation completed successfully!")
+                self.print_to_log_file(f"  {self.test_eval_mode.upper()} evaluation is working correctly.")
+                self.print_to_log_file("=" * 70 + "\n")
+                
+                # Store pre-training test metrics
+                self._pre_training_test_metrics = pre_train_test_metrics
+                
+            except Exception as e:
+                self.print_to_log_file("-" * 70)
+                self.print_to_log_file(f"✗ PRE-TRAINING TEST EVALUATION FAILED!")
+                self.print_to_log_file(f"  Error: {e}")
+                self.print_to_log_file("-" * 70)
+                self.print_to_log_file("Please fix the issue before proceeding with training.")
+                self.print_to_log_file("=" * 70 + "\n")
+                raise RuntimeError(f"Pre-training test evaluation failed: {e}") from e
+            
+            finally:
+                self.network.train()
+    
+    def run_training(self):
+        """
+        Override to add tqdm progress bar for training iterations.
+        
+        This provides visual feedback during training so you can verify
+        the main process is alive and progressing.
+        """
+        self.on_train_start()
+
+        for epoch in range(self.current_epoch, self.num_epochs):
+            self.on_epoch_start()
+
+            self.on_train_epoch_start()
+            train_outputs = []
+            
+            # Add tqdm progress bar for training iterations
+            pbar = tqdm(
+                range(self.num_iterations_per_epoch), 
+                desc=f"Epoch {epoch} Training",
+                disable=self.local_rank != 0,  # Only show on main process
+                leave=False  # Don't leave progress bar after completion
+            )
+            for batch_id in pbar:
+                output = self.train_step(next(self.dataloader_train))
+                train_outputs.append(output)
+                
+                # Update progress bar with current loss
+                if 'loss' in output:
+                    pbar.set_postfix({'loss': f"{output['loss']:.4f}"})
+            
+            pbar.close()
+            self.on_train_epoch_end(train_outputs)
+
+            with torch.no_grad():
+                self.on_validation_epoch_start()
+                val_outputs = []
+                for batch_id in range(self.num_val_iterations_per_epoch):
+                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                self.on_validation_epoch_end(val_outputs)
+
+            self.on_epoch_end()
+
+        self.on_train_end()
     
     def _is_original_sample(self, key: str) -> bool:
         """
@@ -1665,9 +2696,12 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         pattern = f"^{self.pattern_original_samples}$"
         return bool(re.match(pattern, key))
     
-    def _sanity_check_samples_for_tumor(self, keys: List[str], dataset_folder: str) -> Tuple[List[str], List[str]]:
+    def _sanity_check_samples_for_tumor(self, keys: List[str], dataset_folder: str, 
+                                         num_workers: int = None) -> Tuple[List[str], List[str]]:
         """
         Sanity check to identify samples that do NOT contain tumor (label 2).
+        
+        Uses multiprocessing to speed up I/O-bound checking of many samples.
         
         Rationale: Samples without tumor will have Dice=0 for any FP during evaluation,
         which unfairly penalizes the model. These samples should be excluded from all sets.
@@ -1675,63 +2709,69 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         Args:
             keys: List of sample keys to check
             dataset_folder: Path to the preprocessed dataset folder
+            num_workers: Number of parallel workers (default: SANITY_CHECK_NUM_WORKERS=16)
             
         Returns:
             Tuple of (valid_keys, excluded_keys) where:
             - valid_keys: Samples that contain tumor (label 2)
             - excluded_keys: Samples that do NOT contain tumor (will be excluded)
         """
-        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+        if num_workers is None:
+            num_workers = SANITY_CHECK_NUM_WORKERS
         
         self.print_to_log_file("\n" + "=" * 70)
         self.print_to_log_file("DATA SANITY CHECK: Checking for samples without tumor (label 2)")
         self.print_to_log_file("=" * 70)
+        self.print_to_log_file(f"  Checking {len(keys)} samples with {num_workers} parallel workers...")
         
         valid_keys = []
         excluded_keys = []
         samples_with_ignore_label = []
+        error_samples = []
         
         TUMOR_LABEL = 2
         
-        # Create a temporary dataset to load samples properly
-        # This handles both .npz and .b2nd formats correctly
-        dataset_class = infer_dataset_class(dataset_folder)
-        temp_dataset = dataset_class(
-            dataset_folder,
-            keys,
-            folder_with_segs_from_previous_stage=None
-        )
+        # Prepare arguments for parallel processing
+        # Each worker gets (key, dataset_folder, tumor_label)
+        process_args = [(key, dataset_folder, TUMOR_LABEL) for key in keys]
         
-        for key in tqdm(keys, desc="Checking samples for tumor"):
-            try:
-                # Use the dataset's load_case method to properly load the segmentation
-                data, seg, seg_prev, properties = temp_dataset.load_case(key)
-                
-                # seg shape is (1, D, H, W) or similar
-                seg_np = seg[0] if seg.ndim == 4 else seg
-                
-                # Check for ignore label (-1)
-                if np.any(seg_np < 0):
-                    n_ignore = np.sum(seg_np < 0)
-                    samples_with_ignore_label.append((key, n_ignore))
-                
-                # Check if tumor (label 2) exists
-                has_tumor = np.any(seg_np == TUMOR_LABEL)
-                
-                if has_tumor:
-                    valid_keys.append(key)
-                else:
-                    excluded_keys.append(key)
-                    
-            except Exception as e:
-                self.print_to_log_file(f"  WARNING: Error checking {key}: {e}, excluding")
+        # Run parallel sanity check
+        try:
+            with Pool(processes=num_workers) as pool:
+                # Use imap for progress bar support
+                results = list(tqdm(
+                    pool.imap(_check_single_sample_for_tumor, process_args),
+                    total=len(keys),
+                    desc="Checking samples for tumor"
+                ))
+        except Exception as e:
+            self.print_to_log_file(f"  WARNING: Multiprocessing failed ({e}), falling back to sequential...")
+            # Fallback to sequential processing
+            results = []
+            for args in tqdm(process_args, desc="Checking samples for tumor (sequential)"):
+                results.append(_check_single_sample_for_tumor(args))
+        
+        # Process results
+        for key, has_tumor, has_ignore, n_ignore, error_msg in results:
+            if error_msg is not None:
+                self.print_to_log_file(f"  WARNING: Error checking {key}: {error_msg}, excluding")
                 excluded_keys.append(key)
+                error_samples.append((key, error_msg))
+            elif has_tumor:
+                valid_keys.append(key)
+            else:
+                excluded_keys.append(key)
+            
+            if has_ignore:
+                samples_with_ignore_label.append((key, n_ignore))
         
         # Log results
         self.print_to_log_file(f"\nResults:")
         self.print_to_log_file(f"  Total samples checked: {len(keys)}")
         self.print_to_log_file(f"  Samples WITH tumor (label 2): {len(valid_keys)} ✓")
         self.print_to_log_file(f"  Samples WITHOUT tumor (label 2): {len(excluded_keys)} ✗")
+        if error_samples:
+            self.print_to_log_file(f"  Samples with errors: {len(error_samples)}")
         
         if excluded_keys:
             self.print_to_log_file(f"\n*** EXCLUDED SAMPLES (no tumor label 2): ***")
@@ -1775,8 +2815,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         The tuning keys are stored in self.tuning_keys.
         Returns (train_keys, test_keys) - tuning is handled separately.
         """
-        import os
-        
         # =====================================================================
         # STEP 1: Get original 2-way split from parent
         # =====================================================================
@@ -2004,9 +3042,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         Override to use 3-way centering DataLoaders for training and test.
         Also creates the tuning dataloader.
         """
-        from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
-        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
-        
         if self.dataset_class is None:
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
         
@@ -2111,8 +3146,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         This doubles the effective evaluation samples for balanced metrics.
         """
-        from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
-        
         # Get validation transforms (no augmentation)
         deep_supervision_scales = self._get_deep_supervision_scales()
         val_transforms = self.get_validation_transforms(
@@ -2154,9 +3187,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         _ = next(self.tuning_dataloader)
         
         # Log the actual evaluation mode (DataLoader is created for both modes, but may not be used)
-        if self.eval_mode == 'sliding_window':
-            self.print_to_log_file(f"Created tuning dataloader (for dual-crop fallback)")
-            self.print_to_log_file(f"  → Actual eval mode: SLIDING WINDOW within GT anatomy bbox")
+        if self.tuning_eval_mode == 'dual_crop':
+            self.print_to_log_file(f"Created tuning dataloader (for dual-crop evaluation)")
+            self.print_to_log_file(f"  → Tuning eval: DUAL_CROP (1 anatomy + 1 tumor patch per sample)")
         else:
             self.print_to_log_file(f"Created tuning dataloader with dual-crop eval (anatomy + tumor per sample)")
     
@@ -2244,9 +3277,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
     def _classify_boxes_by_foreground(self,
                                        segmentation: np.ndarray,
                                        box_slicers: List[Tuple[slice, ...]],
-                                       foreground_labels: List[int] = [1, 2]) -> List[int]:
+                                       foreground_labels: List[int] = [1, 2]) -> Dict:
         """
-        Classify which boxes contain ANY foreground voxels.
+        Classify which boxes contain foreground voxels, distinguishing tumor from anatomy-only.
         
         Args:
             segmentation: Ground truth segmentation array (D, H, W), no channel dim
@@ -2254,25 +3287,35 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             foreground_labels: Labels to consider as foreground (default: anatomy=1, tumor=2)
             
         Returns:
-            List of indices of boxes that contain at least one foreground voxel
+            Dict with:
+                'foreground_indices': List of all box indices with any foreground
+                'tumor_indices': List of box indices that contain tumor (label 2)
+                'anatomy_only_indices': List of box indices with anatomy but no tumor
         """
-        foreground_indices = []
+        tumor_indices = []
+        anatomy_only_indices = []
         
         for idx, sl in enumerate(box_slicers):
             # Extract the box region from segmentation
             box_seg = segmentation[sl]
             
-            # Check if any foreground label exists in this box
-            has_foreground = False
-            for label in foreground_labels:
-                if np.any(box_seg == label):
-                    has_foreground = True
-                    break
+            # Check for tumor first (higher priority)
+            has_tumor = np.any(box_seg == 2)
+            has_anatomy = np.any(box_seg == 1)
             
-            if has_foreground:
-                foreground_indices.append(idx)
+            if has_tumor:
+                tumor_indices.append(idx)
+            elif has_anatomy:
+                anatomy_only_indices.append(idx)
         
-        return foreground_indices
+        # Combined list for backward compatibility
+        foreground_indices = tumor_indices + anatomy_only_indices
+        
+        return {
+            'foreground_indices': foreground_indices,
+            'tumor_indices': tumor_indices,
+            'anatomy_only_indices': anatomy_only_indices,
+        }
     
     def _get_cached_foreground_boxes(self,
                                       segmentation: np.ndarray,
@@ -2285,9 +3328,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         {
             'volume_shape': Tuple[int, ...],
             'box_slicers': List[Tuple[slice, ...]],  # ALL box positions
-            'foreground_indices': List[int],  # Indices of boxes with foreground
+            'foreground_indices': List[int],  # Indices of boxes with any foreground
+            'tumor_indices': List[int],  # Indices of boxes with tumor (label 2)
+            'anatomy_only_indices': List[int],  # Indices of boxes with anatomy but no tumor
             'n_total_boxes': int,
             'n_foreground_boxes': int,
+            'n_tumor_boxes': int,
+            'n_anatomy_only_boxes': int,
         }
         
         Args:
@@ -2311,8 +3358,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         box_slicers = self._compute_all_sliding_window_boxes(volume_shape, patch_size, step_size)
         
-        # Classify boxes
-        foreground_indices = self._classify_boxes_by_foreground(
+        # Classify boxes (now returns dict with tumor/anatomy breakdown)
+        classification = self._classify_boxes_by_foreground(
             segmentation, box_slicers, foreground_labels=[1, 2]
         )
         
@@ -2320,9 +3367,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         cache_entry = {
             'volume_shape': volume_shape,
             'box_slicers': box_slicers,
-            'foreground_indices': foreground_indices,
+            'foreground_indices': classification['foreground_indices'],
+            'tumor_indices': classification['tumor_indices'],
+            'anatomy_only_indices': classification['anatomy_only_indices'],
             'n_total_boxes': len(box_slicers),
-            'n_foreground_boxes': len(foreground_indices),
+            'n_foreground_boxes': len(classification['foreground_indices']),
+            'n_tumor_boxes': len(classification['tumor_indices']),
+            'n_anatomy_only_boxes': len(classification['anatomy_only_indices']),
         }
         
         # Store in cache
@@ -2371,6 +3422,11 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Move data to device
         data = data.to(self.device)
         
+        # Disable torch.compile/dynamo for inference to avoid shape mismatch issues
+        # with dynamic patch sizes in residual connections
+        # Note: We use suppress_errors so dynamo falls back to eager mode
+        _dynamo.config.suppress_errors = True
+        
         # Process ONLY foreground boxes
         for box_idx in foreground_indices:
             sl = box_slicers[box_idx]
@@ -2378,7 +3434,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # Extract patch: sl is for spatial dims, need to add channel dim
             patch = data[(slice(None),) + sl][None]  # Add batch dim
             
-            # Forward pass
+            # Forward pass (dynamo errors suppressed, will fall back to eager)
             pred = self.network(patch)[0]  # Remove batch dim
             
             if self.enable_deep_supervision:
@@ -2558,6 +3614,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
     
     def compute_metrics_sliding_window(self, dataset, keys: List[str], 
                                         num_samples: int = None,
+                                        max_patches_per_sample: int = None,
                                         progress_desc: str = "Sliding Window Eval") -> dict:
         """
         Compute metrics using FULL-VOLUME sliding window inference with box filtering.
@@ -2579,6 +3636,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             dataset: nnUNet dataset with preprocessed data
             keys: List of case keys to evaluate
             num_samples: Max number of samples (None = all)
+            max_patches_per_sample: Max patches to process per sample (None = all).
+                If set, uses priority sampling: tumor boxes first, then anatomy-only.
+                Useful for faster tuning set evaluation.
             progress_desc: Description for progress bar
             
         Returns:
@@ -2622,9 +3682,50 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     )
                     
                     box_slicers = box_info['box_slicers']
-                    foreground_indices = box_info['foreground_indices']
                     n_total = box_info['n_total_boxes']
-                    n_foreground = box_info['n_foreground_boxes']
+                    
+                    # =====================================================================
+                    # PRIORITY SAMPLING: Limit patches per sample if max_patches_per_sample is set
+                    # Priority: tumor boxes first, then anatomy-only boxes
+                    # =====================================================================
+                    if max_patches_per_sample is not None and max_patches_per_sample > 0:
+                        tumor_indices = box_info['tumor_indices']
+                        anatomy_only_indices = box_info['anatomy_only_indices']
+                        
+                        # Sample with priority: tumor first, then anatomy-only
+                        selected_indices = []
+                        
+                        # First, add tumor boxes (randomly shuffled if more than limit)
+                        if len(tumor_indices) > 0:
+                            if len(tumor_indices) <= max_patches_per_sample:
+                                selected_indices.extend(tumor_indices)
+                            else:
+                                # Randomly sample tumor boxes
+                                rng = np.random.default_rng(seed=42)  # Deterministic for reproducibility
+                                selected_indices.extend(
+                                    rng.choice(tumor_indices, size=max_patches_per_sample, replace=False).tolist()
+                                )
+                        
+                        # Then, fill remaining slots with anatomy-only boxes
+                        remaining_slots = max_patches_per_sample - len(selected_indices)
+                        if remaining_slots > 0 and len(anatomy_only_indices) > 0:
+                            if len(anatomy_only_indices) <= remaining_slots:
+                                selected_indices.extend(anatomy_only_indices)
+                            else:
+                                # Randomly sample anatomy-only boxes
+                                rng = np.random.default_rng(seed=42)
+                                selected_indices.extend(
+                                    rng.choice(anatomy_only_indices, size=remaining_slots, replace=False).tolist()
+                                )
+                        
+                        foreground_indices = selected_indices
+                        n_foreground = len(foreground_indices)
+                        n_sampled_from = box_info['n_foreground_boxes']
+                    else:
+                        foreground_indices = box_info['foreground_indices']
+                        n_foreground = box_info['n_foreground_boxes']
+                        n_sampled_from = n_foreground
+                    # =====================================================================
                     
                     # Update statistics
                     total_boxes_processed += n_foreground
@@ -2635,7 +3736,17 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                         self.print_to_log_file(f"  [Debug] First sample: {key}")
                         self.print_to_log_file(f"    Volume shape: {volume_shape}")
                         self.print_to_log_file(f"    Patch size: {patch_size}")
-                        self.print_to_log_file(f"    Total boxes: {n_total}, Foreground boxes: {n_foreground} ({100*n_foreground/n_total:.1f}%)")
+                        self.print_to_log_file(f"    Total boxes: {n_total}, Tumor boxes: {box_info['n_tumor_boxes']}, "
+                                               f"Anatomy-only: {box_info['n_anatomy_only_boxes']}")
+                        if max_patches_per_sample is not None:
+                            self.print_to_log_file(f"    Priority sampling: {n_foreground}/{n_sampled_from} boxes "
+                                                   f"(max={max_patches_per_sample})")
+                            if max_patches_per_sample <= 10:
+                                self.print_to_log_file(f"    → Using FAST per-patch path (no full-volume tensors)")
+                            else:
+                                self.print_to_log_file(f"    → Using full-volume path")
+                        else:
+                            self.print_to_log_file(f"    Processing all {n_foreground} foreground boxes (full-volume path)")
                         self.print_to_log_file(f"    Seg unique values: {np.unique(seg_np)}")
                         first_sample_logged = True
                     
@@ -2649,30 +3760,109 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                         self.print_to_log_file(f"  Warning: No foreground boxes for {key}, skipping")
                         continue
                     
-                    # Convert to tensor (FULL volume)
-                    # Use np.asarray() to handle NDArray/memmap types from dataset.load_case()
-                    data_tensor = torch.from_numpy(np.asarray(data)).float()
-                    # Keep seg_tensor on CPU - metrics will be computed on CPU
-                    seg_tensor = torch.from_numpy(np.asarray(seg)).long()
-                    
-                    # Run selective sliding window inference (on GPU)
-                    # Only processes foreground boxes, returns valid_mask for metric computation
-                    predicted_logits, valid_mask = self._sliding_window_inference_selective(
-                        data_tensor, box_slicers, foreground_indices, use_gaussian=True
-                    )
-                    
-                    # Move predictions to CPU for metric computation (saves GPU memory)
-                    predicted_logits = predicted_logits.cpu()
-                    valid_mask = valid_mask.cpu()
-                    
-                    # Compute metrics on CPU - more memory efficient for large volumes
-                    # valid_mask excludes pure-background regions from metric computation
-                    metrics = self._compute_metrics_from_prediction(
-                        predicted_logits, seg_tensor, valid_mask=valid_mask,
-                        loss_fn=None, simulate_perfect_anatomy=self.simulate_perfect_anatomy,
-                        compute_on_cpu=True  # Force CPU computation to avoid GPU OOM
-                    )
-                    all_outputs.append(metrics)
+                    # =====================================================================
+                    # OPTIMIZED PATH: Per-patch metrics (fast for tuning with limited patches)
+                    # Instead of creating full-volume tensors, compute metrics per-patch
+                    # and aggregate. MUCH faster when max_patches_per_sample is small.
+                    # =====================================================================
+                    if max_patches_per_sample is not None and max_patches_per_sample <= 10:
+                        # FAST PATH: Per-patch inference and metrics
+                        # Avoid full-volume tensor allocation
+                        patch_size = self.configuration_manager.patch_size
+                        num_classes = self.label_manager.num_segmentation_heads
+                        
+                        # Convert data to tensor but DON'T move to GPU yet
+                        data_np = np.asarray(data)
+                        seg_np_full = np.asarray(seg)
+                        if seg_np_full.ndim == 4:
+                            seg_np_full = seg_np_full[0]
+                        
+                        # Aggregate TP/FP/FN/TN across patches
+                        tp_sum = np.zeros(num_classes - 1)  # Exclude background
+                        fp_sum = np.zeros(num_classes - 1)
+                        fn_sum = np.zeros(num_classes - 1)
+                        tn_sum = np.zeros(num_classes - 1)
+                        
+                        # Suppress dynamo errors to avoid shape mismatch in residuals
+                        _dynamo.config.suppress_errors = True
+                        
+                        for box_idx in foreground_indices:
+                            sl = box_slicers[box_idx]
+                            
+                            # Extract patch (data has channel dim, seg doesn't)
+                            patch_data = data_np[(slice(None),) + sl]  # (C, D, H, W)
+                            patch_seg = seg_np_full[sl]  # (D, H, W)
+                            
+                            # Convert to tensor and move to GPU
+                            patch_tensor = torch.from_numpy(patch_data).float().to(self.device)[None]  # Add batch
+                            
+                            # Forward pass (dynamo errors suppressed, will fall back to eager)
+                            pred = self.network(patch_tensor)[0]  # Remove batch
+                            if self.enable_deep_supervision:
+                                pred = pred[0]
+                            
+                            # Get segmentation (argmax)
+                            pred_seg = pred.argmax(0).cpu().numpy()  # (D, H, W)
+                            
+                            # Handle ignore label (-1) in patch_seg
+                            valid_mask_patch = patch_seg >= 0
+                            patch_seg_clean = np.where(patch_seg < 0, 0, patch_seg)
+                            
+                            # Simulate perfect anatomy if enabled
+                            if self.simulate_perfect_anatomy:
+                                gt_is_background = (patch_seg_clean == 0)
+                                pred_seg = np.where(gt_is_background, 0, pred_seg)
+                            
+                            # Compute per-class TP/FP/FN/TN (skip background class 0)
+                            for c in range(1, num_classes):
+                                pred_c = (pred_seg == c) & valid_mask_patch
+                                gt_c = (patch_seg_clean == c) & valid_mask_patch
+                                
+                                tp_sum[c-1] += np.sum(pred_c & gt_c)
+                                fp_sum[c-1] += np.sum(pred_c & ~gt_c)
+                                fn_sum[c-1] += np.sum(~pred_c & gt_c)
+                                tn_sum[c-1] += np.sum(~pred_c & ~gt_c & valid_mask_patch)
+                        
+                        metrics = {
+                            'tp_hard': tp_sum,
+                            'fp_hard': fp_sum,
+                            'fn_hard': fn_sum,
+                            'tn_hard': tn_sum,
+                            'loss': 0.0
+                        }
+                        all_outputs.append(metrics)
+                        
+                        # Clear GPU cache
+                        torch.cuda.empty_cache()
+                        
+                    else:
+                        # =====================================================================
+                        # FULL-VOLUME PATH: Used for test set (complete evaluation)
+                        # =====================================================================
+                        # Convert to tensor (FULL volume)
+                        # Use np.asarray() to handle NDArray/memmap types from dataset.load_case()
+                        data_tensor = torch.from_numpy(np.asarray(data)).float()
+                        # Keep seg_tensor on CPU - metrics will be computed on CPU
+                        seg_tensor = torch.from_numpy(np.asarray(seg)).long()
+                        
+                        # Run selective sliding window inference (on GPU)
+                        # Only processes foreground boxes, returns valid_mask for metric computation
+                        predicted_logits, valid_mask = self._sliding_window_inference_selective(
+                            data_tensor, box_slicers, foreground_indices, use_gaussian=True
+                        )
+                        
+                        # Move predictions to CPU for metric computation (saves GPU memory)
+                        predicted_logits = predicted_logits.cpu()
+                        valid_mask = valid_mask.cpu()
+                        
+                        # Compute metrics on CPU - more memory efficient for large volumes
+                        # valid_mask excludes pure-background regions from metric computation
+                        metrics = self._compute_metrics_from_prediction(
+                            predicted_logits, seg_tensor, valid_mask=valid_mask,
+                            loss_fn=None, simulate_perfect_anatomy=self.simulate_perfect_anatomy,
+                            compute_on_cpu=True  # Force CPU computation to avoid GPU OOM
+                        )
+                        all_outputs.append(metrics)
                     
                     # Clear GPU cache after each sample to prevent memory fragmentation
                     torch.cuda.empty_cache()
@@ -2755,7 +3945,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         """
         Compute metrics on the tuning set.
         
-        Uses either sliding_window or dual_crop mode based on self.eval_mode.
+        Uses either sliding_window or dual_crop mode based on self.tuning_eval_mode.
         
         Returns:
             Dictionary with per-class metrics:
@@ -2768,16 +3958,18 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             - 'f1_per_class': 2 * precision * recall / (precision + recall)
             - 'fpr_per_class': FP / (FP + TN) in percent (False Positive Rate)
         """
-        if self.eval_mode == 'sliding_window':
+        if self.tuning_eval_mode == 'sliding_window':
             # Use sliding window inference within GT anatomy bounding box
+            # Use max_patches_per_sample for faster evaluation (priority: tumor boxes first)
             return self.compute_metrics_sliding_window(
                 self.tuning_dataset, 
                 self.tuning_keys,
                 num_samples=None,  # Use all tuning samples
+                max_patches_per_sample=self.tuning_max_patches_per_sample,  # Limit for speed
                 progress_desc="Tuning SW Eval"
             )
         else:
-            # Use dual-crop evaluation (legacy)
+            # Use dual-crop evaluation (fast, default for tuning)
             return self._compute_tuning_metrics_dual_crop()
     
     def _compute_tuning_metrics_dual_crop(self) -> dict:
@@ -2795,7 +3987,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         tuning_outputs = []
         
         with torch.no_grad():
-            for _ in range(num_batches):
+            for _ in tqdm(range(num_batches), desc="Tuning Dual-Crop Eval", disable=self.local_rank != 0):
                 batch = next(self.tuning_dataloader)
                 output = self._tuning_step(batch)
                 tuning_outputs.append(output)
@@ -2863,9 +4055,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             target = target.to(self.device, non_blocking=True)
         
         # Forward pass
-        from torch.amp import autocast
-        from nnunetv2.utilities.helpers import dummy_context
-        
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             del data
@@ -3086,9 +4275,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         else:
             target = target.to(self.device, non_blocking=True)
 
-        from torch.amp import autocast
-        from nnunetv2.utilities.helpers import dummy_context
-
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             del data
@@ -3145,15 +4331,32 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         In sliding_window mode: Computes test metrics using sliding window inference
         In dual_crop mode: Uses the val_outputs from parent's validation loop
         
+        ASYNC MODE: When ASYNC_TEST_EVAL is enabled:
+        1. Check for completed results from previous async eval
+        2. Spawn new async eval for current epoch (runs in subprocess)
+        3. Use cached metrics for logging (async eval completes in background)
+        4. Checkpoint saving is handled by the async subprocess
+        
         If not an evaluation epoch, uses cached results from last evaluation.
         """
-        from torch import distributed as dist
-        
         # Check if this is an evaluation epoch
         is_eval_epoch = self._should_run_evaluation()
         
+        # =====================================================================
+        # ASYNC EVAL: Check for completed results from previous async eval
+        # This check happens EVERY epoch (not just eval epochs) to receive
+        # results as soon as they're available.
+        # =====================================================================
+        if ASYNC_TEST_EVAL and self._async_eval_process is not None:
+            result = self._check_async_eval_result()
+            if result:
+                self.print_to_log_file(f"\n[Async] *** Received results from epoch {result.get('epoch', '?')} evaluation ***")
+                self._handle_async_eval_result(result)
+        
+        # =====================================================================
+        # NOT AN EVALUATION EPOCH: Use cached results
+        # =====================================================================
         if not is_eval_epoch and self._last_eval_results is not None:
-            # Use cached results from last evaluation
             global_dc_per_class = self._last_eval_results['dice_per_class']
             recall_per_class = self._last_eval_results['recall_per_class']
             precision_per_class = self._last_eval_results['precision_per_class']
@@ -3161,22 +4364,53 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             fpr_per_class = self._last_eval_results['fpr_per_class']
             loss_here = self._last_eval_results['loss']
             self.print_to_log_file(f"  Using cached test metrics from epoch {self._last_eval_epoch}")
-        elif self.eval_mode == 'sliding_window':
-            # =====================================================================
-            # SLIDING WINDOW MODE: Use sliding window inference for test set
-            # =====================================================================
-            # Use the already-initialized test dataset via self._dl_val
-            # _dl_val is the nnUNetDataLoaderDualCropEval we created in get_dataloaders()
             
-            # Get test keys from the dataloader's dataset
+        # =====================================================================
+        # ASYNC TEST EVAL: Spawn subprocess and use cached metrics
+        # =====================================================================
+        elif is_eval_epoch and ASYNC_TEST_EVAL and self.test_eval_mode == 'sliding_window':
+            test_keys = list(self._dl_val._data.identifiers)
+            
+            # Spawn async evaluation subprocess
+            self._spawn_async_test_eval(self.current_epoch, test_keys)
+            
+            # Use cached results for logging (async eval handles checkpoint saving)
+            if self._last_eval_results is not None:
+                global_dc_per_class = self._last_eval_results['dice_per_class']
+                recall_per_class = self._last_eval_results['recall_per_class']
+                precision_per_class = self._last_eval_results['precision_per_class']
+                f1_per_class = self._last_eval_results['f1_per_class']
+                fpr_per_class = self._last_eval_results['fpr_per_class']
+                loss_here = self._last_eval_results['loss']
+                self.print_to_log_file(f"  Test eval running in background. Using cached metrics from epoch {self._last_eval_epoch}")
+            else:
+                # No cached results yet (first eval epoch) - use placeholder
+                num_classes = len(self.label_manager.foreground_labels)
+                global_dc_per_class = [0.0] * num_classes
+                recall_per_class = [0.0] * num_classes
+                precision_per_class = [0.0] * num_classes
+                f1_per_class = [0.0] * num_classes
+                fpr_per_class = [0.0] * num_classes
+                loss_here = 0.0
+                self.print_to_log_file(f"  Test eval running in background. No cached metrics yet.")
+            
+            # Flag to skip checkpoint logic in on_epoch_end (async handles it)
+            self._async_eval_in_progress = True
+            
+        # =====================================================================
+        # SYNC SLIDING WINDOW MODE (async disabled)
+        # =====================================================================
+        elif self.test_eval_mode == 'sliding_window':
             test_keys = list(self._dl_val._data.identifiers)
             
             self.print_to_log_file(f"  Running sliding window evaluation on {len(test_keys)} test samples...")
+            self.print_to_log_file(f"  Max patches per sample: {self.test_max_patches_per_sample or 'ALL (full evaluation)'}")
             
             test_result = self.compute_metrics_sliding_window(
-                self._dl_val._data,  # The underlying dataset
+                self._dl_val._data,
                 test_keys,
-                num_samples=None,  # Use all test samples
+                num_samples=None,
+                max_patches_per_sample=self.test_max_patches_per_sample,
                 progress_desc="Test SW Eval"
             )
             
@@ -3187,7 +4421,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             fpr_per_class = test_result['fpr_per_class']
             loss_here = test_result['loss']
             
-            # Cache results for non-evaluation epochs
             self._last_eval_results = {
                 'dice_per_class': global_dc_per_class,
                 'recall_per_class': recall_per_class,
@@ -3197,10 +4430,12 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 'loss': loss_here,
             }
             self._last_eval_epoch = self.current_epoch
+            self._async_eval_in_progress = False
+            
+        # =====================================================================
+        # DUAL-CROP MODE
+        # =====================================================================
         else:
-            # =====================================================================
-            # DUAL-CROP MODE: Use the val_outputs from parent's validation loop
-            # =====================================================================
             outputs_collated = collate_outputs(val_outputs)
             tp = np.sum(outputs_collated['tp_hard'], 0)
             fp = np.sum(outputs_collated['fp_hard'], 0)
@@ -3232,17 +4467,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             else:
                 loss_here = np.mean(outputs_collated['loss'])
 
-            # Compute Dice per class: 2*TP / (2*TP + FP + FN)
             global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
             
-            # Compute additional metrics per class
             recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fn)]
             precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fp)]
             f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
                            for p, r in zip(precision_per_class, recall_per_class)]
             fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 for f, t in zip(fp, tn)]
             
-            # Cache results for non-evaluation epochs (dual_crop mode)
             if is_eval_epoch:
                 self._last_eval_results = {
                     'dice_per_class': global_dc_per_class,
@@ -3253,21 +4485,17 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     'loss': loss_here,
                 }
                 self._last_eval_epoch = self.current_epoch
+            self._async_eval_in_progress = False
         
         # =====================================================================
-        # Use TUMOR DICE ONLY for checkpoint selection (single-epoch, not EMA)
+        # Log metrics for on_epoch_end
         # =====================================================================
-        # global_dc_per_class: [anatomy_dice, tumor_dice, ...]
-        # Index 1 = tumor (label 2)
         tumor_dice = global_dc_per_class[1] if len(global_dc_per_class) > 1 else np.nanmean(global_dc_per_class)
         
-        # Log metrics every epoch (needed for on_epoch_end printing)
-        # Checkpoint saving is restricted to evaluation epochs in on_epoch_end
         self.logger.log('mean_fg_dice', tumor_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
         
-        # Store additional metrics for logging in on_epoch_end
         self._test_additional_metrics = {
             'recall_per_class': recall_per_class,
             'precision_per_class': precision_per_class,
@@ -3279,7 +4507,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         """
         Override to log additional metrics after the standard Pseudo dice line.
         """
-        from time import time
         
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
@@ -3313,8 +4540,19 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         # TOP-K CHECKPOINT HANDLING
         # Only run on evaluation epochs to avoid saving checkpoints with stale metrics
+        # ASYNC MODE: Skip if async eval is in progress (subprocess handles checkpoints)
         # =====================================================================
-        if self._should_run_evaluation():
+        async_in_progress = getattr(self, '_async_eval_in_progress', False)
+        
+        if async_in_progress:
+            # Async test eval is running - checkpoint saving is handled by subprocess
+            # Check if subprocess is still alive
+            if self._async_eval_process is not None and self._async_eval_process.is_alive():
+                self.print_to_log_file(f"  [Async] Test eval still running in background (epoch {self._async_eval_epoch})")
+            else:
+                self.print_to_log_file(f"  [Async] Test eval spawned for epoch {self._async_eval_epoch}")
+            self.print_to_log_file(f"  [Async] Checkpoint saving will be handled by subprocess")
+        elif self._should_run_evaluation():
             # Use single-epoch tumor dice for checkpoint ranking (NOT EMA)
             # mean_fg_dice is actually tumor_dice for this trainer (see on_validation_epoch_end)
             current_dice = self.logger.my_fantastic_logging['mean_fg_dice'][-1]
@@ -3363,7 +4601,6 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         """
         if self.local_rank == 0:
             if not self.disable_checkpointing:
-                from torch._dynamo import OptimizedModule
                 
                 if self.is_ddp:
                     mod = self.network.module
@@ -3416,12 +4653,16 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     'top_k_checkpoints': self.top_k_checkpoints,
                     'top_k_dices': self.top_k_dices,
                     '_best_dice': getattr(self, '_best_dice', None),
-                    # Evaluation mode
-                    'eval_mode': self.eval_mode,
+                    # Evaluation mode (separate for tuning vs test)
+                    'tuning_eval_mode': self.tuning_eval_mode,
+                    'test_eval_mode': self.test_eval_mode,
+                    'eval_mode': self.eval_mode,  # Legacy compatibility
                     'sliding_window_step_size': self.sliding_window_step_size,
                     'simulate_perfect_anatomy': self.simulate_perfect_anatomy,
-                    # Evaluation frequency
+                    # Evaluation frequency and speed
                     'eval_every_n_epochs': self.eval_every_n_epochs,
+                    'tuning_max_patches_per_sample': self.tuning_max_patches_per_sample,
+                    'test_max_patches_per_sample': self.test_max_patches_per_sample,
                     '_last_eval_results': self._last_eval_results,
                     '_last_eval_epoch': self._last_eval_epoch,
                 }
@@ -3506,19 +4747,23 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # Keep top_k_dices empty - it will be populated by scanning files in on_epoch_end
             self.top_k_dices = []
             
-            # Load evaluation mode
-            self.eval_mode = checkpoint.get('eval_mode', self.eval_mode)
+            # Load evaluation mode (separate for tuning vs test)
+            self.tuning_eval_mode = checkpoint.get('tuning_eval_mode', self.tuning_eval_mode)
+            self.test_eval_mode = checkpoint.get('test_eval_mode', self.test_eval_mode)
+            self.eval_mode = checkpoint.get('eval_mode', self.eval_mode)  # Legacy
             self.sliding_window_step_size = checkpoint.get('sliding_window_step_size', self.sliding_window_step_size)
             self.simulate_perfect_anatomy = checkpoint.get('simulate_perfect_anatomy', self.simulate_perfect_anatomy)
             
-            # Load evaluation frequency settings
+            # Load evaluation frequency and speed settings
             self.eval_every_n_epochs = checkpoint.get('eval_every_n_epochs', self.eval_every_n_epochs)
+            self.tuning_max_patches_per_sample = checkpoint.get('tuning_max_patches_per_sample', self.tuning_max_patches_per_sample)
+            self.test_max_patches_per_sample = checkpoint.get('test_max_patches_per_sample', self.test_max_patches_per_sample)
             self._last_eval_results = checkpoint.get('_last_eval_results', self._last_eval_results)
             self._last_eval_epoch = checkpoint.get('_last_eval_epoch', self._last_eval_epoch)
             
             self.print_to_log_file(f"Loaded tuning info: {len(self.tuning_keys)} tuning cases")
             self.print_to_log_file(f"Loaded centering probs - Train: ({self.train_prob_random:.2f}/{self.train_prob_anatomy:.2f}/{self.train_prob_tumor:.2f})")
-            self.print_to_log_file(f"Loaded eval mode: {self.eval_mode}")
+            self.print_to_log_file(f"Loaded eval modes: tuning={self.tuning_eval_mode}, test={self.test_eval_mode}")
             if self.pattern_original_samples:
                 self.print_to_log_file(f"Loaded original/synthetic handling: pattern='{self.pattern_original_samples}', "
                                        f"orig={self.n_original_total}, synth={self.n_synthetic_total}, removed={self.n_synthetic_removed}")
