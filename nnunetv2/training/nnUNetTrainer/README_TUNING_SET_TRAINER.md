@@ -196,36 +196,22 @@ test_eval_mode = 'sliding_window'  # Default for test set
 
 ### Async Mode (Default)
 
-```
-ASYNC_TEST_EVAL = True
-```
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Main Process                  │ Subprocess                  │
-├───────────────────────────────┼─────────────────────────────┤
-│ Epoch 0: Train                │                             │
-│ Epoch 0: Eval tuning (sync)   │                             │
-│ Epoch 0: Spawn test eval ─────┼──→ Load checkpoint          │
-│ Epoch 1: Train                │    Run sliding window       │
-│ Epoch 1: Use cached metrics   │    Save top-k checkpoints   │
-│ Epoch 2: Train                │    Write result JSON        │
-│ Epoch 2: Receive results ←────┼─── Complete                 │
-│ Epoch 2: Spawn new test eval  │                             │
-└───────────────────────────────┴─────────────────────────────┘
-```
+The trainer supports **multi-subprocess evaluation** where multiple test evaluations can run concurrently on separate GPUs.
 
 **Key Points**:
 - Training continues while test evaluation runs in background
-- Uses separate GPU (configurable via `--backup_gpu_id`)
-- Subprocess is daemon: auto-terminates if main process crashes
-- Only ONE subprocess at a time (waits if previous still running)
-- **Training completion**: `on_train_end()` waits for any running async eval to finish before exiting, ensuring no checkpoints are lost
+- Uses separate GPUs (configurable via `--backup_gpu_ids`, comma-separated)
+- Up to `MAX_CONCURRENT_SUBPROCESSES` (default: 3) can run in parallel
+- Subprocesses are daemon: auto-terminate if main process crashes
+- **Training completion**: `on_train_end()` waits for all running async evals to finish before exiting
+- **REQUIRED**: You must set `--backup_gpu_ids` to use async evaluation
+
+For detailed architecture and diagrams, see [MULTIPROCESS_EVALUATION_MECHANISM.md](./MULTIPROCESS_EVALUATION_MECHANISM.md).
 
 ### Sync Mode
 
 ```python
-ASYNC_TEST_EVAL = False  # Set in module-level config
+ASYNC_TEST_EVAL = False  # Set in tuning_set_trainer/constants.py
 ```
 
 Test evaluation runs in the main process, blocking training until complete.
@@ -254,22 +240,26 @@ When a new checkpoint qualifies:
 
 ## Configuration Options
 
-### Module-Level Constants (Top of File)
+### Module-Level Constants (in `tuning_set_trainer/constants.py`)
 
-These constants control trainer behavior and can be modified directly in the source file:
+These constants control trainer behavior and can be modified in the constants file:
 
 ```python
 # Pre-training evaluation (debugging)
-ENABLE_PRE_TRAINING_EVAL = False           # Test set pre-training eval
+ENABLE_PRE_TRAINING_EVAL = True            # Test set pre-training eval
 ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET = True  # Tuning set pre-training eval
+PRE_TRAINING_EVAL_MAX_SAMPLES = 5          # Limit samples for sanity check
 
 # Async test evaluation
-ASYNC_TEST_EVAL = True          # Enable async subprocess
-ASYNC_EVAL_GPU_ID = None        # GPU for subprocess (None = same as main)
-ASYNC_EVAL_TIMEOUT = 3600       # Timeout in seconds (1 hour)
+ASYNC_TEST_EVAL = True                     # Enable async subprocess
+MAX_CONCURRENT_SUBPROCESSES = 3            # Max parallel subprocesses
+SUBPROCESS_TIMEOUT_HOURS = 4.0             # Hard timeout per subprocess
+
+# Error handling
+ASYNC_EVAL_EXIT_ON_FAILURE = False         # Continue on subprocess failure
 
 # Sanity check parallelization
-SANITY_CHECK_NUM_WORKERS = 16   # Workers for tumor presence check
+SANITY_CHECK_NUM_WORKERS = 16              # Workers for tumor presence check
 ```
 
 ### Instance-Level Defaults (in `__init__`)
@@ -300,7 +290,7 @@ self.max_synthetic_ratio = 0.5           # Default 50% cap
 nnUNetv2_train DATASET CONFIG FOLD \
     -tr nnUNetTrainer_WithTuningSet \
     --main_gpu_id 0 \              # GPU for main training process
-    --backup_gpu_id 1 \            # GPU for async test evaluation subprocess
+    --backup_gpu_ids "1,2" \       # GPUs for async test evaluation (comma-separated, REQUIRED)
     --pattern_original_samples "liver_\\d+" \  # Regex to identify original samples
     --ignore_synthetic \           # Exclude synthetic data (sets max_synthetic_ratio=0)
     --ignore_existing_best \       # Reset checkpoint ranking
@@ -308,7 +298,9 @@ nnUNetv2_train DATASET CONFIG FOLD \
     --integration_test             # Run quick verification with minimal samples
 ```
 
-**Note on `--pattern_original_samples`**: Must be a valid Python regex. Invalid patterns will raise a helpful error message with the specific regex syntax issue.
+**Important Notes**:
+- `--backup_gpu_ids` is **REQUIRED** when using async evaluation (the default). Without it, training will raise an error.
+- `--pattern_original_samples` must be a valid Python regex. Invalid patterns will raise a helpful error message.
 
 ---
 
@@ -317,19 +309,21 @@ nnUNetv2_train DATASET CONFIG FOLD \
 ### Basic Training
 
 ```bash
+# Note: --backup_gpu_ids is REQUIRED when ASYNC_TEST_EVAL=True (default)
 nnUNetv2_train 602 3d_fullres 0 \
     -tr nnUNetTrainer_WithTuningSet \
-    -p nnUNetResEncUNetLPlans
+    -p nnUNetResEncUNetLPlans \
+    --backup_gpu_ids "1"
 ```
 
-### With GPU Assignment (Recommended for Async Eval)
+### With GPU Assignment (Required for Async Eval)
 
 ```bash
 nnUNetv2_train 602 3d_fullres 0 \
     -tr nnUNetTrainer_WithTuningSet \
     -p nnUNetResEncUNetLPlans \
     --main_gpu_id 0 \
-    --backup_gpu_id 1
+    --backup_gpu_ids "1,2"
 ```
 
 ### With Synthetic Data Filtering
@@ -433,12 +427,13 @@ nnUNetv2_train 602 3d_fullres 0 \
 - Metrics are computed on CPU by default
 - Reduce `sliding_window_step_size` for fewer boxes
 - Use `tuning_max_patches_per_sample = 5` (default) to limit tuning patches
-- Ensure `--backup_gpu_id` is different from `--main_gpu_id` to avoid competition
+- Ensure `--backup_gpu_ids` contains GPUs different from `--main_gpu_id`
 
-### Subprocess Not Starting
+### Subprocess Not Starting or "backup_gpu_ids not set" Error
 
-- Check `--backup_gpu_id` is available and not same as main GPU
-- Verify `ASYNC_TEST_EVAL = True` in module constants
+- You **MUST** set `--backup_gpu_ids` when using async evaluation (default)
+- Example: `--backup_gpu_ids "1,2"` (comma-separated GPU IDs)
+- Verify `ASYNC_TEST_EVAL = True` in `tuning_set_trainer/constants.py`
 - Check for orphaned temp files in output folder (auto-cleaned on startup)
 
 ### Training Appears Stuck

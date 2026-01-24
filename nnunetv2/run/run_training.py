@@ -299,13 +299,13 @@ def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool
         else:
             # Try new naming convention first, then fall back to old naming
             checkpoint_candidates = [
-                join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
-                join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_latest')),
                 join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
+                join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_latest')),
+                join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
                 # Fallback to old naming convention
-                join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
-                join(nnunet_trainer.output_folder, 'checkpoint_latest.pth'),
                 join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
+                join(nnunet_trainer.output_folder, 'checkpoint_latest.pth'),
+                join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
             ]
             expected_checkpoint_file = None
             for candidate in checkpoint_candidates:
@@ -319,13 +319,13 @@ def maybe_load_checkpoint(nnunet_trainer: nnUNetTrainer, continue_training: bool
     elif validation_only:
         # Try new naming convention first, then fall back to old naming
         checkpoint_candidates = [
-            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
             join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_best')),
             join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_latest')),
+            join(nnunet_trainer.output_folder, nnunet_trainer.get_checkpoint_filename('checkpoint_final')),
             # Fallback to old naming convention
-            join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
             join(nnunet_trainer.output_folder, 'checkpoint_best.pth'),
             join(nnunet_trainer.output_folder, 'checkpoint_latest.pth'),
+            join(nnunet_trainer.output_folder, 'checkpoint_final.pth'),
         ]
         expected_checkpoint_file = None
         for candidate in checkpoint_candidates:
@@ -361,7 +361,7 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
             checkpoint_path=None, skip_manual_confirm=False, pattern_original_samples=None,
             ignore_existing_best=False, skip_val=False, ignore_synthetic=False,
-            main_gpu_id=None, backup_gpu_id=None, integration_test=False):
+            main_gpu_id=None, backup_gpu_ids=None, integration_test=False):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -380,9 +380,17 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
     if ignore_synthetic and hasattr(nnunet_trainer, 'max_synthetic_ratio'):
         nnunet_trainer.max_synthetic_ratio = 0.0
     
-    # Set backup GPU for async test evaluation (used by nnUNetTrainer_WithTuningSet)
-    if hasattr(nnunet_trainer, 'backup_gpu_id'):
-        nnunet_trainer.backup_gpu_id = backup_gpu_id
+    # Set backup GPUs for async test evaluation (used by nnUNetTrainer_WithTuningSet)
+    if hasattr(nnunet_trainer, 'backup_gpu_ids') and backup_gpu_ids is not None:
+        gpu_list = [int(x.strip()) for x in backup_gpu_ids.split(',') if x.strip()]
+        if len(gpu_list) == 0:
+            raise ValueError("--backup_gpu_ids cannot be empty in DDP mode")
+        if len(gpu_list) > 3:
+            gpu_list = gpu_list[:3]
+        nnunet_trainer.backup_gpu_ids = gpu_list
+        # Update max concurrent subprocesses based on available GPUs
+        if hasattr(nnunet_trainer, '_max_concurrent_subprocesses'):
+            nnunet_trainer._max_concurrent_subprocesses = len(gpu_list)
     
     # Set integration test mode (used by nnUNetTrainer_WithTuningSet)
     # Must call _setup_integration_test_mode() to modify output folder BEFORE confirmation
@@ -468,7 +476,7 @@ def run_training(
     ignore_existing_best: bool = False,              # args.ignore_existing_best
     ignore_synthetic: bool = False,                  # args.ignore_synthetic
     main_gpu_id: Optional[int] = None,               # args.main_gpu_id
-    backup_gpu_id: Optional[int] = None,             # args.backup_gpu_id
+    backup_gpu_ids: Optional[str] = None,            # args.backup_gpu_ids (comma-separated)
     integration_test: bool = False                   # args.integration_test
 ):
     if plans_identifier == 'nnUNetPlans':
@@ -520,7 +528,7 @@ def run_training(
                      skip_val,
                      ignore_synthetic,
                      main_gpu_id,
-                     backup_gpu_id,
+                     backup_gpu_ids,
                      integration_test),
                  nprocs=num_gpus,
                  join=True)
@@ -548,11 +556,21 @@ def run_training(
         if ignore_synthetic and hasattr(nnunet_trainer, 'max_synthetic_ratio'):
             nnunet_trainer.max_synthetic_ratio = 0.0
         
-        # Set backup GPU for async test evaluation (used by nnUNetTrainer_WithTuningSet)
-        if hasattr(nnunet_trainer, 'backup_gpu_id'):
-            nnunet_trainer.backup_gpu_id = backup_gpu_id
-            if backup_gpu_id is not None:
-                print(f"*** Set backup GPU ID={backup_gpu_id} for async test evaluation")
+        # Set backup GPUs for async test evaluation (used by nnUNetTrainer_WithTuningSet)
+        if hasattr(nnunet_trainer, 'backup_gpu_ids'):
+            if backup_gpu_ids is not None:
+                # Parse comma-separated GPU IDs
+                gpu_list = [int(x.strip()) for x in backup_gpu_ids.split(',') if x.strip()]
+                if len(gpu_list) == 0:
+                    raise ValueError("--backup_gpu_ids cannot be empty. Provide at least one GPU ID.")
+                if len(gpu_list) > 3:
+                    print(f"*** WARNING: More than 3 backup GPUs specified. Using only first 3: {gpu_list[:3]}")
+                    gpu_list = gpu_list[:3]
+                nnunet_trainer.backup_gpu_ids = gpu_list
+                # Update max concurrent subprocesses based on available GPUs
+                if hasattr(nnunet_trainer, '_max_concurrent_subprocesses'):
+                    nnunet_trainer._max_concurrent_subprocesses = len(gpu_list)
+                print(f"*** Set backup GPU IDs={gpu_list} for async test evaluation (max {len(gpu_list)} concurrent subprocesses)")
         
         # Set integration test mode (used by nnUNetTrainer_WithTuningSet)
         # Must call _setup_integration_test_mode() to modify output folder BEFORE confirmation
@@ -682,8 +700,9 @@ def run_training_entry():
     parser.add_argument('--main_gpu_id', type=int, required=False, default=None,
                         help='[OPTIONAL] GPU ID for main training process. Sets CUDA_VISIBLE_DEVICES before training. '
                              'If not specified, uses current CUDA_VISIBLE_DEVICES setting.')
-    parser.add_argument('--backup_gpu_id', type=int, required=False, default=None,
-                        help='[OPTIONAL] GPU ID for async test evaluation subprocess. '
+    parser.add_argument('--backup_gpu_ids', type=str, required=False, default=None,
+                        help='[OPTIONAL] Comma-separated GPU IDs for async test evaluation subprocesses (e.g., "0,1,2"). '
+                             'Up to 3 concurrent subprocesses can run on these GPUs. '
                              'Only used by nnUNetTrainer_WithTuningSet with async evaluation. '
                              'If not specified, uses same GPU as main training (may cause OOM).')
     parser.add_argument('--integration_test', action='store_true', required=False,
@@ -713,7 +732,7 @@ def run_training_entry():
                  ignore_existing_best=args.ignore_existing_best,
                  ignore_synthetic=args.ignore_synthetic,
                  main_gpu_id=args.main_gpu_id,
-                 backup_gpu_id=args.backup_gpu_id,
+                 backup_gpu_ids=args.backup_gpu_ids,
                  integration_test=args.integration_test)
 
 

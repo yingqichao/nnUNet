@@ -2,9 +2,13 @@
 
 Analysis performed by Cursor AI on the following files:
 - `nnUNetTrainer_with_tuning_set.py`
+- `tuning_set_trainer/` (constants, multiprocess_eval, etc.)
 - `run_training.py`
 - `README_TUNING_SET_TRAINER.md`
+- `MULTIPROCESS_EVALUATION_MECHANISM.md`
 - `continue_training_with_ckpt.sh`
+
+**Last Updated**: January 2026 (after refactoring into modules)
 
 ---
 
@@ -217,6 +221,62 @@ if len(valid_keys) == 0:
 
 ---
 
+## 9. Refactoring-Related Issues (January 2026)
+
+### 9.1 Pending Eval Checkpoints Never Processed ✅ FIXED
+
+**Original Issue**: `_pending_eval_checkpoints` queue was initialized and items added when subprocess slots were full, but the queue was never consumed.
+
+**Resolution**: Added `_process_pending_eval_checkpoints()` method that:
+- Spawns queued evaluations when slots become available
+- Called after processing completed results in `on_validation_epoch_end()`
+- Also processed in `on_train_end()` before waiting for running subprocesses
+- Cleans up any remaining pending checkpoints that couldn't be processed
+
+### 9.2 Documentation: `--backup_gpu_id` vs `--backup_gpu_ids` ✅ DOC FIXED
+
+**Original Issue**: Code now uses `--backup_gpu_ids` (plural, comma-separated) but README used singular `--backup_gpu_id`.
+
+**Resolution**: Updated all documentation to use `--backup_gpu_ids`.
+
+### 9.3 Documentation: Single vs Multi-Subprocess ✅ DOC FIXED
+
+**Original Issue**: README said "only ONE subprocess" but code supports up to 3 concurrent subprocesses.
+
+**Resolution**: Updated README to reflect multi-subprocess capability and reference `MULTIPROCESS_EVALUATION_MECHANISM.md` for details.
+
+### 9.4 Constants Location Mismatch ✅ DOC FIXED
+
+**Original Issue**: README said constants are "at top of file" but they're now in `tuning_set_trainer/constants.py`.
+
+**Resolution**: Updated documentation to point to correct location.
+
+### 9.5 `SANITY_CHECK_NUM_WORKERS` Location ✅ FIXED
+
+**Original Issue**: Constant was defined in `multiprocess_eval.py` instead of `constants.py`.
+
+**Resolution**: Moved to `constants.py` for consistency with other constants.
+
+### 9.6 Legacy `backup_gpu_id` Attribute ✅ FIXED
+
+**Original Issue**: Trainer had both `backup_gpu_id` (legacy) and `backup_gpu_ids` (new) but no conversion logic.
+
+**Resolution**: Removed legacy `backup_gpu_id` attribute.
+
+### 9.7 No Validation for `backup_gpu_ids` ✅ FIXED
+
+**Original Issue**: Async evaluation could run on same GPU as training if `--backup_gpu_ids` not set, causing OOM.
+
+**Resolution**: Added validation in `_spawn_async_test_eval()` that raises `RuntimeError` if `backup_gpu_ids` is empty.
+
+### 9.8 Type Hints in `multiprocess_eval.py` ✅ FIXED
+
+**Original Issue**: Type hints were commented out with "to avoid import issues" but this was unnecessary.
+
+**Resolution**: Added proper type hints: `List[str]`, `List[Tuple[float, int]]`, `Optional[int]`.
+
+---
+
 ## Summary Table
 
 | ID | Issue | Status | Priority | Impact |
@@ -236,13 +296,21 @@ if len(valid_keys) == 0:
 | 7.1 | Cache key missing patch size | ⚠️ OPEN | Low | Low |
 | 8.1 | Regex pattern validation | ✅ FIXED | - | - |
 | 8.2 | All samples excluded warning | ⚠️ OPEN | Medium | Medium |
+| 9.1 | Pending eval checkpoints queue | ✅ FIXED | - | - |
+| 9.2 | --backup_gpu_id vs --backup_gpu_ids | 📝 DOC FIXED | - | - |
+| 9.3 | Single vs multi-subprocess docs | 📝 DOC FIXED | - | - |
+| 9.4 | Constants location in docs | 📝 DOC FIXED | - | - |
+| 9.5 | SANITY_CHECK_NUM_WORKERS location | ✅ FIXED | - | - |
+| 9.6 | Legacy backup_gpu_id attribute | ✅ FIXED | - | - |
+| 9.7 | backup_gpu_ids validation | ✅ FIXED | - | - |
+| 9.8 | Type hints in multiprocess_eval | ✅ FIXED | - | - |
 
 ---
 
 ## Recommended Priority Fixes
 
 ### High Priority (Should Fix)
-1. **3.2**: Add warning when `backup_gpu_id == main_gpu_id`
+1. **3.2**: Add warning when `backup_gpu_ids` contains same GPU as `main_gpu_id`
 2. **8.2**: Add early error when all samples excluded by sanity check
 
 ### Medium Priority (Nice to Have)
@@ -258,5 +326,6 @@ if len(valid_keys) == 0:
 ## Notes
 
 - Analysis performed on code state as of January 2026
+- Updated after refactoring into `tuning_set_trainer/` module
 - Some "issues" are design decisions that may be intentional
 - Always test changes thoroughly before deploying to production training

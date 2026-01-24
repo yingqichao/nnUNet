@@ -65,13 +65,10 @@ import torch
 import torch._dynamo as _dynamo
 import multiprocessing as mp
 from multiprocessing import Pool
-from typing import List, Tuple, Union, Dict, Optional, Callable
+from typing import List, Tuple, Union, Dict, Optional, Callable, Any
 from threadpoolctl import threadpool_limits
 from collections import defaultdict
-from dataclasses import dataclass
-from queue import Queue
-from threading import Thread
-from time import time
+from time import time, sleep
 from tqdm import tqdm
 from scipy.special import softmax as scipy_softmax
 
@@ -96,1712 +93,52 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context, check_if_proc
 from nnunetv2.inference.sliding_window_prediction import compute_steps_for_sliding_window, compute_gaussian
 
 # =============================================================================
-# MODULE-LEVEL CONFIGURATION FLAGS
+# IMPORT FROM HELPER MODULES
 # =============================================================================
-# Set these before training to control behavior
+# These modules contain extracted code for better maintainability
 
-# Pre-training evaluation: run sliding window eval before first epoch
-# Useful for debugging, catches evaluation bugs early before wasting training time
-ENABLE_PRE_TRAINING_EVAL = True  # Test set pre-training eval (sliding window)
-ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET = True  # Tuning set pre-training eval (dual-crop)
-PRE_TRAINING_EVAL_MAX_SAMPLES = 5  # Limit samples for faster pre-training sanity check
-
-# Async test evaluation: run test set evaluation in a subprocess
-# This allows training to continue while test evaluation runs in parallel
-ASYNC_TEST_EVAL = True  # Set to False to use synchronous evaluation
-
-# GPU for async evaluation subprocess
-# None = use same GPU as training (may cause OOM if memory is tight)
-# Integer = specific GPU ID (e.g., 6 for cuda:6)
-# This is the ACTUAL GPU ID, not the CUDA_VISIBLE_DEVICES index
-ASYNC_EVAL_GPU_ID = None  # Set to a different GPU ID if available
-
-# Timeout for async evaluation (seconds)
-ASYNC_EVAL_TIMEOUT = 3600  # 1 hour default
-
-# Minimum success rate for subprocess evaluation
-# If fewer than this fraction of samples are successfully processed, the evaluation is considered unreliable
-# With timeout support, we lower this to 50% since timeout can legitimately reduce sample count
-ASYNC_EVAL_MIN_SUCCESS_RATE = 0.50  # 50% of samples must succeed (lowered to accommodate timeout)
-
-# Maximum time (in minutes) for subprocess to run before timing out
-# When timeout is reached, metrics are computed from already-processed samples
-ASYNC_EVAL_TIMEOUT_MINUTES = 60  # 50 minutes max
-
-# Whether to exit main process when subprocess evaluation fails
-# If True, main process will raise RuntimeError and exit gracefully
-# If False, main process logs error and continues training
-ASYNC_EVAL_EXIT_ON_FAILURE = True
-
-
-# =============================================================================
-# ASYNC EVALUATION WORKER FUNCTION (must be at module level for pickling)
-# =============================================================================
-# 
-# GPU CONFIGURATION FOR SUBPROCESS:
-# We set CUDA_VISIBLE_DEVICES in the parent process BEFORE spawning. The 'spawn'
-# context creates a fresh Python interpreter that inherits the environment at
-# spawn time. After spawning, we immediately restore the parent's original
-# CUDA_VISIBLE_DEVICES. This ensures:
-# 1. The subprocess uses the configured GPU (ASYNC_EVAL_GPU_ID)
-# 2. The parent process continues using its original GPU
-# 3. No CUDA context is shared between processes (avoiding crashes)
-#
-# =============================================================================
-
-def _async_test_eval_worker(
-    temp_ckpt_path: str,
-    result_path: str,
-    preprocessed_folder: str,
-    test_keys: list,  # Changed from List[str] to avoid import issues
-    top_k_dices: list,  # Changed from List[Tuple[float, int]]
-    top_k_checkpoints: int,
-    output_folder: str,
-    plans_identifier: str,
-    eval_config: dict,
-    gpu_id: int = None,  # Changed from Optional[int] to avoid import issues
-):
-    """
-    Standalone worker function for async test evaluation.
-    
-    This function runs in a separate process and:
-    1. Sets up the GPU environment (via initializer function)
-    2. Loads the model from temp checkpoint
-    3. Runs sliding window evaluation on test set
-    4. Determines if result qualifies for top-k
-    5. If yes, saves checkpoint with appropriate rank
-    6. Writes result JSON to result_path
-    
-    IMPORTANT: CUDA_VISIBLE_DEVICES is set by _async_subprocess_initializer
-    BEFORE this function is called, ensuring correct GPU selection.
-    
-    Args:
-        temp_ckpt_path: Path to temporary checkpoint with model weights
-        result_path: Path to write result JSON
-        preprocessed_folder: Path to preprocessed dataset
-        test_keys: List of test sample keys
-        top_k_dices: Current top-k dice values [(dice, epoch), ...]
-        top_k_checkpoints: Number of top checkpoints to maintain
-        output_folder: Folder to save checkpoints
-        plans_identifier: Identifier for checkpoint naming
-        eval_config: Dict with evaluation configuration
-        gpu_id: GPU ID (for logging only - already set by initializer)
-    """
-    # Import everything inside the function to ensure clean subprocess environment
-    # This avoids inheriting any CUDA context from parent process
-    import os
-    import sys
-    import json
-    import traceback
-    from datetime import datetime
-    
-    # Helper for timestamped logging in subprocess
-    def _mp_log(msg: str):
-        """Print with timestamp and [MP] prefix for subprocess logs."""
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        print(f"{timestamp}: [MP] {msg}", flush=True)
-    
-    # Verify GPU setting (for debugging)
-    actual_gpu = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
-    _mp_log(f"CUDA_VISIBLE_DEVICES={actual_gpu}")
-    
-    try:
-        # All imports happen AFTER CUDA_VISIBLE_DEVICES is set by initializer
-        import torch
-        import torch._dynamo as _dynamo
-        import numpy as np
-        from tqdm import tqdm
-        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
-        from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
-        from nnunetv2.utilities.label_handling.label_handling import LabelManager
-        from nnunetv2.inference.sliding_window_prediction import compute_steps_for_sliding_window, compute_gaussian
-        from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
-        from nnunetv2.utilities.collate_outputs import collate_outputs
-        from batchgenerators.utilities.file_and_folder_operations import join, isfile
-        
-        # Suppress dynamo errors to avoid shape mismatch in residual connections
-        # This allows dynamo to fall back to eager mode when shapes are dynamic
-        _dynamo.config.suppress_errors = True
-        
-        # Now initialize CUDA - this creates a fresh CUDA context for this subprocess
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        _mp_log(f"Using device: {device}, torch.cuda.device_count()={torch.cuda.device_count() if torch.cuda.is_available() else 0}")
-        
-        # Load checkpoint
-        checkpoint = torch.load(temp_ckpt_path, map_location='cpu', weights_only=False)
-        
-        # Reconstruct model from init_args
-        init_args = checkpoint['init_args']
-        plans = init_args['plans']
-        configuration = init_args['configuration']
-        dataset_json = init_args['dataset_json']
-        
-        # Get model architecture
-        plans_manager = PlansManager(plans)
-        config_manager = plans_manager.get_configuration(configuration)
-        label_manager = plans_manager.get_label_manager(dataset_json)
-        
-        # Determine number of input channels
-        from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
-        num_input_channels = determine_num_input_channels(plans_manager, config_manager, dataset_json)
-        num_output_channels = label_manager.num_segmentation_heads
-        
-        # Build network using correct function signature
-        from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
-        
-        network = get_network_from_plans(
-            arch_class_name=config_manager.network_arch_class_name,
-            arch_kwargs=config_manager.network_arch_init_kwargs,
-            arch_kwargs_req_import=config_manager.network_arch_init_kwargs_req_import,
-            input_channels=num_input_channels,
-            output_channels=num_output_channels,
-            allow_init=True,
-            deep_supervision=eval_config.get('enable_deep_supervision', True)
-        )
-        network.load_state_dict(checkpoint['network_weights'])
-        network = network.to(device)
-        network.eval()
-        
-        # Create dataset
-        dataset_class = infer_dataset_class(preprocessed_folder)
-        test_dataset = dataset_class(
-            preprocessed_folder,
-            test_keys,
-            folder_with_segs_from_previous_stage=None
-        )
-        
-        # Extract eval config
-        patch_size = tuple(eval_config['patch_size'])
-        step_size = eval_config['step_size']
-        simulate_perfect_anatomy = eval_config.get('simulate_perfect_anatomy', True)
-        max_patches_per_sample = eval_config.get('max_patches_per_sample', None)
-        current_epoch = eval_config['current_epoch']
-        num_classes = label_manager.num_segmentation_heads
-        enable_deep_supervision = eval_config.get('enable_deep_supervision', True)
-        timeout_minutes = eval_config.get('timeout_minutes', 50)  # Default 50 min timeout
-        
-        # Run sliding window evaluation with timeout tracking
-        import time
-        start_time = time.time()
-        timeout_seconds = timeout_minutes * 60
-        timed_out = False
-        skipped_samples = []  # Track samples skipped due to timeout
-        
-        all_outputs = []
-        failed_samples = []  # Track failed sample keys
-        total_samples = len(test_keys)
-        
-        with torch.no_grad():
-            for sample_idx, key in enumerate(tqdm(test_keys, desc=f"[MP] Test SW Eval (epoch {current_epoch})")):
-                # Check for timeout at the start of each sample
-                elapsed_time = time.time() - start_time
-                if elapsed_time >= timeout_seconds:
-                    remaining_keys = test_keys[sample_idx:]  # Use index directly, O(1)
-                    skipped_samples.extend(remaining_keys)
-                    timed_out = True
-                    _mp_log(f"TIMEOUT: Reached {timeout_minutes} min limit after {len(all_outputs)} samples. "
-                            f"Skipping remaining {len(remaining_keys)} samples.")
-                    break
-                
-                try:
-                    data, seg, seg_prev, properties = test_dataset.load_case(key)
-                    
-                    # Get original segmentation for foreground classification
-                    seg_np_orig = seg[0] if seg.ndim == 4 else seg
-                    original_shape = tuple(seg_np_orig.shape)
-                    
-                    # PAD data and seg to at least patch_size (critical for UNet residual connections)
-                    # This mirrors what nnUNet predictor does in predict_sliding_window_return_logits
-                    # NOTE: pad_nd_image uses np.pad for numpy arrays (expects 'constant_values')
-                    #       and torch.nn.functional.pad for tensors (expects 'value')
-                    from acvl_utils.cropping_and_padding.padding import pad_nd_image
-                    data_padded, slicer_revert = pad_nd_image(
-                        np.asarray(data), patch_size, 'constant', {'constant_values': 0}, True, None
-                    )
-                    seg_padded, _ = pad_nd_image(
-                        np.asarray(seg), patch_size, 'constant', {'constant_values': 0}, True, None
-                    )
-                    
-                    # Use padded shapes for sliding window computation
-                    seg_np = seg_padded[0] if seg_padded.ndim == 4 else seg_padded
-                    volume_shape = tuple(seg_np.shape)
-                    
-                    # Compute sliding window boxes on PADDED volume
-                    steps = compute_steps_for_sliding_window(volume_shape, patch_size, step_size)
-                    
-                    slicers = []
-                    for sx in steps[0]:
-                        for sy in steps[1]:
-                            for sz in steps[2]:
-                                slicers.append(
-                                    tuple([slice(si, si + ti) for si, ti in zip((sx, sy, sz), patch_size)])
-                                )
-                    
-                    # Classify boxes by foreground
-                    tumor_indices = []
-                    anatomy_only_indices = []
-                    
-                    for idx, sl in enumerate(slicers):
-                        box_seg = seg_np[sl]
-                        has_tumor = np.any(box_seg == 2)
-                        has_anatomy = np.any(box_seg == 1)
-                        
-                        if has_tumor:
-                            tumor_indices.append(idx)
-                        elif has_anatomy:
-                            anatomy_only_indices.append(idx)
-                    
-                    foreground_indices = tumor_indices + anatomy_only_indices
-                    
-                    # Priority sampling if max_patches set
-                    if max_patches_per_sample is not None and max_patches_per_sample > 0:
-                        selected = []
-                        rng = np.random.default_rng(seed=42)
-                        
-                        if len(tumor_indices) > 0:
-                            if len(tumor_indices) <= max_patches_per_sample:
-                                selected.extend(tumor_indices)
-                            else:
-                                selected.extend(rng.choice(tumor_indices, size=max_patches_per_sample, replace=False).tolist())
-                        
-                        remaining = max_patches_per_sample - len(selected)
-                        if remaining > 0 and len(anatomy_only_indices) > 0:
-                            if len(anatomy_only_indices) <= remaining:
-                                selected.extend(anatomy_only_indices)
-                            else:
-                                selected.extend(rng.choice(anatomy_only_indices, size=remaining, replace=False).tolist())
-                        
-                        foreground_indices = selected
-                    
-                    if len(foreground_indices) == 0:
-                        continue
-                    
-                    # Run inference on PADDED data
-                    data_tensor = torch.from_numpy(np.asarray(data_padded)).float().to(device)
-                    
-                    predicted_logits = torch.zeros(
-                        (num_classes, *volume_shape), dtype=torch.half, device=device
-                    )
-                    n_predictions = torch.zeros(volume_shape, dtype=torch.half, device=device)
-                    gaussian = compute_gaussian(patch_size, sigma_scale=1./8, value_scaling_factor=10, device=device)
-                    
-                    for box_idx in foreground_indices:
-                        sl = slicers[box_idx]
-                        patch = data_tensor[(slice(None),) + sl][None]
-                        
-                        # Forward pass (dynamo errors suppressed, will fall back to eager)
-                        pred = network(patch)[0]
-                        if enable_deep_supervision:
-                            pred = pred[0]
-                        
-                        pred = pred * gaussian
-                        predicted_logits[(slice(None),) + sl] += pred
-                        n_predictions[sl] += gaussian
-                    
-                    valid_mask = n_predictions > 0
-                    n_predictions_safe = torch.clamp(n_predictions, min=1e-8)
-                    predicted_logits = predicted_logits / n_predictions_safe
-                    
-                    # Move to CPU for metrics
-                    predicted_logits = predicted_logits.cpu()
-                    valid_mask = valid_mask.cpu()
-                    
-                    # REVERT PADDING on predictions and valid_mask
-                    # slicer_revert is for spatial dims, need to add channel dim for predicted_logits
-                    predicted_logits = predicted_logits[(slice(None),) + slicer_revert[1:]]
-                    valid_mask = valid_mask[slicer_revert[1:]]
-                    
-                    # Use ORIGINAL (unpadded) seg for metrics
-                    seg_tensor = torch.from_numpy(np.asarray(seg)).long()
-                    
-                    if seg_tensor.ndim == 3:
-                        seg_tensor = seg_tensor.unsqueeze(0)
-                    
-                    # Handle ignore label
-                    if seg_tensor.min() < 0:
-                        seg_tensor = seg_tensor.clone()
-                        seg_tensor[seg_tensor < 0] = 0
-                    if seg_tensor.max() >= num_classes:
-                        seg_tensor = torch.clamp(seg_tensor, 0, num_classes - 1)
-                    
-                    # Convert to segmentation
-                    output_seg = predicted_logits.argmax(0, keepdim=True)
-                    
-                    if simulate_perfect_anatomy:
-                        gt_is_background = (seg_tensor == 0)
-                        output_seg = output_seg.clone()
-                        output_seg[gt_is_background] = 0
-                    
-                    # One-hot encoding
-                    pred_onehot = torch.zeros(predicted_logits.shape, dtype=torch.float32)
-                    pred_onehot.scatter_(0, output_seg, 1)
-                    pred_onehot = pred_onehot.unsqueeze(0)
-                    seg_tensor = seg_tensor.unsqueeze(0)
-                    
-                    target_onehot = torch.zeros(pred_onehot.shape, dtype=torch.bool)
-                    target_onehot.scatter_(1, seg_tensor, 1)
-                    
-                    valid_mask_expanded = valid_mask.unsqueeze(0).unsqueeze(0).float()
-                    
-                    axes = [0] + list(range(2, pred_onehot.ndim))
-                    tp, fp, fn, tn = get_tp_fp_fn_tn(pred_onehot, target_onehot, axes=axes, mask=valid_mask_expanded)
-                    
-                    tp_hard = tp.numpy()[1:]  # Skip background
-                    fp_hard = fp.numpy()[1:]
-                    fn_hard = fn.numpy()[1:]
-                    tn_hard = tn.numpy()[1:]
-                    
-                    all_outputs.append({
-                        'tp_hard': tp_hard,
-                        'fp_hard': fp_hard,
-                        'fn_hard': fn_hard,
-                        'tn_hard': tn_hard,
-                        'loss': 0.0
-                    })
-                    
-                    torch.cuda.empty_cache()
-                    
-                except Exception as e:
-                    _mp_log(f"Warning: Failed to process {key}: {e}")
-                    traceback.print_exc()
-                    failed_samples.append(key)
-                    continue
-        
-        # Check success rate
-        # When timed_out, calculate rate from attempted samples only (exclude skipped)
-        attempted_samples = total_samples - len(skipped_samples)
-        successful_samples = attempted_samples - len(failed_samples)
-        success_rate = successful_samples / attempted_samples if attempted_samples > 0 else 0.0
-        min_success_rate = eval_config.get('min_success_rate', 0.5)  # Lowered to 50%
-        
-        elapsed_minutes = (time.time() - start_time) / 60
-        _mp_log(f"Completed in {elapsed_minutes:.1f} min. "
-                f"Processed {successful_samples}/{attempted_samples} attempted samples successfully ({success_rate*100:.1f}%)")
-        if timed_out:
-            _mp_log(f"Timed out: {len(skipped_samples)} samples skipped due to {timeout_minutes} min limit")
-        if failed_samples:
-            _mp_log(f"Failed samples: {failed_samples[:10]}{'...' if len(failed_samples) > 10 else ''}")
-        
-        # Aggregate results
-        # We now compute metrics even with low success rate, but mark them as unreliable
-        if not all_outputs:
-            result = {
-                'success': False,
-                'error': 'No outputs collected - all samples failed or skipped',
-                'epoch': current_epoch,
-                'total_samples': total_samples,
-                'attempted_samples': attempted_samples,
-                'failed_samples': failed_samples,
-                'skipped_samples': len(skipped_samples),
-                'timed_out': timed_out,
-            }
-        elif success_rate < min_success_rate:
-            # Low success rate - compute metrics anyway but mark as unreliable
-            # Main process will decide whether to use these metrics
-            _mp_log(f"Warning: Low success rate ({success_rate*100:.1f}% < {min_success_rate*100:.1f}%). "
-                    f"Computing metrics from {successful_samples} samples anyway.")
-            
-            outputs_collated = collate_outputs(all_outputs)
-            tp = np.sum(outputs_collated['tp_hard'], 0)
-            fp = np.sum(outputs_collated['fp_hard'], 0)
-            fn = np.sum(outputs_collated['fn_hard'], 0)
-            tn = np.sum(outputs_collated['tn_hard'], 0)
-            
-            dice_per_class = [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0.0 
-                             for i, j, k in zip(tp, fp, fn)]
-            
-            result = {
-                'success': True,  # Mark as success but with warning flag
-                'unreliable': True,  # Flag for main process to decide
-                'warning': f'Low success rate: {success_rate*100:.1f}% < {min_success_rate*100:.1f}% threshold',
-                'epoch': current_epoch,
-                'dice_per_class': dice_per_class,
-                'total_samples': total_samples,
-                'attempted_samples': attempted_samples,
-                'successful_samples': successful_samples,
-                'failed_samples': len(failed_samples),
-                'skipped_samples': len(skipped_samples),
-                'success_rate': success_rate,
-                'timed_out': timed_out,
-            }
-        else:
-            outputs_collated = collate_outputs(all_outputs)
-            tp = np.sum(outputs_collated['tp_hard'], 0)
-            fp = np.sum(outputs_collated['fp_hard'], 0)
-            fn = np.sum(outputs_collated['fn_hard'], 0)
-            tn = np.sum(outputs_collated['tn_hard'], 0)
-            
-            dice_per_class = [2 * i / (2 * i + j + k) if (2 * i + j + k) > 0 else 0.0 
-                             for i, j, k in zip(tp, fp, fn)]
-            recall_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fn)]
-            precision_per_class = [100.0 * t / (t + f) if (t + f) > 0 else 0.0 for t, f in zip(tp, fp)]
-            f1_per_class = [2 * p * r / (p + r) if (p + r) > 0 else 0.0 
-                           for p, r in zip(precision_per_class, recall_per_class)]
-            fpr_per_class = [100.0 * f / (f + t) if (f + t) > 0 else 0.0 for f, t in zip(fp, tn)]
-            
-            tumor_dice = dice_per_class[1] if len(dice_per_class) > 1 else np.nanmean(dice_per_class)
-            
-            # Check if this qualifies for top-k
-            achieved_rank = 0
-            for i, (dice, _) in enumerate(top_k_dices):
-                if tumor_dice > dice:
-                    achieved_rank = i + 1
-                    break
-            if achieved_rank == 0 and len(top_k_dices) < top_k_checkpoints:
-                achieved_rank = len(top_k_dices) + 1
-            
-            # Save checkpoint if qualified
-            checkpoint_saved = None
-            if achieved_rank > 0:
-                # Shift existing checkpoints down
-                for rank in range(min(len(top_k_dices), top_k_checkpoints - 1), achieved_rank - 1, -1):
-                    src_name = f"checkpoint_best_{plans_identifier}.pth" if rank == 1 else f"checkpoint_best_{plans_identifier}.pth.{rank}"
-                    dst_name = f"checkpoint_best_{plans_identifier}.pth.{rank + 1}"
-                    src_path = join(output_folder, src_name)
-                    dst_path = join(output_folder, dst_name)
-                    if isfile(src_path):
-                        try:
-                            os.rename(src_path, dst_path)
-                        except Exception as e:
-                            _mp_log(f"Warning: Could not rename {src_name} to {dst_name}: {e}")
-                
-                # Remove old last rank if list was full
-                if len(top_k_dices) >= top_k_checkpoints:
-                    last_name = f"checkpoint_best_{plans_identifier}.pth.{top_k_checkpoints}"
-                    last_path = join(output_folder, last_name)
-                    if isfile(last_path):
-                        try:
-                            os.remove(last_path)
-                        except:
-                            pass
-                
-                # Save new checkpoint at achieved rank
-                ckpt_name = f"checkpoint_best_{plans_identifier}.pth" if achieved_rank == 1 else f"checkpoint_best_{plans_identifier}.pth.{achieved_rank}"
-                ckpt_path = join(output_folder, ckpt_name)
-                
-                # Update checkpoint with dice info
-                checkpoint['_best_dice'] = tumor_dice
-                checkpoint['_best_ema'] = tumor_dice
-                torch.save(checkpoint, ckpt_path)
-                checkpoint_saved = ckpt_name
-                _mp_log(f"Saved checkpoint: {ckpt_name} (Dice: {tumor_dice:.4f}, Rank: {achieved_rank})")
-            
-            result = {
-                'success': True,
-                'unreliable': False,  # High success rate, metrics are reliable
-                'epoch': current_epoch,
-                'dice_per_class': dice_per_class,
-                'recall_per_class': recall_per_class,
-                'precision_per_class': precision_per_class,
-                'f1_per_class': f1_per_class,
-                'fpr_per_class': fpr_per_class,
-                'tumor_dice': tumor_dice,
-                'achieved_rank': achieved_rank,
-                'checkpoint_saved': checkpoint_saved,
-                'total_samples': total_samples,
-                'attempted_samples': attempted_samples,
-                'successful_samples': successful_samples,
-                'failed_samples': len(failed_samples),
-                'skipped_samples': len(skipped_samples),
-                'success_rate': success_rate,
-                'timed_out': timed_out,
-            }
-        
-        # Write result
-        with open(result_path, 'w') as f:
-            json.dump(result, f, indent=2)
-        
-        _mp_log(f"Evaluation complete. Tumor Dice: {result.get('tumor_dice', 'N/A')}")
-        
-    except Exception as e:
-        error_result = {
-            'success': False,
-            'error': str(e),
-            'traceback': traceback.format_exc(),
-            'epoch': eval_config.get('current_epoch', -1),
-        }
-        with open(result_path, 'w') as f:
-            json.dump(error_result, f, indent=2)
-        _mp_log(f"Evaluation FAILED: {e}")
-
-
-# =============================================================================
-# SANITY CHECK WORKER FUNCTION (for multiprocessing)
-# =============================================================================
-
-def _check_single_sample_for_tumor(args: tuple) -> tuple:
-    """
-    Worker function to check if a single sample contains tumor (label 2).
-    
-    This function is designed for multiprocessing.Pool.map() and must be
-    at module level to be picklable.
-    
-    Args:
-        args: Tuple of (key, dataset_folder, tumor_label)
-        
-    Returns:
-        Tuple of (key, has_tumor, has_ignore, n_ignore, error_msg)
-        - key: Sample key
-        - has_tumor: True if sample contains tumor_label
-        - has_ignore: True if sample contains ignore label (-1)
-        - n_ignore: Number of ignore label voxels
-        - error_msg: Error message if failed, None otherwise
-    """
-    key, dataset_folder, tumor_label = args
-    
-    try:
-        # Import inside function to avoid issues with multiprocessing
-        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
-        import numpy as np
-        
-        # Create dataset for this single key
-        dataset_class = infer_dataset_class(dataset_folder)
-        temp_dataset = dataset_class(dataset_folder, [key], None)
-        
-        # Load the sample
-        data, seg, seg_prev, properties = temp_dataset.load_case(key)
-        
-        # Get segmentation array
-        seg_np = seg[0] if seg.ndim == 4 else seg
-        
-        # Check for ignore label (-1)
-        has_ignore = bool(np.any(seg_np < 0))
-        n_ignore = int(np.sum(seg_np < 0)) if has_ignore else 0
-        
-        # Check if tumor label exists
-        has_tumor = bool(np.any(seg_np == tumor_label))
-        
-        return (key, has_tumor, has_ignore, n_ignore, None)
-        
-    except Exception as e:
-        return (key, False, False, 0, str(e))
-
-
-# Default number of workers for sanity check multiprocessing
-SANITY_CHECK_NUM_WORKERS = 16
-
-
-# =============================================================================
-# SHARED EVALUATION UTILITIES (used by both trainer and eval_with_soft_predictions.py)
-# =============================================================================
-
-def compute_dice_score_np(pred: np.ndarray, gt: np.ndarray) -> float:
-    """
-    Compute Dice score between binary prediction and ground truth (numpy).
-    
-    Args:
-        pred: Binary prediction array (any shape)
-        gt: Binary ground truth array (same shape as pred)
-    
-    Returns:
-        Dice score (float between 0 and 1)
-    """
-    pred = pred.astype(bool)
-    gt = gt.astype(bool)
-    
-    intersection = np.logical_and(pred, gt).sum()
-    pred_sum = pred.sum()
-    gt_sum = gt.sum()
-    
-    if pred_sum + gt_sum == 0:
-        return 1.0  # Both empty, perfect match
-    
-    dice = (2.0 * intersection) / (pred_sum + gt_sum)
-    return float(dice)
-
-
-def compute_tp_fp_fn_tn_np(pred: np.ndarray, gt: np.ndarray) -> Tuple[int, int, int, int]:
-    """
-    Compute TP, FP, FN, TN between binary prediction and ground truth (numpy).
-    
-    Args:
-        pred: Binary prediction array
-        gt: Binary ground truth array
-    
-    Returns:
-        Tuple of (TP, FP, FN, TN) as integers
-    """
-    pred = pred.astype(bool)
-    gt = gt.astype(bool)
-    
-    tp = np.logical_and(pred, gt).sum()
-    fp = np.logical_and(pred, ~gt).sum()
-    fn = np.logical_and(~pred, gt).sum()
-    tn = np.logical_and(~pred, ~gt).sum()
-    
-    return int(tp), int(fp), int(fn), int(tn)
-
-
-def compute_class_metrics_np(
-    pred_seg: np.ndarray,
-    gt_seg: np.ndarray,
-    class_idx: int,
-    simulate_perfect_anatomy: bool = False
-) -> Dict[str, Optional[float]]:
-    """
-    Compute metrics for a specific class using numpy arrays.
-    
-    This function is shared between:
-    - nnUNetTrainer_with_tuning_set.py (for training evaluation)
-    - eval_with_soft_predictions.py (for post-hoc evaluation)
-    
-    Args:
-        pred_seg: Predicted segmentation (D, H, W) with class indices
-        gt_seg: Ground truth segmentation (1, D, H, W) or (D, H, W) with class indices
-            May contain -1 as ignore label (will be treated as background)
-        class_idx: Class index to evaluate (e.g., 2 for tumor)
-        simulate_perfect_anatomy: If True, zero out predictions where GT is background (label 0).
-            This simulates "perfect anatomy detection" and computes tumor metrics only
-            within the GT anatomy region, reducing FP from outside anatomy.
-    
-    Returns:
-        Dictionary with:
-        - "Dice": Dice score (None if undefined)
-        - "IoU": Intersection over Union (None if undefined)
-        - "TP", "FP", "FN", "TN": Raw counts
-        - "Recall": TP / (TP + FN) in percent
-        - "Precision": TP / (TP + FP) in percent
-        - "n_pred": Number of predicted voxels
-        - "n_ref": Number of reference (GT) voxels
-    """
-    # Handle channel dimension for both gt and pred
-    if gt_seg.ndim == 4:
-        gt_seg = gt_seg[0]
-    if pred_seg.ndim == 4:
-        pred_seg = pred_seg[0]
-    
-    # Handle ignore label (-1): treat as background for evaluation
-    # nnUNet uses -1 for regions to exclude (padding, uncertain regions)
-    if np.any(gt_seg < 0):
-        gt_seg = gt_seg.copy()
-        gt_seg[gt_seg < 0] = 0
-    
-    # Apply postprocessing: zero predictions outside GT anatomy
-    if simulate_perfect_anatomy:
-        gt_anatomy_mask = (gt_seg != 0)  # GT is not background
-        pred_seg_pp = pred_seg.copy()
-        pred_seg_pp[~gt_anatomy_mask] = 0  # Zero predictions outside GT anatomy
-    else:
-        pred_seg_pp = pred_seg
-    
-    # Binary masks for the target class
-    pred_mask = (pred_seg_pp == class_idx)
-    gt_mask = (gt_seg == class_idx)
-    
-    # Compute metrics
-    tp, fp, fn, tn = compute_tp_fp_fn_tn_np(pred_mask, gt_mask)
-    
-    # Dice and IoU
-    if tp + fp + fn == 0:
-        dice = None
-        iou = None
-    else:
-        dice = 2 * tp / (2 * tp + fp + fn)
-        iou = tp / (tp + fp + fn)
-    
-    # Recall and Precision
-    recall = 100.0 * tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    precision = 100.0 * tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    
-    return {
-        "Dice": float(dice) if dice is not None else None,
-        "IoU": float(iou) if iou is not None else None,
-        "TP": tp,
-        "FP": fp,
-        "FN": fn,
-        "TN": tn,
-        "Recall": recall,
-        "Precision": precision,
-        "n_pred": tp + fp,
-        "n_ref": tp + fn
-    }
-
-
-def compute_anatomy_dice_np(
-    pred_seg: np.ndarray,
-    gt_seg: np.ndarray
-) -> float:
-    """
-    Compute Dice score for anatomy prediction (non-background).
-    
-    Args:
-        pred_seg: Predicted segmentation (D, H, W)
-        gt_seg: Ground truth segmentation (1, D, H, W) or (D, H, W)
-    
-    Returns:
-        Dice score for anatomy segmentation (foreground vs background)
-    """
-    if gt_seg.ndim == 4:
-        gt_seg = gt_seg[0]
-    
-    # Anatomy = anywhere not background (class != 0)
-    pred_anatomy = (pred_seg != 0).astype(np.uint8)
-    gt_anatomy = (gt_seg != 0).astype(np.uint8)
-    
-    return compute_dice_score_np(pred_anatomy, gt_anatomy)
-
-
-def soft_pred_to_segmentation_np(
-    soft_pred: np.ndarray,
-    apply_softmax: bool = False
-) -> np.ndarray:
-    """
-    Convert soft predictions (logits) to hard segmentation using argmax.
-    
-    Args:
-        soft_pred: Soft prediction array with shape (num_classes, D, H, W)
-                   These are logits (pre-softmax) from nnUNet
-        apply_softmax: Whether to apply softmax first (doesn't change argmax result,
-                       but included for consistency)
-    
-    Returns:
-        Hard segmentation array with shape (D, H, W) containing class indices
-    """
-    if apply_softmax:
-        probs = scipy_softmax(soft_pred, axis=0)
-    else:
-        probs = soft_pred
-    
-    # Argmax across class dimension
-    segmentation = np.argmax(probs, axis=0)
-    
-    return segmentation
-
-
-# =============================================================================
-# DYNAMIC SAMPLING STRATEGY
-# =============================================================================
-
-@dataclass
-class SamplingConfig:
-    """Configuration for dynamic sampling strategy.
-    
-    Probability relationship (simplified model):
-    - p_random = 0.5 * p_anatomy (random is always half of anatomy)
-    - p_tumor = 1 - 1.5 * p_anatomy (tumor gets the rest)
-    - Only p_anatomy is actively adjusted; others follow automatically
-    
-    This means:
-    - When we "increase context", we increase p_anatomy (and p_random follows)
-    - When we "increase lesion focus", we decrease p_anatomy (freeing up for tumor)
-    """
-    
-    # Probability bounds for p_anatomy (primary control variable)
-    # Since p_random = 0.5 * p_anatomy and p_tumor = 1 - 1.5 * p_anatomy:
-    # - min_anatomy = 0.10 → p_random = 0.05, p_tumor = 0.85 (max lesion focus)
-    # - max_anatomy = 0.50 → p_random = 0.25, p_tumor = 0.25 (balanced)
-    min_anatomy_prob: float = 0.10
-    max_anatomy_prob: float = 0.50
-    
-    # Context preservation: minimum (p_anatomy + p_random) = 1.5 * p_anatomy >= 0.15
-    # This is automatically satisfied when min_anatomy_prob >= 0.10
-    min_context_prob: float = 0.15  # Lower bound for anatomy + random combined
-    
-    # Moving average smoothing (exponential smoothing factor)
-    alpha: float = 0.7  # Higher = more weight to recent epochs
-    
-    # Convergence detection
-    convergence_threshold: float = 0.005  # Relative change < 0.5%
-    convergence_window: int = 5  # Check last 5 epochs
-    
-    # Adjustment rates (how aggressively to change p_anatomy)
-    adjustment_rate: float = 0.05  # Max change per epoch for p_anatomy
-    decay_rate: float = 0.02  # Gradual decay when converged
-    
-    # Stabilization: reduce oscillation
-    smoothing_factor: float = 0.5  # Blend new and old probabilities
-    
-    # Priority order for trend detection: Dice > Recall > Precision
-    # 1. Dice trend is the primary signal
-    # 2. Recall drop triggers "increase lesion focus" (reduce FN is priority)
-    # 3. Precision drop triggers "increase context" (reduce FP, lower priority)
-    recall_drop_threshold: float = 0.03    # 3% recall drop → increase lesion focus
-    precision_drop_threshold: float = 0.03  # 3% precision drop → increase context
-    
-    # Best Dice tracking: revert to best-known settings if performance degrades
-    # This ensures Dice generally improves by remembering what worked
-    dice_revert_threshold: float = 0.05  # Revert if Dice drops > 5% from best
-    exploration_margin: float = 0.02     # Only explore when within 2% of best Dice
-
-
-class DynamicSamplingStrategy:
-    """
-    Adaptive patch sampling strategy for medical image segmentation.
-    
-    This class maintains historical metric records and implements decision logic
-    to adjust p1 (anatomy probability) and p2 (lesion probability) to optimize
-    lesion segmentation performance.
-    
-    Key features:
-    - EMA smoothing of validation metrics
-    - Trend detection (improving/stable/degrading)
-    - Adaptive probability adjustment based on trends
-    - Convergence detection with decay toward equilibrium
-    - **Best Dice tracking**: remembers best-performing settings and reverts if degraded
-    
-    Dice Improvement Guarantee:
-    - Tracks the best Dice EMA achieved and corresponding p_anatomy setting
-    - If current Dice drops significantly below best (> dice_revert_threshold), 
-      reverts to the best-known settings
-    - Only explores new settings when current Dice is within exploration_margin of best
-    - This creates an "exploit best, explore cautiously" behavior
-    """
-    
-    def __init__(self, config: Optional[SamplingConfig] = None, 
-                 log_fn: Optional[Callable[[str], None]] = None):
-        """
-        Initialize the dynamic sampling strategy.
-        
-        Args:
-            config: SamplingConfig object with hyperparameters
-            log_fn: Optional logging function (e.g., print_to_log_file)
-        """
-        self.config = config or SamplingConfig()
-        self.log_fn = log_fn or print
-        
-        # History tracking: epoch -> {metric_name -> value}
-        self.history: Dict[int, Dict[str, float]] = defaultdict(dict)
-        
-        # Moving average tracking (scalar values, updated each epoch)
-        self.ema_lesion_dice: Optional[float] = None
-        self.ema_lesion_f1: Optional[float] = None
-        self.ema_lesion_recall: Optional[float] = None
-        self.ema_lesion_precision: Optional[float] = None
-        
-        # History of EMAs for trend/convergence detection
-        self.ema_history: List[float] = []  # Dice EMA history
-        self.recall_ema_history: List[float] = []  # Recall EMA history for drop detection
-        self.precision_ema_history: List[float] = []  # Precision EMA history for drop detection
-        
-        # Probability history
-        self.p1_history: List[float] = []  # anatomy
-        self.p2_history: List[float] = []  # lesion
-        
-        # Current epoch
-        self.epoch = 0
-        
-        # Convergence tracking
-        self.stagnation_counter = 0
-        
-        # Best Dice tracking for improvement guarantee
-        self.best_dice_ema: Optional[float] = None  # Best Dice EMA achieved
-        self.best_p_anatomy: Optional[float] = None  # p_anatomy that achieved best Dice
-        self.best_epoch: int = 0  # Epoch when best was achieved
-        self.reverted_count: int = 0  # How many times we reverted to best
-    
-    def _log(self, msg: str) -> None:
-        """Log a message using the configured logging function."""
-        self.log_fn(msg)
-    
-    def update(self, metrics_dict: Dict[str, float]) -> Tuple[float, float]:
-        """
-        Main function to update probabilities based on validation metrics.
-        
-        Includes Dice improvement guarantee:
-        1. Track best Dice EMA and corresponding settings
-        2. If current Dice drops significantly, revert to best settings
-        3. Only explore new settings when close to best performance
-        
-        Args:
-            metrics_dict: Dictionary containing validation metrics.
-                Expected keys:
-                - 'lesion_dice', 'lesion_recall', 'lesion_precision', 'lesion_f1'
-                - 'anatomy_dice', 'anatomy_recall', 'anatomy_precision', 'anatomy_f1'
-        
-        Returns:
-            Tuple of (p1_new, p2_new) where p1=anatomy, p2=lesion probability
-        """
-        self.epoch += 1
-        self._log(f"  [DynamicSampling] Epoch {self.epoch}: Updating probabilities")
-        
-        # Store metrics in history
-        self.history[self.epoch] = metrics_dict.copy()
-        
-        # Update EMAs for lesion metrics
-        self._update_ema(metrics_dict)
-        
-        # Log current metrics and EMAs
-        self._log_metrics_summary(metrics_dict)
-        
-        # === BEST DICE TRACKING ===
-        current_dice_ema = self.ema_lesion_dice
-        current_p_anatomy = self.p1_history[-1] if self.p1_history else 0.25
-        
-        # Check if this is a new best
-        if self.best_dice_ema is None or current_dice_ema > self.best_dice_ema:
-            self.best_dice_ema = current_dice_ema
-            self.best_p_anatomy = current_p_anatomy
-            self.best_epoch = self.epoch
-            self._log(f"    ★ NEW BEST Dice EMA: {self.best_dice_ema:.4f} at p_anatomy={self.best_p_anatomy:.3f}")
-        
-        # Check if we should revert to best settings
-        should_revert = False
-        if self.best_dice_ema is not None and self.best_dice_ema > 0:
-            dice_drop = (self.best_dice_ema - current_dice_ema) / self.best_dice_ema
-            if dice_drop > self.config.dice_revert_threshold:
-                should_revert = True
-                self.reverted_count += 1
-                self._log(f"    ⚠ Dice dropped {dice_drop:.1%} from best → REVERTING to best settings")
-                self._log(f"      Best: Dice={self.best_dice_ema:.4f} at p_anatomy={self.best_p_anatomy:.3f} (epoch {self.best_epoch})")
-        
-        # Check if we're close enough to best to explore
-        can_explore = True
-        if self.best_dice_ema is not None and self.best_dice_ema > 0:
-            dice_gap = (self.best_dice_ema - current_dice_ema) / self.best_dice_ema
-            if dice_gap > self.config.exploration_margin:
-                can_explore = False
-                self._log(f"    ⏸ Dice {dice_gap:.1%} below best → limiting exploration")
-        
-        # === PROBABILITY UPDATE ===
-        if should_revert:
-            # Revert to best-known settings
-            p1_new = self.best_p_anatomy
-            p2_new = 1.0 - 1.5 * p1_new  # Derived from fixed relationship
-            self._log(f"    REVERTED: p_anatomy={p1_new:.3f}")
-        else:
-            # Normal update path
-            is_converged = self._check_convergence()
-            
-            if can_explore:
-                # Calculate new probabilities based on trends
-                p1_new, p2_new = self._calculate_new_probabilities(is_converged)
-            else:
-                # Stay close to current (no major changes when far from best)
-                p1_new = current_p_anatomy
-                p2_new = 1.0 - 1.5 * p1_new
-                self._log(f"    HOLDING: staying at current settings until Dice improves")
-            
-            # Apply smoothing to reduce oscillation
-            p1_new, p2_new = self._smooth_probabilities(p1_new, p2_new)
-            
-            # Normalize to ensure valid probabilities
-            p1_new, p2_new = self._normalize_probabilities(p1_new, p2_new)
-        
-        # Store in history
-        self.p1_history.append(p1_new)
-        self.p2_history.append(p2_new)
-        
-        # Log decision
-        self._log_decision(p1_new, p2_new, should_revert)
-        
-        return p1_new, p2_new
-    
-    def _update_ema(self, metrics_dict: Dict[str, float]) -> None:
-        """Update exponential moving averages for lesion metrics."""
-        alpha = self.config.alpha
-        
-        lesion_dice = metrics_dict.get('lesion_dice', 0)
-        lesion_f1 = metrics_dict.get('lesion_f1', 0)
-        lesion_recall = metrics_dict.get('lesion_recall', 0)
-        lesion_precision = metrics_dict.get('lesion_precision', 0)
-        
-        if self.ema_lesion_dice is None:
-            # First epoch: initialize
-            self.ema_lesion_dice = lesion_dice
-            self.ema_lesion_f1 = lesion_f1
-            self.ema_lesion_recall = lesion_recall
-            self.ema_lesion_precision = lesion_precision
-        else:
-            # Update with exponential smoothing: EMA_new = alpha * value + (1 - alpha) * EMA_old
-            self.ema_lesion_dice = alpha * lesion_dice + (1 - alpha) * self.ema_lesion_dice
-            self.ema_lesion_f1 = alpha * lesion_f1 + (1 - alpha) * self.ema_lesion_f1
-            self.ema_lesion_recall = alpha * lesion_recall + (1 - alpha) * self.ema_lesion_recall
-            self.ema_lesion_precision = alpha * lesion_precision + (1 - alpha) * self.ema_lesion_precision
-        
-        # Store EMA history for trend detection
-        self.ema_history.append(self.ema_lesion_dice)
-        self.recall_ema_history.append(self.ema_lesion_recall)
-        self.precision_ema_history.append(self.ema_lesion_precision)
-    
-    def _log_metrics_summary(self, metrics_dict: Dict[str, float]) -> None:
-        """Log current metrics and EMAs."""
-        self._log(f"    Lesion metrics (current | EMA): "
-                  f"Dice={metrics_dict.get('lesion_dice', 0):.4f}|{self.ema_lesion_dice:.4f}, "
-                  f"Recall={metrics_dict.get('lesion_recall', 0):.4f}|{self.ema_lesion_recall:.4f}, "
-                  f"Precision={metrics_dict.get('lesion_precision', 0):.4f}|{self.ema_lesion_precision:.4f}")
-    
-    def _check_convergence(self) -> bool:
-        """Check if metrics have converged over recent epochs."""
-        window = self.config.convergence_window
-        
-        if len(self.ema_history) < window + 1:
-            return False
-        
-        # Get recent EMAs
-        recent_emas = self.ema_history[-window:]
-        
-        # Calculate relative changes
-        changes = []
-        for i in range(1, len(recent_emas)):
-            if recent_emas[i-1] > 0:
-                rel_change = abs(recent_emas[i] - recent_emas[i-1]) / recent_emas[i-1]
-                changes.append(rel_change)
-        
-        if not changes:
-            return False
-        
-        avg_change = np.mean(changes)
-        is_converged = avg_change < self.config.convergence_threshold
-        
-        if is_converged:
-            self.stagnation_counter += 1
-        else:
-            self.stagnation_counter = 0
-        
-        return is_converged
-    
-    def _calculate_trend(self) -> str:
-        """
-        Determine trend with priority: Dice > Recall > Precision.
-        
-        Decision priority:
-        1. If recall drops > 3% → 'recall_dropping' (needs more lesion focus to reduce FN)
-        2. If precision drops > 3% (and recall stable) → 'precision_dropping' (needs more context)
-        3. Otherwise → Dice-based: 'improving', 'degrading', or 'stable'
-        
-        This prioritizes reducing False Negatives (missed lesions) over reducing
-        False Positives (over-segmentation), which is appropriate for lesion detection
-        where missing a lesion is typically more costly than a false alarm.
-        
-        Returns: 'improving', 'recall_dropping', 'precision_dropping', 'degrading', or 'stable'
-        """
-        if len(self.ema_history) < 2:
-            return 'stable'
-        
-        # Compare last two Dice EMAs
-        dice_change = self.ema_history[-1] - self.ema_history[-2]
-        
-        # Small threshold for Dice trend
-        threshold = 0.002
-        
-        # Priority 1: Check for recall degradation (FN increasing - highest priority after Dice)
-        recall_dropping = False
-        if len(self.recall_ema_history) >= 2:
-            recall_change = self.recall_ema_history[-1] - self.recall_ema_history[-2]
-            if recall_change < -self.config.recall_drop_threshold:
-                recall_dropping = True
-                self._log(f"    ⚠ Recall dropping: {recall_change:.4f} "
-                          f"(threshold: -{self.config.recall_drop_threshold}) → need more lesion focus")
-        
-        # Priority 2: Check for precision degradation (FP increasing - lower priority)
-        precision_dropping = False
-        if len(self.precision_ema_history) >= 2:
-            precision_change = self.precision_ema_history[-1] - self.precision_ema_history[-2]
-            if precision_change < -self.config.precision_drop_threshold:
-                precision_dropping = True
-                self._log(f"    ⚠ Precision dropping: {precision_change:.4f} "
-                          f"(threshold: -{self.config.precision_drop_threshold}) → may need more context")
-        
-        # Decision logic with recall > precision priority
-        if recall_dropping:
-            # Recall is dropping - missing lesions, need more tumor patches
-            # This takes precedence even if precision is also dropping
-            return 'recall_dropping'
-        elif precision_dropping:
-            # Precision is dropping (but recall is stable) - over-segmenting
-            # Need more context patches
-            if dice_change > threshold:
-                self._log(f"    Note: Dice improving but precision dropping → increasing context")
-            return 'precision_dropping'
-        elif dice_change > threshold:
-            return 'improving'
-        elif dice_change < -threshold:
-            return 'degrading'
-        else:
-            return 'stable'
-    
-    def _calculate_new_probabilities(self, is_converged: bool) -> Tuple[float, float]:
-        """
-        Calculate new probabilities based on trends.
-        
-        Simplified model where only p_anatomy is adjusted:
-        - p_random = 0.5 * p_anatomy (random is always half of anatomy)
-        - p_tumor = 1 - 1.5 * p_anatomy (tumor gets the rest)
-        
-        Actions:
-        - IMPROVING or RECALL_DROPPING: decrease p_anatomy → more tumor patches
-        - DEGRADING or PRECISION_DROPPING: increase p_anatomy → more context patches
-        - STABLE: maintain current
-        - CONVERGED: decay toward equilibrium (p_anatomy = 0.30)
-        
-        Priority: Dice trend > Recall drop > Precision drop
-        """
-        config = self.config
-        
-        # Get current p_anatomy or start from default
-        if self.p1_history:
-            p_anatomy_current = self.p1_history[-1]
-        else:
-            # First epoch: start with moderate anatomy (0.25 → p_random=0.125, p_tumor=0.625)
-            p_anatomy_current = 0.25
-        
-        # Get trend
-        trend = self._calculate_trend()
-        adjustment_rate = config.adjustment_rate
-        
-        if trend == "improving":
-            # Dice improving - increase lesion focus (decrease p_anatomy)
-            p_anatomy_new = p_anatomy_current - adjustment_rate
-            self._log(f"    Trend: IMPROVING → increase lesion focus (↓ p_anatomy)")
-            
-        elif trend == "recall_dropping":
-            # Recall dropping - need more tumor patches to reduce FN
-            # This is higher priority than precision, so use larger adjustment
-            p_anatomy_new = p_anatomy_current - adjustment_rate * 1.5
-            self._log(f"    Trend: RECALL_DROPPING → increase lesion focus (↓↓ p_anatomy)")
-            
-        elif trend == "precision_dropping":
-            # Precision dropping (but recall stable) - need more context to reduce FP
-            p_anatomy_new = p_anatomy_current + adjustment_rate
-            self._log(f"    Trend: PRECISION_DROPPING → increase context (↑ p_anatomy)")
-            
-        elif trend == "degrading":
-            # Dice degrading - add more context
-            p_anatomy_new = p_anatomy_current + adjustment_rate
-            self._log(f"    Trend: DEGRADING → increase context (↑ p_anatomy)")
-            
-        else:  # stable
-            p_anatomy_new = p_anatomy_current
-            self._log(f"    Trend: STABLE → maintain current")
-        
-        # Handle convergence: decay toward equilibrium (p_anatomy = 0.30)
-        equilibrium_anatomy = 0.30  # Balanced: p_random=0.15, p_tumor=0.55
-        if is_converged:
-            p_anatomy_new = p_anatomy_current + config.decay_rate * (equilibrium_anatomy - p_anatomy_current)
-            self._log(f"    CONVERGED: decaying toward equilibrium (p_anatomy → {equilibrium_anatomy})")
-        
-        # Derive other probabilities from p_anatomy
-        # These will be properly bounded in _normalize_probabilities
-        p_random_new = 0.5 * p_anatomy_new
-        p_tumor_new = 1.0 - 1.5 * p_anatomy_new
-        
-        # Return (p_anatomy, p_tumor) - p_random is derived in _normalize_probabilities
-        return p_anatomy_new, p_tumor_new
-    
-    def _smooth_probabilities(self, p1_new: float, p2_new: float) -> Tuple[float, float]:
-        """Apply smoothing to reduce oscillation."""
-        if not self.p1_history:
-            return p1_new, p2_new
-        
-        factor = self.config.smoothing_factor
-        p1_smoothed = factor * p1_new + (1 - factor) * self.p1_history[-1]
-        p2_smoothed = factor * p2_new + (1 - factor) * self.p2_history[-1]
-        
-        return p1_smoothed, p2_smoothed
-    
-    def _normalize_probabilities(self, p_anatomy: float, p_tumor: float) -> Tuple[float, float]:
-        """
-        Normalize probabilities with simplified model:
-        - p_random = 0.5 * p_anatomy (random is always half of anatomy)
-        - p_tumor = 1 - 1.5 * p_anatomy (tumor gets the rest)
-        - Only p_anatomy is bounded; others follow automatically
-        
-        Bounds:
-        - p_anatomy ∈ [min_anatomy_prob, max_anatomy_prob] = [0.10, 0.50]
-        - This ensures: p_anatomy + p_random = 1.5 * p_anatomy ≥ 0.15 (context preservation)
-        
-        At boundaries:
-        - Min context (max lesion): p_anatomy=0.10, p_random=0.05, p_tumor=0.85
-        - Max context (balanced):   p_anatomy=0.50, p_random=0.25, p_tumor=0.25
-        """
-        config = self.config
-        
-        # Bound p_anatomy (the control variable)
-        p_anatomy = np.clip(p_anatomy, config.min_anatomy_prob, config.max_anatomy_prob)
-        
-        # Derive other probabilities from the fixed relationship
-        p_random = 0.5 * p_anatomy
-        p_tumor = 1.0 - 1.5 * p_anatomy
-        
-        # Sanity check: ensure context preservation
-        context_prob = p_anatomy + p_random  # = 1.5 * p_anatomy
-        if context_prob < config.min_context_prob:
-            # This shouldn't happen if min_anatomy_prob >= min_context_prob / 1.5
-            self._log(f"    WARNING: Context prob {context_prob:.3f} < {config.min_context_prob:.3f}")
-            p_anatomy = config.min_context_prob / 1.5
-            p_random = 0.5 * p_anatomy
-            p_tumor = 1.0 - 1.5 * p_anatomy
-        
-        # Log the fixed relationship
-        self._log(f"    Probability model: p_anatomy={p_anatomy:.3f}, "
-                  f"p_random={p_random:.3f} (=0.5×anatomy), p_tumor={p_tumor:.3f}")
-        
-        return p_anatomy, p_tumor
-    
-    def _log_decision(self, p1: float, p2: float, reverted: bool = False) -> None:
-        """Log final decision."""
-        p_random = 0.5 * p1  # Fixed relationship
-        
-        strategy_type = "LESION-ORIENTED" if p2 > p1 and p2 > p_random else \
-                        "ANATOMY-ORIENTED" if p1 > p2 and p1 > p_random else \
-                        "BALANCED"
-        
-        status = " [REVERTED]" if reverted else ""
-        best_info = f" (best={self.best_dice_ema:.4f})" if self.best_dice_ema else ""
-        
-        self._log(f"    Decision: {strategy_type}{status} → p_anatomy={p1:.3f}, "
-                  f"p_tumor={p2:.3f}, p_random={p_random:.3f}{best_info}")
-    
-    def get_history(self) -> Dict[str, List]:
-        """Return complete history for visualization/analysis."""
-        epochs = list(self.history.keys())
-        
-        result = {
-            'epochs': epochs,
-            'p1_anatomy': self.p1_history,
-            'p2_lesion': self.p2_history,
-            'ema_lesion_dice': self.ema_history,
-            'ema_lesion_recall': self.recall_ema_history,
-            'ema_lesion_precision': self.precision_ema_history,
-            # Best tracking info
-            'best_dice_ema': self.best_dice_ema,
-            'best_p_anatomy': self.best_p_anatomy,
-            'best_epoch': self.best_epoch,
-            'reverted_count': self.reverted_count,
-        }
-        
-        # Add metric histories
-        for metric_key in ['lesion_dice', 'lesion_f1', 'lesion_recall', 'lesion_precision',
-                          'anatomy_dice', 'anatomy_f1', 'anatomy_recall', 'anatomy_precision']:
-            result[metric_key] = [self.history[ep].get(metric_key, 0) for ep in epochs]
-        
-        return result
-
-
-# =============================================================================
-# CUSTOM DATALOADER WITH 3-WAY CENTERING
-# =============================================================================
-
-class nnUNetDataLoader3WayCentering(nnUNetDataLoader):
-    """
-    Custom DataLoader with configurable 3-way patch centering probabilities.
-    
-    For each sample in batch, randomly choose centering mode based on probabilities:
-    - Random: Center on any random voxel
-    - Anatomy: Center on random anatomy voxel (label 1)
-    - Tumor: Center on random tumor voxel (label 2 ONLY)
-    
-    Note: Labels >= 3 (e.g., cyst in KiTS) are trained but NOT explicitly centered on.
-    This provides fine-grained control over patch sampling strategy.
-    """
-    
-    # Label conventions
-    BACKGROUND_LABEL = 0
-    ANATOMY_LABEL = 1  # liver for LiTS, kidney for KiTS
-    PRIMARY_TUMOR_LABEL = 2  # Only label 2 is used for tumor-centered cropping
-    # Note: Labels >= 3 (e.g., cyst in KiTS) are trained but NOT explicitly centered on
-    
-    def __init__(self,
-                 data: nnUNetBaseDataset,
-                 batch_size: int,
-                 patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
-                 final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
-                 label_manager: LabelManager,
-                 prob_random: float = 0.0,
-                 prob_anatomy: float = 0.67,
-                 prob_tumor: float = 0.33,
-                 sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
-                 pad_sides: Union[List[int], Tuple[int, ...]] = None,
-                 transforms=None):
-        """
-        Args:
-            prob_random: Probability of centering on random voxel
-            prob_anatomy: Probability of centering on anatomy voxel (label 1)
-            prob_tumor: Probability of centering on tumor voxel (label 2 ONLY)
-            
-            Note: prob_random + prob_anatomy + prob_tumor must equal 1.0
-        """
-        # Map to parent's oversample_foreground_percent (not directly used, but required)
-        super().__init__(
-            data=data,
-            batch_size=batch_size,
-            patch_size=patch_size,
-            final_patch_size=final_patch_size,
-            label_manager=label_manager,
-            oversample_foreground_percent=prob_tumor,  # Legacy compatibility
-            sampling_probabilities=sampling_probabilities,
-            pad_sides=pad_sides,
-            probabilistic_oversampling=True,  # Always use probabilistic for 3-way
-            transforms=transforms
-        )
-        
-        # Validate probabilities
-        total_prob = prob_random + prob_anatomy + prob_tumor
-        if not np.isclose(total_prob, 1.0, atol=1e-6):
-            raise ValueError(f"Probabilities must sum to 1.0, got {total_prob}")
-        
-        self.prob_random = prob_random
-        self.prob_anatomy = prob_anatomy
-        self.prob_tumor = prob_tumor
-        
-        # Only use PRIMARY_TUMOR_LABEL (2) for tumor-centered cropping
-        # Labels >= 3 (e.g., cyst in KiTS) are trained but not explicitly centered on
-        if self.PRIMARY_TUMOR_LABEL not in label_manager.foreground_labels:
-            raise ValueError(
-                f"The dedicated tumor channel (2) is not found! Please note that "
-                f"{self.__class__.__name__} is designed for better tumor-focused training!"
-            )
-        self.tumor_labels = [self.PRIMARY_TUMOR_LABEL]
-        self.anatomy_label = self.ANATOMY_LABEL
-        
-        # Counters for tracking actual centering modes used (including fallbacks)
-        self.reset_centering_counts()
-    
-    def reset_centering_counts(self):
-        """Reset the centering mode counters. Call at start of each epoch."""
-        self.centering_counts = {
-            'random': 0,
-            'anatomy': 0,
-            'tumor': 0
-        }
-    
-    def get_centering_counts(self) -> dict:
-        """Get the current centering mode counts."""
-        return self.centering_counts.copy()
-    
-    def update_probabilities(self, prob_random: float, prob_anatomy: float, prob_tumor: float):
-        """
-        Update centering probabilities dynamically.
-        
-        This allows adaptive adjustment of patch sampling strategy during training.
-        
-        Args:
-            prob_random: Probability of centering on random voxel
-            prob_anatomy: Probability of centering on anatomy voxel (label 1)
-            prob_tumor: Probability of centering on tumor voxel (label 2 ONLY)
-        """
-        total = prob_random + prob_anatomy + prob_tumor
-        if not np.isclose(total, 1.0, atol=1e-6):
-            raise ValueError(f"Probabilities must sum to 1.0, got {total}")
-        self.prob_random = prob_random
-        self.prob_anatomy = prob_anatomy
-        self.prob_tumor = prob_tumor
-    
-    def _sample_centering_mode(self) -> str:
-        """
-        Randomly sample centering mode based on probabilities.
-        
-        Returns: 'random', 'anatomy', or 'tumor'
-        """
-        r = np.random.uniform()
-        if r < self.prob_random:
-            return 'random'
-        elif r < self.prob_random + self.prob_anatomy:
-            return 'anatomy'
-        else:
-            return 'tumor'
-    
-    def get_bbox_3way(self, data_shape: np.ndarray, centering_mode: str,
-                      class_locations: Union[dict, None]) -> Tuple[List[int], List[int], str]:
-        """
-        Get bounding box based on centering mode.
-        
-        Args:
-            data_shape: Shape of the data (excluding channel dimension)
-            centering_mode: 'random', 'anatomy', or 'tumor'
-            class_locations: Dict mapping class labels to voxel locations
-            
-        Returns:
-            bbox_lbs, bbox_ubs: Bounding box lower and upper bounds
-            actual_mode: The actual centering mode used (may differ due to fallbacks)
-        """
-        need_to_pad = self.need_to_pad.copy()
-        dim = len(data_shape)
-        
-        for d in range(dim):
-            if need_to_pad[d] + data_shape[d] < self.patch_size[d]:
-                need_to_pad[d] = self.patch_size[d] - data_shape[d]
-        
-        lbs = [- need_to_pad[i] // 2 for i in range(dim)]
-        ubs = [data_shape[i] + need_to_pad[i] // 2 + need_to_pad[i] % 2 - self.patch_size[i] for i in range(dim)]
-        
-        selected_voxel = None
-        actual_mode = centering_mode  # Track actual mode used
-        
-        if centering_mode == 'tumor':
-            # Try to center on tumor (label 2 ONLY - self.tumor_labels contains only PRIMARY_TUMOR_LABEL)
-            tumor_classes_with_voxels = [l for l in self.tumor_labels 
-                                         if class_locations and l in class_locations 
-                                         and len(class_locations[l]) > 0]
-            if tumor_classes_with_voxels:
-                selected_class = tumor_classes_with_voxels[np.random.choice(len(tumor_classes_with_voxels))]
-                voxels = class_locations[selected_class]
-                selected_voxel = voxels[np.random.choice(len(voxels))]
-                actual_mode = 'tumor'
-            else:
-                # Fallback to anatomy if no tumor
-                centering_mode = 'anatomy'
-        
-        if centering_mode == 'anatomy' and selected_voxel is None:
-            # Center on anatomy (label 1)
-            if class_locations and self.anatomy_label in class_locations \
-               and len(class_locations[self.anatomy_label]) > 0:
-                voxels = class_locations[self.anatomy_label]
-                selected_voxel = voxels[np.random.choice(len(voxels))]
-                actual_mode = 'anatomy'
-            else:
-                # Fallback to random if no anatomy
-                centering_mode = 'random'
-        
-        if centering_mode == 'random' or selected_voxel is None:
-            # Random centering
-            actual_mode = 'random'
-            bbox_lbs = [np.random.randint(lbs[i], ubs[i] + 1) if lbs[i] < ubs[i] + 1 
-                        else lbs[i] for i in range(dim)]
-        else:
-            # Center on selected voxel
-            # i + 1 because first dimension is channel
-            bbox_lbs = [max(lbs[i], selected_voxel[i + 1] - self.patch_size[i] // 2) for i in range(dim)]
-        
-        bbox_ubs = [bbox_lbs[i] + self.patch_size[i] for i in range(dim)]
-        
-        return bbox_lbs, bbox_ubs, actual_mode
-    
-    def generate_train_batch(self):
-        """
-        Generate a training batch with 3-way centering.
-        Tracks the actual centering modes used (including fallbacks).
-        """
-        selected_keys = self.get_indices()
-        data_all = np.zeros(self.data_shape, dtype=np.float32)
-        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
-        
-        for j, i in enumerate(selected_keys):
-            # Sample centering mode for this sample
-            centering_mode = self._sample_centering_mode()
-            
-            data, seg, seg_prev, properties = self._data.load_case(i)
-            shape = data.shape[1:]
-            
-            # Get bbox using 3-way centering (returns actual mode used after fallbacks)
-            bbox_lbs, bbox_ubs, actual_mode = self.get_bbox_3way(
-                shape, centering_mode, properties.get('class_locations')
-            )
-            
-            # Track the actual centering mode used
-            self.centering_counts[actual_mode] += 1
-            
-            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
-            
-            data_all[j] = crop_and_pad_nd(data, bbox, 0)
-            
-            seg_cropped = crop_and_pad_nd(seg, bbox, -1)
-            if seg_prev is not None:
-                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)[None]))
-            seg_all[j] = seg_cropped
-        
-        if self.patch_size_was_2d:
-            data_all = data_all[:, :, 0]
-            seg_all = seg_all[:, :, 0]
-        
-        if self.transforms is not None:
-            with torch.no_grad():
-                with threadpool_limits(limits=1, user_api=None):
-                    # Use np.asarray() to handle NDArray/memmap types
-                    data_all = torch.from_numpy(np.asarray(data_all)).float()
-                    seg_all = torch.from_numpy(np.asarray(seg_all)).to(torch.int16)
-                    images = []
-                    segs = []
-                    for b in range(self.batch_size):
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
-                        images.append(tmp['image'])
-                        segs.append(tmp['segmentation'])
-                    data_all = torch.stack(images)
-                    if isinstance(segs[0], list):
-                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
-                    else:
-                        seg_all = torch.stack(segs)
-                    del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
-        
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
-
-
-# =============================================================================
-# DUAL-CROP EVALUATION DATALOADER (ANATOMY + TUMOR)
-# =============================================================================
-
-class nnUNetDataLoaderDualCropEval(nnUNetDataLoader):
-    """
-    Evaluation DataLoader that creates TWO patches per sample for balanced evaluation.
-    
-    For each sample in the dataset:
-    - Patch 1: Centered on a random ANATOMY voxel (label 1) → evaluates FP control
-    - Patch 2: Centered on a random TUMOR voxel (label 2) → evaluates tumor detection
-    
-    This provides balanced evaluation that considers both:
-    - False positive rate on normal anatomy regions
-    - True positive rate (recall) on tumor regions
-    
-    If a sample has N original cases, evaluation will use 2N patches.
-    Example: 25 samples → 50 patches (25 anatomy-centered + 25 tumor-centered)
-    
-    This is used for tuning and test set evaluation ONLY (not training).
-    """
-    
-    ANATOMY_LABEL = 1  # liver for LiTS, kidney for KiTS
-    TUMOR_LABEL = 2    # Only label 2 is used for tumor centering
-    
-    def __init__(self,
-                 data: nnUNetBaseDataset,
-                 batch_size: int,
-                 patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
-                 final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
-                 label_manager: LabelManager,
-                 sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
-                 pad_sides: Union[List[int], Tuple[int, ...]] = None,
-                 transforms=None):
-        """
-        Note: batch_size here refers to the number of ORIGINAL samples per batch.
-        The actual output will have 2x batch_size patches (anatomy + tumor for each sample).
-        """
-        super().__init__(
-            data=data,
-            batch_size=batch_size,
-            patch_size=patch_size,
-            final_patch_size=final_patch_size,
-            label_manager=label_manager,
-            oversample_foreground_percent=1.0,  # Not used, we do dual-crop
-            sampling_probabilities=sampling_probabilities,
-            pad_sides=pad_sides,
-            probabilistic_oversampling=True,
-            transforms=transforms
-        )
-        
-        # Update data_shape and seg_shape to accommodate 2x patches
-        # Original shape: (batch_size, channels, *patch_size)
-        # New shape: (2 * batch_size, channels, *patch_size)
-        self.original_batch_size = batch_size
-        self.data_shape = (2 * batch_size,) + self.data_shape[1:]
-        self.seg_shape = (2 * batch_size,) + self.seg_shape[1:]
-    
-    def get_bbox_for_mode(self, data_shape: np.ndarray, mode: str,
-                          class_locations: Union[dict, None]) -> Tuple[List[int], List[int]]:
-        """
-        Get bounding box centered on a voxel of the specified class.
-        
-        Args:
-            data_shape: Shape of the data (excluding channel dimension)
-            mode: 'anatomy' or 'tumor'
-            class_locations: Dict mapping class labels to voxel locations
-            
-        Returns:
-            bbox_lbs, bbox_ubs: Bounding box lower and upper bounds
-        """
-        need_to_pad = self.need_to_pad.copy()
-        dim = len(data_shape)
-        
-        for d in range(dim):
-            if need_to_pad[d] + data_shape[d] < self.patch_size[d]:
-                need_to_pad[d] = self.patch_size[d] - data_shape[d]
-        
-        lbs = [- need_to_pad[i] // 2 for i in range(dim)]
-        ubs = [data_shape[i] + need_to_pad[i] // 2 + need_to_pad[i] % 2 - self.patch_size[i] for i in range(dim)]
-        
-        selected_voxel = None
-        target_label = self.ANATOMY_LABEL if mode == 'anatomy' else self.TUMOR_LABEL
-        fallback_label = self.TUMOR_LABEL if mode == 'anatomy' else self.ANATOMY_LABEL
-        
-        # Try to get voxel from target class
-        if class_locations and target_label in class_locations and len(class_locations[target_label]) > 0:
-            voxels = class_locations[target_label]
-            selected_voxel = voxels[np.random.choice(len(voxels))]
-        
-        # Fallback to other foreground class if target not available
-        if selected_voxel is None and class_locations:
-            if fallback_label in class_locations and len(class_locations[fallback_label]) > 0:
-                voxels = class_locations[fallback_label]
-                selected_voxel = voxels[np.random.choice(len(voxels))]
-        
-        # Final fallback: random location
-        if selected_voxel is None:
-            bbox_lbs = [np.random.randint(lbs[i], ubs[i] + 1) if lbs[i] < ubs[i] + 1 
-                        else lbs[i] for i in range(dim)]
-        else:
-            # Center on selected voxel (skip channel dim: voxel is [channel, z, y, x])
-            bbox_lbs = [max(lbs[i], selected_voxel[i + 1] - self.patch_size[i] // 2) for i in range(dim)]
-        
-        bbox_ubs = [bbox_lbs[i] + self.patch_size[i] for i in range(dim)]
-        
-        return bbox_lbs, bbox_ubs
-    
-    def generate_train_batch(self):
-        """
-        Generate an evaluation batch with dual-crop strategy.
-        
-        For each sample:
-        1. Create one patch centered on random anatomy voxel
-        2. Create one patch centered on random tumor voxel
-        
-        Output has 2x the original batch size.
-        """
-        selected_keys = self.get_indices()
-        data_all = np.zeros(self.data_shape, dtype=np.float32)
-        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
-        
-        # Track keys for both patches (each key appears twice: once for anatomy, once for tumor)
-        output_keys = []
-        
-        for j, key in enumerate(selected_keys):
-            data, seg, seg_prev, properties = self._data.load_case(key)
-            shape = data.shape[1:]
-            class_locations = properties.get('class_locations')
-            
-            # === Patch 1: Anatomy-centered ===
-            idx_anatomy = 2 * j
-            bbox_lbs_anat, bbox_ubs_anat = self.get_bbox_for_mode(shape, 'anatomy', class_locations)
-            bbox_anat = [[i, k] for i, k in zip(bbox_lbs_anat, bbox_ubs_anat)]
-            
-            data_all[idx_anatomy] = crop_and_pad_nd(data, bbox_anat, 0)
-            seg_cropped_anat = crop_and_pad_nd(seg, bbox_anat, -1)
-            if seg_prev is not None:
-                seg_cropped_anat = np.vstack((seg_cropped_anat, crop_and_pad_nd(seg_prev, bbox_anat, -1)[None]))
-            seg_all[idx_anatomy] = seg_cropped_anat
-            output_keys.append(f"{key}_anatomy")
-            
-            # === Patch 2: Tumor-centered ===
-            idx_tumor = 2 * j + 1
-            bbox_lbs_tumor, bbox_ubs_tumor = self.get_bbox_for_mode(shape, 'tumor', class_locations)
-            bbox_tumor = [[i, k] for i, k in zip(bbox_lbs_tumor, bbox_ubs_tumor)]
-            
-            data_all[idx_tumor] = crop_and_pad_nd(data, bbox_tumor, 0)
-            seg_cropped_tumor = crop_and_pad_nd(seg, bbox_tumor, -1)
-            if seg_prev is not None:
-                seg_cropped_tumor = np.vstack((seg_cropped_tumor, crop_and_pad_nd(seg_prev, bbox_tumor, -1)[None]))
-            seg_all[idx_tumor] = seg_cropped_tumor
-            output_keys.append(f"{key}_tumor")
-        
-        if self.patch_size_was_2d:
-            data_all = data_all[:, :, 0]
-            seg_all = seg_all[:, :, 0]
-        
-        if self.transforms is not None:
-            with torch.no_grad():
-                with threadpool_limits(limits=1, user_api=None):
-                    # Use np.asarray() to handle NDArray/memmap types
-                    data_all = torch.from_numpy(np.asarray(data_all)).float()
-                    seg_all = torch.from_numpy(np.asarray(seg_all)).to(torch.int16)
-                    images = []
-                    segs = []
-                    # Process all 2*batch_size patches
-                    for b in range(2 * self.original_batch_size):
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
-                        images.append(tmp['image'])
-                        segs.append(tmp['segmentation'])
-                    data_all = torch.stack(images)
-                    if isinstance(segs[0], list):
-                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
-                    else:
-                        seg_all = torch.stack(segs)
-                    del segs, images
-            return {'data': data_all, 'target': seg_all, 'keys': output_keys}
-        
-        return {'data': data_all, 'target': seg_all, 'keys': output_keys}
+from nnunetv2.training.nnUNetTrainer.tuning_set_trainer import (
+    # Configuration constants
+    ENABLE_PRE_TRAINING_EVAL,
+    ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET,
+    PRE_TRAINING_EVAL_MAX_SAMPLES,
+    ASYNC_TEST_EVAL,
+    MAX_CONCURRENT_SUBPROCESSES,
+    SUBPROCESS_TIMEOUT_HOURS,
+    ASYNC_EVAL_TIMEOUT_HOURS,
+    ASYNC_EVAL_EXIT_ON_FAILURE,
+    ASYNC_EVAL_GPU_ID,
+    ASYNC_EVAL_TIMEOUT,
+    ASYNC_EVAL_MIN_SUCCESS_RATE,
+    ASYNC_EVAL_TIMEOUT_MINUTES,
+    # Multiprocess evaluation
+    SubprocessInfo,
+    SANITY_CHECK_NUM_WORKERS,
+    _async_test_eval_worker,
+    _check_single_sample_for_tumor,
+    # Metric utilities
+    compute_dice_score_np,
+    compute_tp_fp_fn_tn_np,
+    compute_class_metrics_np,
+    compute_anatomy_dice_np,
+    soft_pred_to_segmentation_np,
+    # Dynamic sampling strategy
+    SamplingConfig,
+    DynamicSamplingStrategy,
+    # Custom dataloaders
+    nnUNetDataLoader3WayCentering,
+    nnUNetDataLoaderDualCropEval,
+)
 
 
 # =============================================================================
 # TRAINER CLASS
 # =============================================================================
+# NOTE: Helper functions and classes are imported from tuning_set_trainer:
+# - _async_test_eval_worker, _check_single_sample_for_tumor
+# - compute_dice_score_np, compute_tp_fp_fn_tn_np, etc.
+# - SamplingConfig, DynamicSamplingStrategy
+# - nnUNetDataLoader3WayCentering, nnUNetDataLoaderDualCropEval
 
 
 class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
@@ -1950,26 +287,40 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         
         # =====================================================================
-        # ASYNC TEST EVALUATION (runs in subprocess, doesn't block training)
+        # ASYNC TEST EVALUATION (runs in subprocess(es), doesn't block training)
         # =====================================================================
-        # Configuration is controlled by:
-        # - Module-level: ASYNC_TEST_EVAL, ASYNC_EVAL_TIMEOUT, ENABLE_PRE_TRAINING_EVAL
-        # - Instance-level: self.backup_gpu_id (set by run_training.py via --backup_gpu_id)
+        # Configuration:
+        # - Module-level: ASYNC_TEST_EVAL, MAX_CONCURRENT_SUBPROCESSES, SUBPROCESS_TIMEOUT_HOURS
+        # - Instance-level: self.backup_gpu_ids (set by run_training.py via --backup_gpu_ids)
         #
-        # GPU selection priority for subprocess:
-        # 1. self.backup_gpu_id (from --backup_gpu_id argument)
-        # 2. ASYNC_EVAL_GPU_ID (module-level fallback)
-        # 3. None (same GPU as training - may cause OOM)
+        # Multi-subprocess support:
+        # - Up to MAX_CONCURRENT_SUBPROCESSES (default 3) can run in parallel
+        # - Each subprocess uses a different GPU from backup_gpu_ids
+        # - Main process manages checkpoint ranking (no race conditions)
         
-        # Subprocess state tracking
+        # List of running subprocesses (SubprocessInfo dataclass)
+        self._running_subprocesses: List[SubprocessInfo] = []
+        
+        # Queue of pending evaluation checkpoints (when all subprocess slots are full)
+        # Format: [(epoch, temp_ckpt_path), ...]
+        self._pending_eval_checkpoints: List[Tuple[int, str]] = []
+        
+        # Backup GPU IDs for async evaluation (set by run_training.py via --backup_gpu_ids)
+        # Max concurrent subprocesses = min(MAX_CONCURRENT_SUBPROCESSES, len(backup_gpu_ids))
+        self.backup_gpu_ids: List[int] = []
+        
+        # Max concurrent subprocesses (will be set based on backup_gpu_ids when available)
+        # Default to MAX_CONCURRENT_SUBPROCESSES from constants
+        self._max_concurrent_subprocesses: int = MAX_CONCURRENT_SUBPROCESSES
+        
+        # Timestamp tracking for checkpoint management (prevents stale updates)
+        self._last_checkpoint_update_timestamp: float = 0.0
+        
+        # Legacy single subprocess tracking (kept for backward compatibility with old code)
         self._async_eval_process: Optional[mp.Process] = None
-        self._async_eval_epoch: int = -1  # Which epoch is being evaluated
+        self._async_eval_epoch: int = -1
         self._async_eval_result_path: Optional[str] = None
-        self._pending_async_results: Dict[int, dict] = {}  # epoch -> result
-        
-        # Backup GPU ID for async evaluation (set externally by run_training.py)
-        # This takes precedence over ASYNC_EVAL_GPU_ID module constant
-        self.backup_gpu_id: Optional[int] = None
+        self._pending_async_results: Dict[int, dict] = {}
         # =====================================================================
         
         # =====================================================================
@@ -2020,8 +371,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file("-" * 70)
         self.print_to_log_file(f"Async test evaluation: {'ENABLED' if ASYNC_TEST_EVAL else 'DISABLED'}")
         if ASYNC_TEST_EVAL:
-            # backup_gpu_id will be set by run_training.py after __init__, so show placeholder
-            self.print_to_log_file(f"  → Backup GPU: (set via --backup_gpu_id, fallback: {ASYNC_EVAL_GPU_ID})")
+            # backup_gpu_ids will be set by run_training.py after __init__, so show placeholder
+            self.print_to_log_file(f"  → Backup GPUs: (set via --backup_gpu_ids, max {MAX_CONCURRENT_SUBPROCESSES} concurrent)")
+            self.print_to_log_file(f"  → Subprocess timeout: {SUBPROCESS_TIMEOUT_HOURS} hours (must complete ALL samples)")
             self.print_to_log_file(f"  → Training continues while test eval runs in parallel")
         self.print_to_log_file(f"Pre-training evaluation:")
         self.print_to_log_file(f"  TUNING: {'ENABLED' if ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET else 'DISABLED'}")
@@ -2299,10 +651,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         """
         Save a temporary checkpoint for async evaluation subprocess.
         
-        This saves only the necessary data for inference:
-        - Network weights
-        - Init args (for model reconstruction)
-        - Configuration
+        This saves ALL data needed for both inference AND continuing training,
+        ensuring that if this checkpoint is promoted to a top-K checkpoint,
+        it can be used to resume training later.
         
         Returns:
             Path to the saved temporary checkpoint
@@ -2316,46 +667,103 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         temp_ckpt_path = self._get_temp_checkpoint_path(epoch)
         
-        # Save minimal checkpoint for inference
+        # Save FULL checkpoint (same keys as save_checkpoint) so it can be used
+        # for continuing training if promoted to a top-K checkpoint
         checkpoint = {
+            # =========================================================
+            # BASE CLASS REQUIRED KEYS (for nnUNetTrainer.load_checkpoint)
+            # =========================================================
             'network_weights': mod.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'grad_scaler_state': self.grad_scaler.state_dict() if self.grad_scaler is not None else None,
+            'logging': self.logger.get_checkpoint(),
+            '_best_ema': self._best_ema,
+            'current_epoch': epoch + 1,  # +1 to match save_checkpoint convention
             'init_args': self.my_init_kwargs,
-            'current_epoch': epoch,
-            '_best_dice': getattr(self, '_best_dice', None),
-            '_best_ema': getattr(self, '_best_ema', None),
             'trainer_name': self.__class__.__name__,
             'inference_allowed_mirroring_axes': self.inference_allowed_mirroring_axes,
+            
+            # =========================================================
+            # TUNING SET TRAINER CUSTOM DATA
+            # =========================================================
+            'tuning_keys': self.tuning_keys,
+            'tuning_metrics': self.tuning_metrics,
+            'tuning_ratio': self.tuning_ratio,
+            # 3-way centering probabilities
+            'train_prob_random': self.train_prob_random,
+            'train_prob_anatomy': self.train_prob_anatomy,
+            'train_prob_tumor': self.train_prob_tumor,
+            'tuning_prob_random': self.tuning_prob_random,
+            'tuning_prob_anatomy': self.tuning_prob_anatomy,
+            'tuning_prob_tumor': self.tuning_prob_tumor,
+            'test_prob_random': self.test_prob_random,
+            'test_prob_anatomy': self.test_prob_anatomy,
+            'test_prob_tumor': self.test_prob_tumor,
+            # Original vs synthetic sample handling
+            'pattern_original_samples': self.pattern_original_samples,
+            'max_synthetic_ratio': self.max_synthetic_ratio,
+            'n_original_total': self.n_original_total,
+            'n_synthetic_total': self.n_synthetic_total,
+            'n_synthetic_removed': self.n_synthetic_removed,
+            'removed_synthetic_keys': self.removed_synthetic_keys,
+            'excluded_no_tumor_keys': self.excluded_no_tumor_keys,
+            # Dynamic sampling strategy state
+            'enable_dynamic_sampling': self.enable_dynamic_sampling,
+            'probability_history': self.probability_history,
+            'dynamic_sampling_history': self.dynamic_sampling_strategy.get_history() if self.dynamic_sampling_strategy else None,
+            # Top-K checkpoint tracking
+            'top_k_checkpoints': self.top_k_checkpoints,
+            'top_k_dices': self.top_k_dices,
+            '_best_dice': getattr(self, '_best_dice', None),
+            # Evaluation mode (separate for tuning vs test)
+            'tuning_eval_mode': self.tuning_eval_mode,
+            'test_eval_mode': self.test_eval_mode,
+            'eval_mode': self.eval_mode,  # Legacy compatibility
+            'sliding_window_step_size': self.sliding_window_step_size,
+            'simulate_perfect_anatomy': self.simulate_perfect_anatomy,
+            # Evaluation frequency and speed
+            'eval_every_n_epochs': self.eval_every_n_epochs,
+            'tuning_max_patches_per_sample': self.tuning_max_patches_per_sample,
+            'test_max_patches_per_sample': self.test_max_patches_per_sample,
+            '_last_eval_results': self._last_eval_results,
+            '_last_eval_epoch': self._last_eval_epoch,
         }
         
         torch.save(checkpoint, temp_ckpt_path)
         return temp_ckpt_path
     
-    def _cleanup_temp_checkpoint(self, epoch: int) -> None:
-        """Remove temporary checkpoint after async eval completes."""
-        temp_ckpt_path = self._get_temp_checkpoint_path(epoch)
-        if isfile(temp_ckpt_path):
-            try:
-                os.remove(temp_ckpt_path)
-                self.print_to_log_file(f"[MP] Cleaned up temp checkpoint: {os.path.basename(temp_ckpt_path)}")
-            except Exception as e:
-                self.print_to_log_file(f"[MP] Warning: Could not remove temp checkpoint: {e}")
+    """DEPRECATED ALERT START
+    The below functions are only used in the logic when we have only one subprocess and wait for their result in training
+    """
+    # def _cleanup_temp_checkpoint(self, epoch: int) -> None:
+    #     """Remove temporary checkpoint after async eval completes."""
+    #     temp_ckpt_path = self._get_temp_checkpoint_path(epoch)
+    #     if isfile(temp_ckpt_path):
+    #         try:
+    #             os.remove(temp_ckpt_path)
+    #             self.print_to_log_file(f"[MP] Cleaned up temp checkpoint: {os.path.basename(temp_ckpt_path)}")
+    #         except Exception as e:
+    #             self.print_to_log_file(f"[MP] Warning: Could not remove temp checkpoint: {e}")
         
-        # Also clean up result file
-        result_path = self._get_async_result_path(epoch)
-        if isfile(result_path):
-            try:
-                os.remove(result_path)
-            except:
-                pass
+    #     # Also clean up result file
+    #     result_path = self._get_async_result_path(epoch)
+    #     if isfile(result_path):
+    #         try:
+    #             os.remove(result_path)
+    #         except:
+    #             pass
+    """DEPRECATED ALERT END"""
     
     def _cleanup_orphaned_temp_files(self) -> None:
         """
-        Clean up any orphaned temp checkpoints and result files from previous runs.
+        Clean up any orphaned temp checkpoints, result files, and vis folders from previous runs.
         
         This is called during initialization to ensure a clean state.
         Orphaned files can occur if the training process was killed while
         async eval was running.
         """
+        import shutil
+        
         # Find and remove orphaned temp checkpoints
         pattern = join(self.output_folder, 'checkpoint_eval_temp_epoch*.pth')
         for temp_file in glob.glob(pattern):
@@ -2372,13 +780,490 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 os.remove(result_file)
             except:
                 pass
+        
+        # Find and remove orphaned temp vis folders
+        pattern = join(self.output_folder, 'vis_eval_temp_epoch*')
+        for vis_folder in glob.glob(pattern):
+            if os.path.isdir(vis_folder):
+                try:
+                    shutil.rmtree(vis_folder)
+                    self.print_to_log_file(f"[MP] Cleaned up orphaned vis folder: {os.path.basename(vis_folder)}")
+                except Exception as e:
+                    self.print_to_log_file(f"[MP] Warning: Could not remove orphaned vis folder: {e}")
+    
+    # =========================================================================
+    # MULTI-SUBPROCESS MANAGEMENT METHODS
+    # =========================================================================
+    
+    def _get_available_gpu(self) -> Optional[int]:
+        """
+        Get an available GPU from backup_gpu_ids that is not currently in use.
+        
+        Returns:
+            GPU ID if available, None if all GPUs are busy
+        """
+        if not self.backup_gpu_ids:
+            return None
+        
+        # Get set of GPUs currently in use by running subprocesses
+        gpus_in_use = {sp.gpu_id for sp in self._running_subprocesses}
+        
+        # Find first available GPU
+        for gpu_id in self.backup_gpu_ids:
+            if gpu_id not in gpus_in_use:
+                return gpu_id
+        
+        return None
+    
+    def _poll_running_subprocesses(self) -> List[dict]:
+        """
+        Poll all running subprocesses for completion.
+        
+        Returns:
+            List of results from completed subprocesses
+        """
+        completed_results = []
+        still_running = []
+        
+        for sp in self._running_subprocesses:
+            # Check if result file exists (subprocess completed)
+            if isfile(sp.result_path):
+                try:
+                    with open(sp.result_path, 'r') as f:
+                        result = json.load(f)
+                    
+                    # Wait for process to fully terminate
+                    sp.process.join(timeout=5)
+                    
+                    # Add subprocess info to result
+                    result['_subprocess_info'] = {
+                        'epoch': sp.epoch,
+                        'gpu_id': sp.gpu_id,
+                        'temp_ckpt_path': sp.temp_ckpt_path,
+                        'result_path': sp.result_path,
+                    }
+                    completed_results.append(result)
+                    
+                    self.print_to_log_file(f"[MP] Subprocess epoch {sp.epoch} completed (GPU {sp.gpu_id})")
+                    
+                except Exception as e:
+                    self.print_to_log_file(f"[MP] Warning: Could not read result for epoch {sp.epoch}: {e}")
+                    completed_results.append({
+                        'success': False,
+                        'error': f'Could not read result file: {e}',
+                        'epoch': sp.epoch,
+                        '_subprocess_info': {
+                            'epoch': sp.epoch,
+                            'gpu_id': sp.gpu_id,
+                            'temp_ckpt_path': sp.temp_ckpt_path,
+                            'result_path': sp.result_path,
+                        },
+                    })
+                    
+            elif not sp.process.is_alive():
+                # Process finished but no result file - crashed
+                self.print_to_log_file(f"[MP] Warning: Epoch {sp.epoch} subprocess crashed without result file")
+                sp.process.join()  # Clean up
+                completed_results.append({
+                    'success': False,
+                    'error': 'Process finished without result file (likely crashed)',
+                    'epoch': sp.epoch,
+                    '_subprocess_info': {
+                        'epoch': sp.epoch,
+                        'gpu_id': sp.gpu_id,
+                        'temp_ckpt_path': sp.temp_ckpt_path,
+                        'result_path': sp.result_path,
+                    },
+                })
+            else:
+                # Still running
+                still_running.append(sp)
+        
+        # Update running list
+        self._running_subprocesses = still_running
+        
+        return completed_results
+
+    def _process_pending_eval_checkpoints(self, test_keys: list = None) -> int:
+        """
+        Process pending evaluation checkpoints when subprocess slots become available.
+        
+        This handles the case where checkpoints were queued because all subprocess
+        slots were full at the time of evaluation.
+        
+        Args:
+            test_keys: List of test sample keys (if None, will be fetched from dataloader)
+            
+        Returns:
+            Number of pending checkpoints that were spawned
+        """
+        if not self._pending_eval_checkpoints:
+            return 0
+        
+        if not ASYNC_TEST_EVAL:
+            # Clear pending queue if async eval is disabled
+            self._pending_eval_checkpoints.clear()
+            return 0
+        
+        spawned_count = 0
+        
+        # Get test keys if not provided
+        if test_keys is None and hasattr(self, '_dl_val') and self._dl_val is not None:
+            test_keys = list(self._dl_val._data.identifiers)
+        
+        # Process pending checkpoints while slots are available
+        while (self._pending_eval_checkpoints and 
+               len(self._running_subprocesses) < self._max_concurrent_subprocesses):
+            
+            epoch, pending_temp_ckpt_path = self._pending_eval_checkpoints.pop(0)
+            
+            # Check if the temp checkpoint still exists
+            if not isfile(pending_temp_ckpt_path):
+                self.print_to_log_file(f"[MP] Pending checkpoint for epoch {epoch} no longer exists, skipping")
+                continue
+            
+            # Get an available GPU
+            gpu_id = self._get_available_gpu()
+            if gpu_id is None:
+                # No GPU available, put it back and stop
+                self._pending_eval_checkpoints.insert(0, (epoch, pending_temp_ckpt_path))
+                self.print_to_log_file(f"[MP] No GPU available for pending epoch {epoch}, will retry later")
+                break
+            
+            self.print_to_log_file(f"[MP] Processing pending evaluation for epoch {epoch} on GPU {gpu_id}")
+            
+            # Spawn the subprocess using the existing temp checkpoint
+            result_path = self._get_async_result_path(epoch)
+            if isfile(result_path):
+                os.remove(result_path)
+            
+            eval_config = {
+                'patch_size': list(self.configuration_manager.patch_size),
+                'step_size': self.sliding_window_step_size,
+                'simulate_perfect_anatomy': self.simulate_perfect_anatomy,
+                'max_patches_per_sample': self.test_max_patches_per_sample,
+                'current_epoch': epoch,
+                'enable_deep_supervision': self.enable_deep_supervision,
+                'timeout_hours': ASYNC_EVAL_TIMEOUT_HOURS,
+                'temp_ckpt_path': pending_temp_ckpt_path,
+            }
+            
+            plans_identifier = self.plans_manager.plans_name
+            ctx = mp.get_context('spawn')
+            original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+            
+            try:
+                os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+                
+                process = ctx.Process(
+                    target=_async_test_eval_worker,
+                    kwargs={
+                        'temp_ckpt_path': pending_temp_ckpt_path,
+                        'result_path': result_path,
+                        'preprocessed_folder': self.preprocessed_dataset_folder,
+                        'test_keys': list(test_keys) if test_keys else [],
+                        'top_k_dices': list(self.top_k_dices),
+                        'top_k_checkpoints': self.top_k_checkpoints,
+                        'output_folder': self.output_folder,
+                        'plans_identifier': plans_identifier,
+                        'eval_config': eval_config,
+                        'gpu_id': gpu_id,
+                    },
+                    daemon=True
+                )
+                
+                process.start()
+                
+                sp_info = SubprocessInfo(
+                    process=process,
+                    pid=process.pid,
+                    epoch=epoch,
+                    gpu_id=gpu_id,
+                    result_path=result_path,
+                    temp_ckpt_path=pending_temp_ckpt_path,
+                    start_time=time.time()
+                )
+                self._running_subprocesses.append(sp_info)
+                spawned_count += 1
+                
+                self.print_to_log_file(f"[MP] Spawned pending eval for epoch {epoch} (PID: {process.pid}, GPU: {gpu_id})")
+                
+            finally:
+                if original_cuda_visible is not None:
+                    os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible
+                elif 'CUDA_VISIBLE_DEVICES' in os.environ:
+                    del os.environ['CUDA_VISIBLE_DEVICES']
+        
+        if spawned_count > 0:
+            self.print_to_log_file(f"[MP] Processed {spawned_count} pending evaluation(s), "
+                                   f"{len(self._pending_eval_checkpoints)} still pending")
+        
+        return spawned_count
+    
+    def _process_subprocess_result(self, result: dict) -> None:
+        """
+        Process a completed subprocess result.
+        
+        The MAIN PROCESS handles ALL checkpoint management:
+        - Determine if result qualifies for top-k
+        - Save/rename checkpoints as needed
+        - Update top_k_dices list
+        - Clean up temp files
+        
+        Args:
+            result: Result dict from subprocess, including '_subprocess_info'
+        """
+        sp_info = result.get('_subprocess_info', {})
+        epoch = result.get('epoch', sp_info.get('epoch', -1))
+        temp_ckpt_path = result.get('temp_ckpt_path', sp_info.get('temp_ckpt_path'))
+        result_path = sp_info.get('result_path')
+        result_timestamp = result.get('timestamp', 0)
+        vis_folder_path = result.get('vis_folder_path')  # Visualization folder from subprocess
+        
+        # Handle failure
+        if not result.get('success', False):
+            error_msg = result.get('error', 'Unknown error')
+            self.print_to_log_file(f"[MP] Epoch {epoch} evaluation FAILED: {error_msg}")
+            
+            # Log additional failure details
+            if 'total_samples' in result:
+                self.print_to_log_file(f"[MP]   Total samples: {result['total_samples']}")
+            if 'processed_samples' in result:
+                self.print_to_log_file(f"[MP]   Processed before failure: {result['processed_samples']}")
+            if 'traceback' in result:
+                self.print_to_log_file(f"[MP] Traceback:\n{result['traceback']}")
+            
+            # Cleanup temp files and vis folder
+            self._cleanup_subprocess_files(temp_ckpt_path, result_path, vis_folder_path)
+            
+            # Raise error to stop main process if configured
+            if ASYNC_EVAL_EXIT_ON_FAILURE:
+                raise RuntimeError(
+                    f"Test set evaluation failed (epoch {epoch}): {error_msg}. "
+                    f"Set ASYNC_EVAL_EXIT_ON_FAILURE=False to continue training despite evaluation failures."
+                )
+            return
+        
+        # Success case
+        tumor_dice = result.get('tumor_dice', 0)
+        has_failures = result.get('has_failures', False)
+        
+        self.print_to_log_file(f"\n[MP] Epoch {epoch} evaluation complete:")
+        self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+        self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
+        
+        if has_failures:
+            self.print_to_log_file(f"  ⚠ {result.get('failed_samples', 0)} samples failed during evaluation")
+        
+        # =====================================================================
+        # CHECKPOINT MANAGEMENT (main process only)
+        # =====================================================================
+        # Only process if this result is newer than our last update
+        if result_timestamp <= self._last_checkpoint_update_timestamp:
+            self.print_to_log_file(f"  → Skipping checkpoint update (result timestamp older than last update)")
+            self._cleanup_subprocess_files(temp_ckpt_path, result_path, vis_folder_path)
+            return
+        
+        # Determine rank for this dice
+        achieved_rank = 0
+        for i, (dice, _) in enumerate(self.top_k_dices):
+            if tumor_dice > dice:
+                achieved_rank = i + 1
+                break
+        if achieved_rank == 0 and len(self.top_k_dices) < self.top_k_checkpoints:
+            achieved_rank = len(self.top_k_dices) + 1
+        
+        plans_identifier = self.plans_manager.plans_name
+        
+        if achieved_rank > 0 and temp_ckpt_path and isfile(temp_ckpt_path):
+            # This checkpoint qualifies for top-k!
+            self.print_to_log_file(f"  → Achieved rank {achieved_rank}!")
+            
+            # Shift existing checkpoints and their vis folders down
+            for rank in range(min(len(self.top_k_dices), self.top_k_checkpoints - 1), achieved_rank - 1, -1):
+                src_name = f"checkpoint_best_{plans_identifier}.pth" if rank == 1 else f"checkpoint_best_{plans_identifier}.pth.{rank}"
+                dst_name = f"checkpoint_best_{plans_identifier}.pth.{rank + 1}"
+                src_path = join(self.output_folder, src_name)
+                dst_path = join(self.output_folder, dst_name)
+                if isfile(src_path):
+                    try:
+                        os.rename(src_path, dst_path)
+                    except Exception as e:
+                        self.print_to_log_file(f"[MP] Warning: Could not rename {src_name} to {dst_name}: {e}")
+                
+                # Also shift vis folders
+                vis_src_name = f"vis_best_{plans_identifier}" if rank == 1 else f"vis_best_{plans_identifier}.{rank}"
+                vis_dst_name = f"vis_best_{plans_identifier}.{rank + 1}"
+                vis_src_path = join(self.output_folder, vis_src_name)
+                vis_dst_path = join(self.output_folder, vis_dst_name)
+                if os.path.isdir(vis_src_path):
+                    try:
+                        os.rename(vis_src_path, vis_dst_path)
+                    except Exception as e:
+                        self.print_to_log_file(f"[MP] Warning: Could not rename vis folder {vis_src_name} to {vis_dst_name}: {e}")
+            
+            # Remove old last rank checkpoint and vis folder if list was full
+            if len(self.top_k_dices) >= self.top_k_checkpoints:
+                last_name = f"checkpoint_best_{plans_identifier}.pth.{self.top_k_checkpoints}"
+                last_path = join(self.output_folder, last_name)
+                if isfile(last_path):
+                    try:
+                        os.remove(last_path)
+                    except:
+                        pass
+                
+                # Also remove the vis folder for the bumped-out checkpoint
+                last_vis_name = f"vis_best_{plans_identifier}.{self.top_k_checkpoints}"
+                last_vis_path = join(self.output_folder, last_vis_name)
+                if os.path.isdir(last_vis_path):
+                    try:
+                        import shutil
+                        shutil.rmtree(last_vis_path)
+                    except:
+                        pass
+            
+            # Load temp checkpoint and add dice info
+            checkpoint = torch.load(temp_ckpt_path, map_location='cpu', weights_only=False)
+            checkpoint['_best_dice'] = tumor_dice
+            checkpoint['_best_ema'] = tumor_dice
+            
+            # Save to final rank position
+            ckpt_name = f"checkpoint_best_{plans_identifier}.pth" if achieved_rank == 1 else f"checkpoint_best_{plans_identifier}.pth.{achieved_rank}"
+            ckpt_path = join(self.output_folder, ckpt_name)
+            torch.save(checkpoint, ckpt_path)
+            
+            self.print_to_log_file(f"  → Saved checkpoint: {ckpt_name}")
+            
+            # Rename vis folder to match checkpoint (if exists)
+            if vis_folder_path and os.path.isdir(vis_folder_path):
+                final_vis_name = f"vis_best_{plans_identifier}" if achieved_rank == 1 else f"vis_best_{plans_identifier}.{achieved_rank}"
+                final_vis_path = join(self.output_folder, final_vis_name)
+                try:
+                    # Remove target if it exists (from previous runs)
+                    if os.path.isdir(final_vis_path):
+                        import shutil
+                        shutil.rmtree(final_vis_path)
+                    os.rename(vis_folder_path, final_vis_path)
+                    self.print_to_log_file(f"  → Saved visualization folder: {final_vis_name}")
+                    vis_folder_path = None  # Mark as handled, don't cleanup later
+                except Exception as e:
+                    self.print_to_log_file(f"[MP] Warning: Could not rename vis folder: {e}")
+            
+            # Update top_k_dices
+            self.top_k_dices.insert(achieved_rank - 1, (tumor_dice, epoch))
+            if len(self.top_k_dices) > self.top_k_checkpoints:
+                self.top_k_dices = self.top_k_dices[:self.top_k_checkpoints]
+            
+            # Update best dice if rank 1
+            if achieved_rank == 1:
+                self._best_dice = tumor_dice
+                self._best_ema = tumor_dice
+            
+            # Update timestamp
+            self._last_checkpoint_update_timestamp = result_timestamp
+            
+        else:
+            self.print_to_log_file(f"  → Did not qualify for top-{self.top_k_checkpoints}")
+        
+        # Log current top-k dices
+        self._log_top_k_dices()
+        
+        # Cache results
+        self._last_eval_results = {
+            'dice_per_class': result.get('dice_per_class', []),
+            'recall_per_class': result.get('recall_per_class', []),
+            'precision_per_class': result.get('precision_per_class', []),
+            'f1_per_class': result.get('f1_per_class', []),
+            'fpr_per_class': result.get('fpr_per_class', []),
+            'loss': 0.0,
+        }
+        self._last_eval_epoch = epoch
+        
+        # Cleanup temp files (vis_folder_path is None if it was already renamed/saved)
+        self._cleanup_subprocess_files(temp_ckpt_path, result_path, vis_folder_path)
+    
+    def _cleanup_subprocess_files(
+        self, 
+        temp_ckpt_path: Optional[str], 
+        result_path: Optional[str],
+        vis_folder_path: Optional[str] = None
+    ) -> None:
+        """Clean up temp checkpoint, result file, and visualization folder from a subprocess."""
+        if temp_ckpt_path and isfile(temp_ckpt_path):
+            try:
+                os.remove(temp_ckpt_path)
+                self.print_to_log_file(f"[MP] Cleaned up temp checkpoint: {os.path.basename(temp_ckpt_path)}")
+            except Exception as e:
+                self.print_to_log_file(f"[MP] Warning: Could not remove temp checkpoint: {e}")
+        
+        if result_path and isfile(result_path):
+            try:
+                os.remove(result_path)
+            except:
+                pass
+        
+        # Clean up visualization folder if not needed (didn't qualify for top-k)
+        if vis_folder_path and os.path.isdir(vis_folder_path):
+            try:
+                import shutil
+                shutil.rmtree(vis_folder_path)
+                self.print_to_log_file(f"[MP] Cleaned up temp vis folder: {os.path.basename(vis_folder_path)}")
+            except Exception as e:
+                self.print_to_log_file(f"[MP] Warning: Could not remove temp vis folder: {e}")
+    
+    def _log_top_k_dices(self) -> None:
+        """Log the current top-k dices."""
+        if self.top_k_dices:
+            top_k_str = ", ".join([f"#{i+1}: {d:.4f} (ep{e})" for i, (d, e) in enumerate(self.top_k_dices)])
+            self.print_to_log_file(f"  → Current top-{self.top_k_checkpoints}: [{top_k_str}]")
+        else:
+            self.print_to_log_file(f"  → No checkpoints in top-{self.top_k_checkpoints} yet")
+    
+    def _wait_for_subprocess_slot(self, timeout_minutes: float = 60) -> bool:
+        """
+        Wait until a subprocess slot becomes available.
+        
+        While waiting, also save any pending checkpoints from completed subprocesses.
+        
+        Args:
+            timeout_minutes: Max time to wait in minutes
+            
+        Returns:
+            True if a slot is available, False if timeout
+        """
+        timeout_seconds = timeout_minutes * 60
+        start_time = time()
+        poll_interval = 10  # seconds
+        
+        while len(self._running_subprocesses) >= self._max_concurrent_subprocesses:
+            elapsed = time() - start_time
+            if elapsed >= timeout_seconds:
+                self.print_to_log_file(f"[MP] WARNING: Timed out waiting for subprocess slot after {timeout_minutes} min")
+                return False
+            
+            # Poll for completed subprocesses
+            completed_results = self._poll_running_subprocesses()
+            for result in completed_results:
+                self._process_subprocess_result(result)
+            
+            if len(self._running_subprocesses) < self._max_concurrent_subprocesses:
+                break
+            
+            # Log waiting status
+            if int(elapsed) % 60 == 0 and elapsed > 0:
+                self.print_to_log_file(f"[MP] Waiting for subprocess slot... ({int(elapsed/60)} min elapsed, "
+                                       f"{len(self._running_subprocesses)} running)")
+            
+            sleep(poll_interval)
+        
+        return True
     
     def _spawn_async_test_eval(self, epoch: int, test_keys: List[str]) -> bool:
         """
         Spawn a subprocess for async test evaluation.
         
-        IMPORTANT: Only one subprocess can run at a time. If there's already
-        a running subprocess, this method will WAIT for it to complete first.
+        Supports multiple concurrent subprocesses (up to MAX_CONCURRENT_SUBPROCESSES).
+        If all slots are full, waits for a slot to become available.
         
         Args:
             epoch: Current epoch number
@@ -2390,12 +1275,37 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         if not ASYNC_TEST_EVAL:
             return False
         
-        # Check if there's already a running subprocess - if so, wait for it
-        if self._async_eval_process is not None and self._async_eval_process.is_alive():
-            self.print_to_log_file(f"[MP] Previous eval still running (epoch {self._async_eval_epoch}), waiting...")
-            result = self._wait_for_async_eval(timeout=ASYNC_EVAL_TIMEOUT)
-            if result:
-                self._handle_async_eval_result(result)
+        # Validate that backup_gpu_ids is set - required for async evaluation
+        if not self.backup_gpu_ids:
+            raise RuntimeError(
+                "ASYNC_TEST_EVAL is enabled but --backup_gpu_ids is not set!\n"
+                "You MUST specify backup GPUs for async test evaluation to avoid OOM errors.\n"
+                "Example: --backup_gpu_ids \"1,2\" (comma-separated GPU IDs)\n"
+                "The backup GPUs should be DIFFERENT from --main_gpu_id to avoid competition.\n"
+                "Alternatively, set ASYNC_TEST_EVAL = False in tuning_set_trainer/constants.py "
+                "to use synchronous evaluation (blocks training during test eval)."
+            )
+        
+        # First, poll for any completed subprocesses and process their results
+        completed_results = self._poll_running_subprocesses()
+        for result in completed_results:
+            self._process_subprocess_result(result)
+        
+        # Check if we need to wait for a slot
+        if len(self._running_subprocesses) >= self._max_concurrent_subprocesses:
+            self.print_to_log_file(f"[MP] All {self._max_concurrent_subprocesses} subprocess slots in use, waiting...")
+            if not self._wait_for_subprocess_slot(timeout_minutes=60):
+                self.print_to_log_file(f"[MP] WARNING: Could not get subprocess slot, queuing epoch {epoch} for later")
+                # Add to pending queue - we'll process it later
+                temp_ckpt_path = self._save_temp_eval_checkpoint(epoch)
+                self._pending_eval_checkpoints.append((epoch, temp_ckpt_path))
+                return False
+        
+        # Get an available GPU
+        gpu_id = self._get_available_gpu()
+        if gpu_id is None and self.backup_gpu_ids:
+            # This shouldn't happen if _wait_for_subprocess_slot worked correctly
+            self.print_to_log_file(f"[MP] WARNING: No available GPU despite having slot")
         
         # Save temporary checkpoint
         self.print_to_log_file(f"[MP] Saving temp checkpoint for epoch {epoch}...")
@@ -2416,8 +1326,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             'max_patches_per_sample': self.test_max_patches_per_sample,
             'current_epoch': epoch,
             'enable_deep_supervision': self.enable_deep_supervision,
-            'min_success_rate': ASYNC_EVAL_MIN_SUCCESS_RATE,  # Minimum sample success rate
-            'timeout_minutes': ASYNC_EVAL_TIMEOUT_MINUTES,  # Max time before timeout
+            'timeout_hours': ASYNC_EVAL_TIMEOUT_HOURS,  # 4 hour hard timeout
+            'temp_ckpt_path': temp_ckpt_path,  # For result reporting
         }
         
         # Get plans identifier for checkpoint naming
@@ -2439,7 +1349,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         #
         # This ensures:
         # - Parent process continues using its original GPU
-        # - Subprocess uses the configured GPU (ASYNC_EVAL_GPU_ID)
+        # - Subprocess uses the configured GPU
         # =====================================================================
         
         ctx = mp.get_context('spawn')
@@ -2448,8 +1358,8 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
         
         # Determine which GPU to use for subprocess:
-        # Priority: self.backup_gpu_id > ASYNC_EVAL_GPU_ID > None (same as main)
-        subprocess_gpu_id = self.backup_gpu_id if self.backup_gpu_id is not None else ASYNC_EVAL_GPU_ID
+        # Priority: gpu_id from _get_available_gpu > ASYNC_EVAL_GPU_ID > None (same as main)
+        subprocess_gpu_id = gpu_id if gpu_id is not None else ASYNC_EVAL_GPU_ID
         
         try:
             # Set CUDA_VISIBLE_DEVICES for subprocess if configured
@@ -2462,15 +1372,15 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # Create and start the subprocess
             # Note: The subprocess inherits CUDA_VISIBLE_DEVICES at this moment
             # daemon=True: subprocess will be automatically killed if main process exits/crashes
-            self._async_eval_process = ctx.Process(
+            process = ctx.Process(
                 target=_async_test_eval_worker,
                 kwargs={
                     'temp_ckpt_path': temp_ckpt_path,
                     'result_path': result_path,
                     'preprocessed_folder': self.preprocessed_dataset_folder,
                     'test_keys': list(test_keys),  # Ensure it's a plain list for pickling
-                    'top_k_dices': list(self.top_k_dices),  # Copy to avoid race conditions
-                    'top_k_checkpoints': self.top_k_checkpoints,
+                    'top_k_dices': list(self.top_k_dices),  # Copy for subprocess reference (not used for saving)
+                    'top_k_checkpoints': self.top_k_checkpoints,  # For subprocess reference
                     'output_folder': self.output_folder,
                     'plans_identifier': plans_identifier,
                     'eval_config': eval_config,
@@ -2479,9 +1389,24 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 daemon=True  # Auto-terminate if main process exits
             )
             
+            process.start()
+            
+            # Track this subprocess using SubprocessInfo
+            sp_info = SubprocessInfo(
+                process=process,
+                pid=process.pid,  # Get PID after process.start()
+                epoch=epoch,
+                gpu_id=subprocess_gpu_id if subprocess_gpu_id is not None else -1,  # -1 for same as main
+                result_path=result_path,
+                temp_ckpt_path=temp_ckpt_path,
+                start_time=time()
+            )
+            self._running_subprocesses.append(sp_info)
+            
+            # Also update legacy variables for backward compatibility
+            self._async_eval_process = process
             self._async_eval_epoch = epoch
             self._async_eval_result_path = result_path
-            self._async_eval_process.start()
             
         finally:
             # CRITICAL: Restore parent's CUDA_VISIBLE_DEVICES immediately after spawn
@@ -2490,249 +1415,302 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible
             elif subprocess_gpu_id is not None:
                 # Original was not set, but we modified it - remove the modification
-                del os.environ['CUDA_VISIBLE_DEVICES']
+                if 'CUDA_VISIBLE_DEVICES' in os.environ:
+                    del os.environ['CUDA_VISIBLE_DEVICES']
         
-        self.print_to_log_file(f"[MP] Spawned test eval subprocess for epoch {epoch} (PID: {self._async_eval_process.pid})")
+        self.print_to_log_file(f"[MP] Spawned test eval subprocess for epoch {epoch} (PID: {process.pid}, GPU: {subprocess_gpu_id})")
+        self.print_to_log_file(f"[MP] Currently {len(self._running_subprocesses)} subprocess(es) running")
         
         return True
     
-    def _check_async_eval_result(self) -> Optional[dict]:
-        """
-        Non-blocking check for completed async evaluation result.
+    """DEPRECATED ALERT START
+    The below functions are only used in the logic when we have only one subprocess and wait for their result in training
+    """
+    # def _check_async_eval_result(self) -> Optional[dict]:
+    #     """
+    #     Non-blocking check for completed async evaluation result.
         
-        Returns:
-            Result dict if evaluation completed, None otherwise
-        """
-        if self._async_eval_process is None:
-            return None
+    #     Returns:
+    #         Result dict if evaluation completed, None otherwise
+    #     """
+    #     if self._async_eval_process is None:
+    #         return None
         
-        # Check if result file exists
-        if self._async_eval_result_path and isfile(self._async_eval_result_path):
-            try:
-                with open(self._async_eval_result_path, 'r') as f:
-                    result = json.load(f)
+    #     # Check if result file exists
+    #     if self._async_eval_result_path and isfile(self._async_eval_result_path):
+    #         try:
+    #             with open(self._async_eval_result_path, 'r') as f:
+    #                 result = json.load(f)
                 
-                # Wait for process to fully terminate
-                self._async_eval_process.join(timeout=5)
+    #             # Wait for process to fully terminate
+    #             self._async_eval_process.join(timeout=5)
                 
-                return result
-            except Exception as e:
-                self.print_to_log_file(f"[MP] Warning: Could not read result: {e}")
-                return None
+    #             return result
+    #         except Exception as e:
+    #             self.print_to_log_file(f"[MP] Warning: Could not read result: {e}")
+    #             return None
         
-        # Check if process is still alive
-        if not self._async_eval_process.is_alive():
-            # Process finished but no result file - something went wrong
-            self.print_to_log_file(f"[MP] Warning: Process finished without result file")
-            self._async_eval_process.join()
-            return {'success': False, 'error': 'Process finished without result', 'epoch': self._async_eval_epoch}
+    #     # Check if process is still alive
+    #     if not self._async_eval_process.is_alive():
+    #         # Process finished but no result file - something went wrong
+    #         self.print_to_log_file(f"[MP] Warning: Process finished without result file")
+    #         self._async_eval_process.join()
+    #         return {'success': False, 'error': 'Process finished without result', 'epoch': self._async_eval_epoch}
         
-        return None
+    #     return None
     
-    def _wait_for_async_eval(self, timeout: float = None) -> Optional[dict]:
-        """
-        Blocking wait for async evaluation to complete.
+    # def _wait_for_async_eval(self, timeout: float = None) -> Optional[dict]:
+    #     """
+    #     Blocking wait for async evaluation to complete.
         
-        Args:
-            timeout: Max seconds to wait (None = use ASYNC_EVAL_TIMEOUT)
+    #     Args:
+    #         timeout: Max seconds to wait (None = use ASYNC_EVAL_TIMEOUT)
             
-        Returns:
-            Result dict if evaluation completed, None if timeout/error
-        """
-        if self._async_eval_process is None:
-            return None
+    #     Returns:
+    #         Result dict if evaluation completed, None if timeout/error
+    #     """
+    #     if self._async_eval_process is None:
+    #         return None
         
-        if timeout is None:
-            timeout = ASYNC_EVAL_TIMEOUT
+    #     if timeout is None:
+    #         timeout = ASYNC_EVAL_TIMEOUT
         
-        self.print_to_log_file(f"[MP] Waiting for epoch {self._async_eval_epoch} evaluation (timeout: {timeout}s)...")
+    #     self.print_to_log_file(f"[MP] Waiting for epoch {self._async_eval_epoch} evaluation (timeout: {timeout}s)...")
         
-        # Wait for process to complete
-        self._async_eval_process.join(timeout=timeout)
+    #     # Wait for process to complete
+    #     self._async_eval_process.join(timeout=timeout)
         
-        if self._async_eval_process.is_alive():
-            # Timeout - kill the process
-            self.print_to_log_file(f"[MP] WARNING: Evaluation timed out after {timeout}s, terminating...")
-            self._async_eval_process.terminate()
-            self._async_eval_process.join(timeout=5)
-            if self._async_eval_process.is_alive():
-                self._async_eval_process.kill()
-            return {
-                'success': False, 
-                'error': f'Evaluation timed out after {timeout}s and was terminated',
-                'epoch': self._async_eval_epoch
-            }
+    #     if self._async_eval_process.is_alive():
+    #         # Timeout - kill the process
+    #         self.print_to_log_file(f"[MP] WARNING: Evaluation timed out after {timeout}s, terminating...")
+    #         self._async_eval_process.terminate()
+    #         self._async_eval_process.join(timeout=5)
+    #         if self._async_eval_process.is_alive():
+    #             self._async_eval_process.kill()
+    #         return {
+    #             'success': False, 
+    #             'error': f'Evaluation timed out after {timeout}s and was terminated',
+    #             'epoch': self._async_eval_epoch
+    #         }
         
-        # Check for result
-        if self._async_eval_result_path and isfile(self._async_eval_result_path):
-            try:
-                with open(self._async_eval_result_path, 'r') as f:
-                    return json.load(f)
-            except Exception as e:
-                self.print_to_log_file(f"[MP] Warning: Could not read result: {e}")
-                return {
-                    'success': False,
-                    'error': f'Could not read result file: {e}',
-                    'epoch': self._async_eval_epoch
-                }
+    #     # Check for result
+    #     if self._async_eval_result_path and isfile(self._async_eval_result_path):
+    #         try:
+    #             with open(self._async_eval_result_path, 'r') as f:
+    #                 return json.load(f)
+    #         except Exception as e:
+    #             self.print_to_log_file(f"[MP] Warning: Could not read result: {e}")
+    #             return {
+    #                 'success': False,
+    #                 'error': f'Could not read result file: {e}',
+    #                 'epoch': self._async_eval_epoch
+    #             }
         
-        # Process finished but no result file
-        return {
-            'success': False,
-            'error': 'Process finished without writing result file (likely crashed)',
-            'epoch': self._async_eval_epoch
-        }
+    #     # Process finished but no result file
+    #     return {
+    #         'success': False,
+    #         'error': 'Process finished without writing result file (likely crashed)',
+    #         'epoch': self._async_eval_epoch
+    #     }
     
-    def _handle_async_eval_result(self, result: dict) -> None:
-        """
-        Handle the result from async evaluation.
+    # def _handle_async_eval_result(self, result: dict) -> None:
+    #     """
+    #     Handle the result from async evaluation.
         
-        Updates:
-        - top_k_dices list (if subprocess saved a new checkpoint)
-        - Last eval results cache
-        - Cleanup temp files
+    #     Updates:
+    #     - top_k_dices list (if subprocess saved a new checkpoint)
+    #     - Last eval results cache
+    #     - Cleanup temp files
         
-        IMPORTANT: To ensure consistency, we re-scan checkpoint files after
-        the subprocess saves. This handles race conditions where the subprocess
-        might have saved/renamed checkpoints.
+    #     IMPORTANT: To ensure consistency, we re-scan checkpoint files after
+    #     the subprocess saves. This handles race conditions where the subprocess
+    #     might have saved/renamed checkpoints.
         
-        Raises:
-            RuntimeError: If evaluation failed and ASYNC_EVAL_EXIT_ON_FAILURE is True
-        """
-        epoch = result.get('epoch', self._async_eval_epoch)
+    #     Raises:
+    #         RuntimeError: If evaluation failed and ASYNC_EVAL_EXIT_ON_FAILURE is True
+    #     """
+    #     epoch = result.get('epoch', self._async_eval_epoch)
         
-        if not result.get('success', False):
-            error_msg = result.get('error', 'Unknown error')
-            self.print_to_log_file(f"[MP] Epoch {epoch} evaluation FAILED: {error_msg}")
+    #     if not result.get('success', False):
+    #         error_msg = result.get('error', 'Unknown error')
+    #         self.print_to_log_file(f"[MP] Epoch {epoch} evaluation FAILED: {error_msg}")
             
-            # Log additional failure details
-            if 'total_samples' in result:
-                self.print_to_log_file(f"[MP]   Total samples: {result['total_samples']}")
-            if 'successful_samples' in result:
-                self.print_to_log_file(f"[MP]   Successful samples: {result['successful_samples']}")
-            if 'success_rate' in result:
-                self.print_to_log_file(f"[MP]   Success rate: {result['success_rate']*100:.1f}%")
-            if 'failed_samples' in result:
-                failed = result['failed_samples']
-                self.print_to_log_file(f"[MP]   Failed samples ({len(failed)}): {failed[:5]}{'...' if len(failed) > 5 else ''}")
-            if 'traceback' in result:
-                self.print_to_log_file(f"[MP] Traceback:\n{result['traceback']}")
+    #         # Log additional failure details
+    #         if 'total_samples' in result:
+    #             self.print_to_log_file(f"[MP]   Total samples: {result['total_samples']}")
+    #         if 'successful_samples' in result:
+    #             self.print_to_log_file(f"[MP]   Successful samples: {result['successful_samples']}")
+    #         if 'success_rate' in result:
+    #             self.print_to_log_file(f"[MP]   Success rate: {result['success_rate']*100:.1f}%")
+    #         if 'failed_samples' in result:
+    #             failed = result['failed_samples']
+    #             self.print_to_log_file(f"[MP]   Failed samples ({len(failed)}): {failed[:5]}{'...' if len(failed) > 5 else ''}")
+    #         if 'traceback' in result:
+    #             self.print_to_log_file(f"[MP] Traceback:\n{result['traceback']}")
             
-            # Cleanup temp files before potentially raising
-            self._cleanup_temp_checkpoint(epoch)
+    #         # Cleanup temp files before potentially raising
+    #         self._cleanup_temp_checkpoint(epoch)
             
-            # Reset state
-            self._async_eval_process = None
-            self._async_eval_epoch = -1
-            self._async_eval_result_path = None
+    #         # Reset state
+    #         self._async_eval_process = None
+    #         self._async_eval_epoch = -1
+    #         self._async_eval_result_path = None
             
-            # Raise error to stop main process if configured
-            if ASYNC_EVAL_EXIT_ON_FAILURE:
-                raise RuntimeError(
-                    f"Test set evaluation failed (epoch {epoch}): {error_msg}. "
-                    f"Set ASYNC_EVAL_EXIT_ON_FAILURE=False to continue training despite evaluation failures."
-                )
-            return
+    #         # Raise error to stop main process if configured
+    #         if ASYNC_EVAL_EXIT_ON_FAILURE:
+    #             raise RuntimeError(
+    #                 f"Test set evaluation failed (epoch {epoch}): {error_msg}. "
+    #                 f"Set ASYNC_EVAL_EXIT_ON_FAILURE=False to continue training despite evaluation failures."
+    #             )
+    #         return
         
-        # Success case - log sample success rate and handle unreliable results
-        tumor_dice = result.get('tumor_dice', 0)
-        achieved_rank = result.get('achieved_rank', 0)
-        checkpoint_saved = result.get('checkpoint_saved', None)
-        is_unreliable = result.get('unreliable', False)
-        timed_out = result.get('timed_out', False)
+    #     # Success case - log sample success rate and handle unreliable results
+    #     tumor_dice = result.get('tumor_dice', 0)
+    #     achieved_rank = result.get('achieved_rank', 0)
+    #     checkpoint_saved = result.get('checkpoint_saved', None)
+    #     is_unreliable = result.get('unreliable', False)
+    #     timed_out = result.get('timed_out', False)
         
-        self.print_to_log_file(f"[MP] Epoch {epoch} evaluation complete:")
+    #     self.print_to_log_file(f"[MP] Epoch {epoch} evaluation complete:")
         
-        # Log timeout and sample statistics
-        if timed_out:
-            self.print_to_log_file(f"  ⚠ TIMED OUT after {ASYNC_EVAL_TIMEOUT_MINUTES} min")
-            self.print_to_log_file(f"  Skipped {result.get('skipped_samples', 0)} samples due to timeout")
+    #     # Log timeout and sample statistics
+    #     if timed_out:
+    #         self.print_to_log_file(f"  ⚠ TIMED OUT after {ASYNC_EVAL_TIMEOUT_MINUTES} min")
+    #         self.print_to_log_file(f"  Skipped {result.get('skipped_samples', 0)} samples due to timeout")
         
-        if 'success_rate' in result:
-            attempted = result.get('attempted_samples', result.get('total_samples', '?'))
-            successful = result.get('successful_samples', '?')
-            total = result.get('total_samples', '?')
-            self.print_to_log_file(f"  Sample success rate: {result['success_rate']*100:.1f}% ({successful}/{attempted} attempted, {total} total)")
+    #     if 'success_rate' in result:
+    #         attempted = result.get('attempted_samples', result.get('total_samples', '?'))
+    #         successful = result.get('successful_samples', '?')
+    #         total = result.get('total_samples', '?')
+    #         self.print_to_log_file(f"  Sample success rate: {result['success_rate']*100:.1f}% ({successful}/{attempted} attempted, {total} total)")
         
-        # Handle unreliable results
-        if is_unreliable:
-            warning_msg = result.get('warning', 'Low sample success rate')
-            self.print_to_log_file(f"  ⚠ UNRELIABLE METRICS: {warning_msg}")
-            self.print_to_log_file(f"  → Metrics computed but may not be representative")
-            self.print_to_log_file(f"  → Skipping checkpoint save for this epoch")
-            # For unreliable results, we log the dice but don't save checkpoints
-            if 'dice_per_class' in result:
-                self.print_to_log_file(f"  Dice per class (unreliable): {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
-            # Cleanup and return without checkpoint operations
-            self._cleanup_temp_checkpoint(epoch)
-            self._async_eval_process = None
-            self._async_eval_epoch = -1
-            self._async_eval_result_path = None
-            return
+    #     # Handle unreliable results
+    #     if is_unreliable:
+    #         warning_msg = result.get('warning', 'Low sample success rate')
+    #         self.print_to_log_file(f"  ⚠ UNRELIABLE METRICS: {warning_msg}")
+    #         self.print_to_log_file(f"  → Metrics computed but may not be representative")
+    #         self.print_to_log_file(f"  → Skipping checkpoint save for this epoch")
+    #         # For unreliable results, we log the dice but don't save checkpoints
+    #         if 'dice_per_class' in result:
+    #             self.print_to_log_file(f"  Dice per class (unreliable): {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
+    #         # Cleanup and return without checkpoint operations
+    #         self._cleanup_temp_checkpoint(epoch)
+    #         self._async_eval_process = None
+    #         self._async_eval_epoch = -1
+    #         self._async_eval_result_path = None
+    #         return
         
-        self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
-        self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
+    #     self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+    #     self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in result.get('dice_per_class', [])]}")
         
-        if achieved_rank > 0:
-            self.print_to_log_file(f"  → Achieved rank {achieved_rank}! Checkpoint: {checkpoint_saved}")
+    #     if achieved_rank > 0:
+    #         self.print_to_log_file(f"  → Achieved rank {achieved_rank}! Checkpoint: {checkpoint_saved}")
             
-            # Re-scan checkpoint files to ensure consistency
-            # The subprocess has modified checkpoint files, so we need to
-            # refresh our view of the top-k list from disk
-            self.print_to_log_file(f"  → Re-scanning top-k checkpoints from disk for consistency...")
-            self.top_k_dices = self._scan_existing_top_k_checkpoints()
+    #         # Re-scan checkpoint files to ensure consistency
+    #         # The subprocess has modified checkpoint files, so we need to
+    #         # refresh our view of the top-k list from disk
+    #         self.print_to_log_file(f"  → Re-scanning top-k checkpoints from disk for consistency...")
+    #         self.top_k_dices = self._scan_existing_top_k_checkpoints()
             
-            # Update _best_dice if rank 1
-            if achieved_rank == 1:
-                self._best_dice = tumor_dice
-                self._best_ema = tumor_dice
+    #         # Update _best_dice if rank 1
+    #         if achieved_rank == 1:
+    #             self._best_dice = tumor_dice
+    #             self._best_ema = tumor_dice
                 
-            self.print_to_log_file(f"  → Top-k list updated: {[(np.round(d, 4), e) for d, e in self.top_k_dices]}")
-        else:
-            self.print_to_log_file(f"  → Did not qualify for top-{self.top_k_checkpoints}")
+    #         self.print_to_log_file(f"  → Top-k list updated: {[(np.round(d, 4), e) for d, e in self.top_k_dices]}")
+    #     else:
+    #         self.print_to_log_file(f"  → Did not qualify for top-{self.top_k_checkpoints}")
             
-            # Cache results
-            self._last_eval_results = {
-                'dice_per_class': result.get('dice_per_class', []),
-                'recall_per_class': result.get('recall_per_class', []),
-                'precision_per_class': result.get('precision_per_class', []),
-                'f1_per_class': result.get('f1_per_class', []),
-                'fpr_per_class': result.get('fpr_per_class', []),
-                'loss': 0.0,
-            }
-            self._last_eval_epoch = epoch
+    #         # Cache results
+    #         self._last_eval_results = {
+    #             'dice_per_class': result.get('dice_per_class', []),
+    #             'recall_per_class': result.get('recall_per_class', []),
+    #             'precision_per_class': result.get('precision_per_class', []),
+    #             'f1_per_class': result.get('f1_per_class', []),
+    #             'fpr_per_class': result.get('fpr_per_class', []),
+    #             'loss': 0.0,
+    #         }
+    #         self._last_eval_epoch = epoch
             
-            # Store additional metrics for logging
-            self._test_additional_metrics = {
-                'recall_per_class': result.get('recall_per_class', []),
-                'precision_per_class': result.get('precision_per_class', []),
-                'f1_per_class': result.get('f1_per_class', []),
-                'fpr_per_class': result.get('fpr_per_class', []),
-            }
+    #         # Store additional metrics for logging
+    #         self._test_additional_metrics = {
+    #             'recall_per_class': result.get('recall_per_class', []),
+    #             'precision_per_class': result.get('precision_per_class', []),
+    #             'f1_per_class': result.get('f1_per_class', []),
+    #             'fpr_per_class': result.get('fpr_per_class', []),
+    #         }
         
-        # Cleanup temp files
-        self._cleanup_temp_checkpoint(epoch)
+    #     # Cleanup temp files
+    #     self._cleanup_temp_checkpoint(epoch)
         
-        # Reset state
-        self._async_eval_process = None
-        self._async_eval_epoch = -1
-        self._async_eval_result_path = None
+    #     # Reset state
+    #     self._async_eval_process = None
+    #     self._async_eval_epoch = -1
+    #     self._async_eval_result_path = None
+    """DEPRECATED ALERT END"""
     
     def on_train_end(self):
         """
-        Override to ensure async evaluation completes before training ends.
+        Override to ensure all async evaluations complete before training ends.
+        
+        Also processes any pending evaluation checkpoints that were queued.
         """
-        # Wait for any pending async evaluation
-        if self._async_eval_process is not None and self._async_eval_process.is_alive():
+        # First, try to process any pending checkpoints while we wait for running ones
+        if self._pending_eval_checkpoints:
+            self.print_to_log_file(f"\n[MP] Processing {len(self._pending_eval_checkpoints)} pending evaluation(s) before exit...")
+            self._process_pending_eval_checkpoints()
+        
+        # Wait for all running subprocesses to complete
+        if self._running_subprocesses:
             self.print_to_log_file("\n" + "=" * 70)
-            self.print_to_log_file("WAITING FOR ASYNC TEST EVALUATION TO COMPLETE")
+            self.print_to_log_file(f"WAITING FOR {len(self._running_subprocesses)} ASYNC TEST EVALUATION(S) TO COMPLETE")
             self.print_to_log_file("=" * 70)
             
-            result = self._wait_for_async_eval(timeout=ASYNC_EVAL_TIMEOUT)
-            if result:
-                self._handle_async_eval_result(result)
+            # Use a longer timeout for final cleanup (4 hours max per subprocess)
+            max_wait_time = SUBPROCESS_TIMEOUT_HOURS * 3600
+            start_time = time()
+            poll_interval = 10
             
+            while self._running_subprocesses and (time() - start_time) < max_wait_time:
+                completed_results = self._poll_running_subprocesses()
+                for result in completed_results:
+                    self.print_to_log_file(f"\n[MP] *** Received results from epoch {result.get('epoch', '?')} evaluation ***")
+                    self._process_subprocess_result(result)
+                
+                if self._running_subprocesses:
+                    elapsed_min = (time() - start_time) / 60
+                    self.print_to_log_file(f"  Still waiting... ({len(self._running_subprocesses)} running, {elapsed_min:.1f} min elapsed)")
+                    sleep(poll_interval)
+            
+            # If any subprocesses are still running after timeout, terminate them
+            for sp in self._running_subprocesses:
+                self.print_to_log_file(f"[MP] WARNING: Terminating epoch {sp.epoch} subprocess (timed out)")
+                sp.process.terminate()
+                sp.process.join(timeout=5)
+                if sp.process.is_alive():
+                    sp.process.kill()
+            
+            self._running_subprocesses.clear()
             self.print_to_log_file("=" * 70 + "\n")
+        
+        # Also check legacy single-subprocess variable for backward compatibility
+        if self._async_eval_process is not None and self._async_eval_process.is_alive():
+            self.print_to_log_file("[MP] WARNING: Legacy subprocess still running, terminating...")
+            self._async_eval_process.terminate()
+            self._async_eval_process.join(timeout=5)
+        
+        # Clean up any remaining pending checkpoints that couldn't be processed
+        if self._pending_eval_checkpoints:
+            self.print_to_log_file(f"[MP] WARNING: {len(self._pending_eval_checkpoints)} pending evaluation(s) could not be processed")
+            for epoch, temp_ckpt_path in self._pending_eval_checkpoints:
+                self.print_to_log_file(f"[MP]   - Epoch {epoch}: {temp_ckpt_path}")
+                if isfile(temp_ckpt_path):
+                    try:
+                        os.remove(temp_ckpt_path)
+                        self.print_to_log_file(f"[MP]     Cleaned up temp checkpoint")
+                    except Exception as e:
+                        self.print_to_log_file(f"[MP]     Could not clean up: {e}")
+            self._pending_eval_checkpoints.clear()
         
         # Call parent's on_train_end if it exists
         if hasattr(super(), 'on_train_end'):
@@ -4784,15 +3762,19 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         is_eval_epoch = self._should_run_evaluation()
         
         # =====================================================================
-        # ASYNC EVAL: Check for completed results from previous async eval
+        # ASYNC EVAL: Poll for completed results from running subprocesses
         # This check happens EVERY epoch (not just eval epochs) to receive
         # results as soon as they're available.
         # =====================================================================
-        if ASYNC_TEST_EVAL and self._async_eval_process is not None:
-            result = self._check_async_eval_result()
-            if result:
+        if ASYNC_TEST_EVAL and self._running_subprocesses:
+            completed_results = self._poll_running_subprocesses()
+            for result in completed_results:
                 self.print_to_log_file(f"\n[MP] *** Received results from epoch {result.get('epoch', '?')} evaluation ***")
-                self._handle_async_eval_result(result)
+                self._process_subprocess_result(result)
+
+            # Process any pending evaluations now that slots may be available
+            if self._pending_eval_checkpoints:
+                self._process_pending_eval_checkpoints()
         
         # =====================================================================
         # NOT AN EVALUATION EPOCH: Use cached or placeholder results

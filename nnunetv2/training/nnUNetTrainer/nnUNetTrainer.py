@@ -1264,8 +1264,13 @@ class nnUNetTrainer(object):
 
         self.my_init_kwargs = checkpoint['init_args']
         self.current_epoch = checkpoint['current_epoch']
-        self.logger.load_checkpoint(checkpoint['logging'])
-        self._best_ema = checkpoint['_best_ema']
+        # Handle backward compatibility for older checkpoints without 'logging' key
+        if 'logging' in checkpoint:
+            self.logger.load_checkpoint(checkpoint['logging'])
+        else:
+            self.print_to_log_file("WARNING: Checkpoint does not contain 'logging' key (old format). "
+                                   "Training history will not be restored. Progress plot will start fresh.")
+        self._best_ema = checkpoint.get('_best_ema', None)  # Also use .get() for safety
         self.inference_allowed_mirroring_axes = checkpoint[
             'inference_allowed_mirroring_axes'] if 'inference_allowed_mirroring_axes' in checkpoint.keys() else self.inference_allowed_mirroring_axes
 
@@ -1280,10 +1285,18 @@ class nnUNetTrainer(object):
                 self.network._orig_mod.load_state_dict(new_state_dict)
             else:
                 self.network.load_state_dict(new_state_dict)
-        self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        if self.grad_scaler is not None:
+        
+        if 'optimizer_state' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state'])
+        else:
+            self.print_to_log_file("WARNING: Checkpoint does not contain 'optimizer_state' key (old format). "
+                                   "Optimizer state will not be restored. Training may continue with default settings.")
+        if 'grad_scaler_state' in checkpoint:
             if checkpoint['grad_scaler_state'] is not None:
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
+        else:
+            self.print_to_log_file("WARNING: Checkpoint does not contain 'grad_scaler_state' key (old format). "
+                                   "Gradient scaler state will not be restored. Training may continue with default settings.")
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         self.set_deep_supervision_enabled(False)
