@@ -18,7 +18,7 @@ ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET = True
 
 # Limit samples for faster pre-training sanity check
 PRE_TRAINING_EVAL_MAX_SAMPLES = 5
-
+MAX_SYNTHETIC_RATIO = 0.5
 
 # =============================================================================
 # ASYNC TEST EVALUATION

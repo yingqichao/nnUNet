@@ -193,6 +193,9 @@ class nnUNetTrainer(object):
 
         ### custom splits file
         self.splits_file = splits_file  # if None, uses default splits_final.json
+        
+        ### specify_val_set_only mode: use only validation set from splits, train on all other samples
+        self.specify_val_set_only = False  # Set by run_training.py via --specify_val_set_only
 
         self.was_initialized = False
 
@@ -604,10 +607,22 @@ class nnUNetTrainer(object):
 
             self.print_to_log_file("Desired fold for training: %d" % self.fold)
             if self.fold < len(splits):
-                tr_keys = splits[self.fold]['train']
                 val_keys = splits[self.fold]['val']
-                self.print_to_log_file("This split has %d training and %d validation cases."
-                                       % (len(tr_keys), len(val_keys)))
+                
+                # specify_val_set_only mode: use ALL samples except val for training
+                if self.specify_val_set_only:
+                    # Get all case identifiers from the dataset
+                    all_keys = list(dataset.identifiers)
+                    val_keys_set = set(val_keys)
+                    tr_keys = [k for k in all_keys if k not in val_keys_set]
+                    self.print_to_log_file(f"*** specify_val_set_only mode: Using fold {self.fold}'s validation set only ***")
+                    self.print_to_log_file(f"  Validation samples: {len(val_keys)} (from fold {self.fold})")
+                    self.print_to_log_file(f"  Training samples: {len(tr_keys)} (all other samples)")
+                else:
+                    # Normal mode: use fold's train split
+                    tr_keys = splits[self.fold]['train']
+                    self.print_to_log_file("This split has %d training and %d validation cases."
+                                           % (len(tr_keys), len(val_keys)))
             else:
                 self.print_to_log_file("INFO: You requested fold %d for training but splits "
                                        "contain only %d folds. I am now creating a "

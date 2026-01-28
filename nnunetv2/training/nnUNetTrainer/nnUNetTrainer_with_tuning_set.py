@@ -99,6 +99,7 @@ from nnunetv2.inference.sliding_window_prediction import compute_steps_for_slidi
 
 from nnunetv2.training.nnUNetTrainer.tuning_set_trainer import (
     # Configuration constants
+    MAX_SYNTHETIC_RATIO,
     ENABLE_PRE_TRAINING_EVAL,
     ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET,
     PRE_TRAINING_EVAL_MAX_SAMPLES,
@@ -188,13 +189,19 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Pattern to identify original samples (set via --pattern_original_samples)
         # If None, all samples are considered original
         self.pattern_original_samples: str = None  # Set by run_training.py
-        self.max_synthetic_ratio = 0.5  # Max ratio of synthetic samples in training
+        self.max_synthetic_ratio = MAX_SYNTHETIC_RATIO  # Max ratio of synthetic samples in training
         
         # Track original/synthetic sample counts (populated in do_split)
         self.n_original_total = 0
         self.n_synthetic_total = 0
         self.n_synthetic_removed = 0
         self.removed_synthetic_keys: List[str] = []
+        
+        # Weighted sampling for synthetic data (Option C)
+        # These are populated in do_split() for use in get_dataloaders()
+        self._original_train_keys: List[str] = []
+        self._synthetic_train_keys: List[str] = []
+        self._train_sampling_probabilities: Optional[np.ndarray] = None
         
         # Track samples excluded due to missing tumor (label 2)
         # These samples are excluded from ALL sets (train, tuning, test)
@@ -2157,49 +2164,36 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             check_if_proceed(warning_msg)
         
         # =====================================================================
-        # STEP 3: Determine which synthetic samples will be used
+        # STEP 3: Prepare for weighted sampling (no hard exclusion)
         # =====================================================================
         # Use fixed seed for deterministic selection across runs
         rng = np.random.RandomState(seed=12345 + self.fold)
         
-        # Calculate max synthetic samples allowed based on original count
-        # Note: we use full original count here (before tuning set is carved out)
-        # This is a preliminary estimate; final ratio is computed after tuning set
-        if self.max_synthetic_ratio < 1.0 and self.max_synthetic_ratio > 0:
-            # Estimate: assume roughly 80% of original will remain after tuning set
-            estimated_original_in_train = int(len(original_keys) * 0.8)
-            max_synthetic = int(estimated_original_in_train * self.max_synthetic_ratio / (1 - self.max_synthetic_ratio))
-        elif self.max_synthetic_ratio == 0:
-            max_synthetic = 0  # No synthetic data
-        else:
-            max_synthetic = len(synthetic_keys)  # No cap
-        
-        # Determine which synthetic samples will be used
-        if len(synthetic_keys) > max_synthetic:
-            shuffled_synthetic = rng.permutation(synthetic_keys).tolist()
-            synthetic_to_use = shuffled_synthetic[:max_synthetic]
-            synthetic_to_skip = shuffled_synthetic[max_synthetic:]
-        else:
-            synthetic_to_use = synthetic_keys
-            synthetic_to_skip = []
-        
-        # Log synthetic data decision
+        # With weighted sampling (Option C), we include ALL synthetic samples
+        # and use sampling probabilities to control the expected ratio.
+        # The only exception is when max_synthetic_ratio == 0 (hard exclusion).
         if self.max_synthetic_ratio == 0:
             self.print_to_log_file(f"\n*** SYNTHETIC DATA DISABLED (max_synthetic_ratio=0) ***")
-            self.print_to_log_file(f"  Skipping {len(synthetic_keys)} synthetic samples from sanity check")
-        elif len(synthetic_to_skip) > 0:
-            self.print_to_log_file(f"\n*** SYNTHETIC DATA CAP PREVIEW ***")
-            self.print_to_log_file(f"  Max synthetic ratio: {self.max_synthetic_ratio:.0%}")
-            self.print_to_log_file(f"  Synthetic to use: {len(synthetic_to_use)}")
-            self.print_to_log_file(f"  Synthetic to skip: {len(synthetic_to_skip)} (will skip sanity check)")
+            self.print_to_log_file(f"  {len(synthetic_keys)} synthetic samples will be excluded")
+        elif len(synthetic_keys) > 0:
+            self.print_to_log_file(f"\n*** WEIGHTED SAMPLING MODE ***")
+            self.print_to_log_file(f"  Target synthetic ratio: {self.max_synthetic_ratio:.0%}")
+            self.print_to_log_file(f"  Total synthetic samples: {len(synthetic_keys)} (all will be sanity-checked)")
         
         # =====================================================================
-        # STEP 4: SANITY CHECK - Only on samples that will actually be used
+        # STEP 4: SANITY CHECK - Check ALL samples (including all synthetic)
         # =====================================================================
-        # Keys to check: test + original + synthetic_to_use
-        # Skip: synthetic_to_skip (saves time when --ignore_synthetic is set!)
-        keys_to_check = list(set(test_keys) | set(original_keys) | set(synthetic_to_use))
-        n_skipped_check = len(synthetic_to_skip)
+        # With weighted sampling (Option C), we need to check ALL synthetic samples
+        # because any of them could be sampled during training.
+        # Only skip sanity check for synthetic when max_synthetic_ratio == 0
+        if self.max_synthetic_ratio == 0:
+            # Hard exclusion: only check samples that will be used
+            keys_to_check = list(set(test_keys) | set(original_keys))
+            n_skipped_check = len(synthetic_keys)
+        else:
+            # Weighted sampling: check ALL samples including all synthetic
+            keys_to_check = list(set(test_keys) | set(original_keys) | set(synthetic_keys))
+            n_skipped_check = 0
         
         # Check if we already have sanity check results from a loaded checkpoint
         if self.excluded_no_tumor_keys and len(self.excluded_no_tumor_keys) > 0:
@@ -2230,22 +2224,23 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # =====================================================================
         test_keys_before = len(test_keys)
         original_keys_before = len(original_keys)
-        synthetic_to_use_before = len(synthetic_to_use)
+        synthetic_keys_before = len(synthetic_keys)
         
         test_keys = [k for k in test_keys if k in valid_keys_set]
         original_keys = [k for k in original_keys if k in valid_keys_set]
-        synthetic_to_use = [k for k in synthetic_to_use if k in valid_keys_set]
+        # Filter ALL synthetic keys (for weighted sampling, we need all valid ones)
+        synthetic_keys = [k for k in synthetic_keys if k in valid_keys_set]
         
         excluded_from_test = test_keys_before - len(test_keys)
         excluded_from_original = original_keys_before - len(original_keys)
-        excluded_from_synthetic = synthetic_to_use_before - len(synthetic_to_use)
+        excluded_from_synthetic = synthetic_keys_before - len(synthetic_keys)
         
         if excluded_from_test > 0 or excluded_from_original > 0 or excluded_from_synthetic > 0:
             self.print_to_log_file(f"*** Applied sanity check filter:")
             self.print_to_log_file(f"    Test set:   {test_keys_before} → {len(test_keys)} ({excluded_from_test} excluded)")
             self.print_to_log_file(f"    Original:   {original_keys_before} → {len(original_keys)} ({excluded_from_original} excluded)")
-            if synthetic_to_use_before > 0:
-                self.print_to_log_file(f"    Synthetic:  {synthetic_to_use_before} → {len(synthetic_to_use)} ({excluded_from_synthetic} excluded)")
+            if synthetic_keys_before > 0:
+                self.print_to_log_file(f"    Synthetic:  {synthetic_keys_before} → {len(synthetic_keys)} ({excluded_from_synthetic} excluded)")
         
         # =====================================================================
         # VALIDATION: Check if any samples remain after filtering
@@ -2318,54 +2313,103 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"  [Deterministic] Seed=12345+fold={12345 + self.fold}, sorted before shuffle")
         
         # =====================================================================
-        # STEP 7: Finalize synthetic ratio in training set
+        # STEP 7: WEIGHTED SAMPLING - Include ALL synthetic with probability weights
         # =====================================================================
-        # Training = remaining original + synthetic_to_use (already filtered)
+        # Instead of hard-capping synthetic samples, we include ALL valid synthetic
+        # samples and use sampling probabilities to achieve the target ratio in expectation.
+        # This allows every synthetic sample to contribute over the course of training.
+        
         n_remaining_original = len(remaining_original)
+        n_synthetic_available = len(synthetic_keys)
         
-        # Re-calculate max synthetic based on actual remaining original
-        if self.max_synthetic_ratio < 1.0 and self.max_synthetic_ratio > 0:
-            max_synthetic = int(n_remaining_original * self.max_synthetic_ratio / (1 - self.max_synthetic_ratio))
-        elif self.max_synthetic_ratio == 0:
-            max_synthetic = 0
+        # Store keys separately for weighted sampling
+        self._original_train_keys = remaining_original
+        self._synthetic_train_keys = synthetic_keys if self.max_synthetic_ratio > 0 else []
+        
+        # Combine all for training (order will be preserved for probability mapping)
+        if self.max_synthetic_ratio == 0:
+            # Hard exclusion: no synthetic data
+            train_keys = remaining_original
+            self._train_sampling_probabilities = None  # Uniform sampling
+            self.removed_synthetic_keys = synthetic_keys
+            self.n_synthetic_removed = len(synthetic_keys)
+            
+            self.print_to_log_file(f"\n*** SYNTHETIC DATA DISABLED (max_synthetic_ratio=0) ***")
+            self.print_to_log_file(f"  Excluded {self.n_synthetic_removed} synthetic samples")
         else:
-            max_synthetic = len(synthetic_to_use)
+            # Weighted sampling: include all synthetic but weight them
+            train_keys = remaining_original + synthetic_keys
+            self.removed_synthetic_keys = []
+            self.n_synthetic_removed = 0
+            
+            # Calculate sampling probabilities to achieve target ratio in expectation
+            # Target: P(synthetic) = max_synthetic_ratio
+            # If we have n_orig original and n_syn synthetic samples, and want ratio r:
+            #   weight_syn / (n_orig * weight_orig + n_syn * weight_syn) = r
+            # Setting weight_orig = 1, solve for weight_syn:
+            #   weight_syn = r * n_orig / (n_syn * (1 - r))
+            if n_synthetic_available > 0 and n_remaining_original > 0:
+                target_ratio = self.max_synthetic_ratio
+                # Calculate per-sample weight for synthetic samples
+                # weight_syn = target_ratio * n_orig / (n_syn * (1 - target_ratio))
+                weight_orig = 1.0
+                weight_syn = (target_ratio * n_remaining_original) / (n_synthetic_available * (1 - target_ratio))
+                
+                # Build probability array: [orig_probs..., syn_probs...]
+                orig_probs = np.full(n_remaining_original, weight_orig)
+                syn_probs = np.full(n_synthetic_available, weight_syn)
+                all_probs = np.concatenate([orig_probs, syn_probs])
+                
+                # Normalize to sum to 1
+                self._train_sampling_probabilities = all_probs / all_probs.sum()
+                
+                # Log the weighted sampling setup
+                expected_syn_ratio = (n_synthetic_available * weight_syn) / (n_remaining_original * weight_orig + n_synthetic_available * weight_syn)
+                self.print_to_log_file(f"\n*** WEIGHTED SAMPLING ENABLED ***")
+                self.print_to_log_file(f"  Target synthetic ratio: {self.max_synthetic_ratio:.0%}")
+                self.print_to_log_file(f"  Original samples: {n_remaining_original} (weight={weight_orig:.4f})")
+                self.print_to_log_file(f"  Synthetic samples: {n_synthetic_available} (weight={weight_syn:.4f})")
+                self.print_to_log_file(f"  Expected synthetic ratio: {expected_syn_ratio:.1%}")
+                self.print_to_log_file(f"  → ALL {n_synthetic_available} synthetic samples will be used over training")
+            else:
+                # Edge case: no synthetic or no original
+                self._train_sampling_probabilities = None
+                if n_synthetic_available == 0:
+                    self.print_to_log_file(f"\n*** NO SYNTHETIC SAMPLES AVAILABLE ***")
+                elif n_remaining_original == 0:
+                    self.print_to_log_file(f"\n*** NO ORIGINAL SAMPLES IN TRAINING ***")
         
-        # Apply final cap (may differ from preliminary estimate)
-        if len(synthetic_to_use) > max_synthetic:
-            synthetic_for_training = synthetic_to_use[:max_synthetic]
-            additional_removed = synthetic_to_use[max_synthetic:]
-            self.removed_synthetic_keys = synthetic_to_skip + additional_removed
+        # Shuffle training set (but preserve the probability mapping)
+        # Note: We need to shuffle both keys and probabilities together
+        if self._train_sampling_probabilities is not None:
+            # Shuffle together to maintain correspondence
+            combined = list(zip(train_keys, self._train_sampling_probabilities))
+            rng.shuffle(combined)
+            train_keys, probs = zip(*combined)
+            train_keys = list(train_keys)
+            self._train_sampling_probabilities = np.array(probs)
         else:
-            synthetic_for_training = synthetic_to_use
-            self.removed_synthetic_keys = synthetic_to_skip
-        
-        self.n_synthetic_removed = len(self.removed_synthetic_keys)
-        
-        if self.n_synthetic_removed > 0 and self.max_synthetic_ratio > 0:
-            self.print_to_log_file(f"\n*** SYNTHETIC DATA CAP APPLIED ***")
-            self.print_to_log_file(f"  Max synthetic ratio: {self.max_synthetic_ratio:.0%}")
-            self.print_to_log_file(f"  Synthetic samples used: {len(synthetic_for_training)}")
-            self.print_to_log_file(f"  Synthetic samples removed: {self.n_synthetic_removed}")
-        
-        # Combine remaining original + allowed synthetic for training
-        train_keys = remaining_original + synthetic_for_training
-        
-        # Shuffle training set
-        train_keys = rng.permutation(train_keys).tolist()
+            train_keys = rng.permutation(train_keys).tolist()
         
         # =====================================================================
         # STEP 8: Log final split statistics
         # =====================================================================
-        n_original_in_train = len(remaining_original)
-        n_synthetic_in_train = len(synthetic_for_training)
-        actual_synthetic_ratio = n_synthetic_in_train / len(train_keys) if len(train_keys) > 0 else 0
+        n_original_in_train = len(self._original_train_keys)
+        n_synthetic_in_train = len(self._synthetic_train_keys)
         
         self.print_to_log_file(f"\n3-way split for fold {self.fold}:")
-        self.print_to_log_file(f"  - Training: {len(train_keys)} cases")
+        self.print_to_log_file(f"  - Training: {len(train_keys)} samples in pool")
         if len(train_keys) > 0:
-            self.print_to_log_file(f"      Original:  {n_original_in_train} ({100*n_original_in_train/len(train_keys):.1f}%)")
-            self.print_to_log_file(f"      Synthetic: {n_synthetic_in_train} ({100*actual_synthetic_ratio:.1f}%)")
+            if self._train_sampling_probabilities is not None:
+                # Weighted sampling mode
+                self.print_to_log_file(f"      Original:  {n_original_in_train} samples")
+                self.print_to_log_file(f"      Synthetic: {n_synthetic_in_train} samples (weighted sampling)")
+                self.print_to_log_file(f"      Expected batch composition: ~{100*(1-self.max_synthetic_ratio):.0f}% original, ~{100*self.max_synthetic_ratio:.0f}% synthetic")
+            else:
+                # No synthetic or uniform sampling
+                pool_ratio = n_synthetic_in_train / len(train_keys) if len(train_keys) > 0 else 0
+                self.print_to_log_file(f"      Original:  {n_original_in_train} ({100*n_original_in_train/len(train_keys):.1f}%)")
+                self.print_to_log_file(f"      Synthetic: {n_synthetic_in_train} ({100*pool_ratio:.1f}%)")
         self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases (100% original)")
         self.print_to_log_file(f"  - Test:     {len(test_keys)} cases (original val fold)")
         self.print_to_log_file("-" * 70 + "\n")
@@ -2458,6 +2502,11 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         # Create TRAINING dataloader with 3-way centering
         # Store reference for accessing centering counts
+        # Use weighted sampling probabilities if available (Option C: weighted synthetic sampling)
+        sampling_probs = getattr(self, '_train_sampling_probabilities', None)
+        if sampling_probs is not None:
+            self.print_to_log_file(f"  Using weighted sampling for training dataloader")
+        
         self._dl_tr = nnUNetDataLoader3WayCentering(
             dataset_tr, self.batch_size,
             initial_patch_size,
@@ -2466,7 +2515,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             prob_random=self.train_prob_random,
             prob_anatomy=self.train_prob_anatomy,
             prob_tumor=self.train_prob_tumor,
-            sampling_probabilities=None,
+            sampling_probabilities=sampling_probs,
             pad_sides=None,
             transforms=tr_transforms
         )

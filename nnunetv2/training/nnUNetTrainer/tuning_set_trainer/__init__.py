@@ -31,6 +31,7 @@ from .constants import (
     ASYNC_EVAL_TIMEOUT,
     ASYNC_EVAL_MIN_SUCCESS_RATE,
     ASYNC_EVAL_TIMEOUT_MINUTES,
+    MAX_SYNTHETIC_RATIO,
 )
 
 # Multiprocess evaluation

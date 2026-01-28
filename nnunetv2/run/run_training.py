@@ -361,7 +361,7 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
             checkpoint_path=None, skip_manual_confirm=False, pattern_original_samples=None,
             ignore_existing_best=False, skip_val=False, ignore_synthetic=False,
-            main_gpu_id=None, backup_gpu_ids=None, integration_test=False):
+            main_gpu_id=None, backup_gpu_ids=None, integration_test=False, specify_val_set_only=False):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -398,6 +398,12 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
         nnunet_trainer.integration_test_mode = True
         if hasattr(nnunet_trainer, '_setup_integration_test_mode'):
             nnunet_trainer._setup_integration_test_mode()
+    
+    # Set specify_val_set_only mode (use only fold's val set, train on all other samples)
+    if specify_val_set_only:
+        nnunet_trainer.specify_val_set_only = True
+        if rank == 0:
+            print(f"*** specify_val_set_only mode enabled: fold {fold}'s val set only, all other samples for training")
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -466,7 +472,7 @@ def run_training(
     only_run_validation: bool = False,              # args.val
     disable_checkpointing: bool = False,             # args.disable_checkpointing
     val_with_best: bool = False,                    # args.val_best
-    skip_val: bool = False,                          # args.skip_val
+    skip_val: bool = True,                           # args.skip_val (default True now)
     device: torch.device = torch.device('cuda'),     # args.device
     checkpoint_signature: Optional[str] = None,      # args.signature
     splits_file: Optional[str] = None,               # args.split
@@ -477,7 +483,8 @@ def run_training(
     ignore_synthetic: bool = False,                  # args.ignore_synthetic
     main_gpu_id: Optional[int] = None,               # args.main_gpu_id
     backup_gpu_ids: Optional[str] = None,            # args.backup_gpu_ids (comma-separated)
-    integration_test: bool = False                   # args.integration_test
+    integration_test: bool = False,                  # args.integration_test
+    specify_val_set_only: bool = False                   # args.specify_val_set_only
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -529,7 +536,8 @@ def run_training(
                      ignore_synthetic,
                      main_gpu_id,
                      backup_gpu_ids,
-                     integration_test),
+                     integration_test,
+                     specify_val_set_only),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -578,6 +586,12 @@ def run_training(
             nnunet_trainer.integration_test_mode = True
             if hasattr(nnunet_trainer, '_setup_integration_test_mode'):
                 nnunet_trainer._setup_integration_test_mode()
+        
+        # Set specify_val_set_only mode (use only fold's val set, train on all other samples)
+        # This is set BEFORE do_split() is called, so the split logic picks it up
+        if specify_val_set_only:
+            nnunet_trainer.specify_val_set_only = True
+            print(f"*** specify_val_set_only mode enabled: fold {fold}'s val set only, all other samples for training")
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -661,9 +675,11 @@ def run_training_entry():
     parser.add_argument('--disable_checkpointing', action='store_true', required=False,
                         help='[OPTIONAL] Set this flag to disable checkpointing. Ideal for testing things out and '
                              'you dont want to flood your hard drive with checkpoints.')
-    parser.add_argument('--skip_val', action='store_true', required=False,
-                        help='[OPTIONAL] Skip the final validation step after training. Useful when you want to '
-                             'run validation separately on a different test set (e.g., external validation).')
+    parser.add_argument('--skip_val', action='store_true', required=False, default=True,
+                        help='[DEFAULT=True] Skip the final validation step after training. '
+                             'Use --no_skip_val to run final validation.')
+    parser.add_argument('--no_skip_val', action='store_true', required=False,
+                        help='[OPTIONAL] Run final validation after training (overrides default --skip_val).')
     parser.add_argument('-signature', type=str, required=False, default=None,
                         help='[OPTIONAL] Custom signature to append to checkpoint filenames. '
                              'Checkpoints will be named: checkpoint_<type>_<plans_name>_<signature>.pth. '
@@ -697,6 +713,10 @@ def run_training_entry():
                         help='[OPTIONAL] If set, all synthetic samples (those NOT matching --pattern_original_samples) '
                              'will be excluded from training. Requires --pattern_original_samples to be set. '
                              'Only used by nnUNetTrainer_WithTuningSet.')
+    parser.add_argument('--specify_val_set_only', action='store_true', required=False,
+                        help='[OPTIONAL] If set, only use the validation set from splits_final.json for the specified fold. '
+                             'ALL other samples (including from other folds) go into training. '
+                             'This is applied BEFORE --ignore_synthetic filtering.')
     parser.add_argument('--main_gpu_id', type=int, required=False, default=None,
                         help='[OPTIONAL] GPU ID for main training process. Sets CUDA_VISIBLE_DEVICES before training. '
                              'If not specified, uses current CUDA_VISIBLE_DEVICES setting.')
@@ -724,16 +744,20 @@ def run_training_entry():
     else:
         device = torch.device('mps')
 
+    # Handle skip_val: default is True, --no_skip_val overrides to False
+    skip_val = args.skip_val and not args.no_skip_val
+
     run_training(args.dataset_name_or_id, args.configuration, args.fold, args.tr, args.p, args.pretrained_weights,
                  args.num_gpus, args.npz, args.c, args.val, args.disable_checkpointing, args.val_best,
-                 args.skip_val, device=device, checkpoint_signature=args.signature, splits_file=args.split,
+                 skip_val, device=device, checkpoint_signature=args.signature, splits_file=args.split,
                  checkpoint_path=args.checkpoint_path, skip_manual_confirm=args.skip_manual_confirm,
                  pattern_original_samples=args.pattern_original_samples,
                  ignore_existing_best=args.ignore_existing_best,
                  ignore_synthetic=args.ignore_synthetic,
                  main_gpu_id=args.main_gpu_id,
                  backup_gpu_ids=args.backup_gpu_ids,
-                 integration_test=args.integration_test)
+                 integration_test=args.integration_test,
+                 specify_val_set_only=args.specify_val_set_only)
 
 
 if __name__ == '__main__':
