@@ -184,6 +184,17 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.tuning_dataloader = None
         
         # =====================================================================
+        # TUNING SET SOURCE CONFIGURATION
+        # =====================================================================
+        # Determines where tuning set samples come from:
+        # - 'training': Samples carved from original training set (EXCLUDED from training)
+        #               → Independent tuning evaluation, no data leakage to training
+        # - 'test': Samples are the SAME as test set (shared samples)
+        #           → Useful when you want tuning to track test performance directly
+        #           → Note: This means tuning metrics will be identical to test metrics
+        self._tuning_set_source: str = 'test'  # Options: 'training', 'test'
+        
+        # =====================================================================
         # ORIGINAL vs SYNTHETIC SAMPLE HANDLING
         # =====================================================================
         # Pattern to identify original samples (set via --pattern_original_samples)
@@ -271,6 +282,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         # Format: {case_key: {'volume_shape': tuple, 'box_slicers': list, 'foreground_indices': list}}
         # This caches which sliding window boxes contain foreground (anatomy or tumor)
         self._sliding_window_box_cache: Dict[str, Dict] = {}
+        self._tuning_set_source: str = 'training'  # choose from 'training', 'test'
         
         # Simulate perfect anatomy: Zero predictions outside GT anatomy region
         # This makes tumor metrics more meaningful by removing FP from outside anatomy
@@ -696,6 +708,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             'tuning_keys': self.tuning_keys,
             'tuning_metrics': self.tuning_metrics,
             'tuning_ratio': self.tuning_ratio,
+            '_tuning_set_source': self._tuning_set_source,
             # 3-way centering probabilities
             'train_prob_random': self.train_prob_random,
             'train_prob_anatomy': self.train_prob_anatomy,
@@ -2289,28 +2302,61 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             check_if_proceed(warning_msg)
         
         # =====================================================================
-        # STEP 6: Create tuning set from ORIGINAL samples only
+        # STEP 6: Create tuning set based on _tuning_set_source configuration
         # =====================================================================
-        # IMPORTANT: Sort original_keys first to ensure determinism
-        # (order from parent class may vary, but sorted order is always the same)
-        sorted_original = sorted(original_keys)
+        # Validate tuning set source
+        if self._tuning_set_source not in ('training', 'test'):
+            raise ValueError(f"Invalid _tuning_set_source: '{self._tuning_set_source}'. "
+                           f"Must be 'training' or 'test'.")
         
-        # Shuffle with fixed seed for reproducible selection
-        shuffled_original = rng.permutation(sorted_original).tolist()
-        
-        # Tuning set size = test set size (instead of tuning_ratio)
-        # This ensures balanced evaluation between tuning and test
-        n_tuning = len(test_keys)
-        if n_tuning > len(shuffled_original):
-            self.print_to_log_file(f"WARNING: Test set size ({n_tuning}) > available original samples ({len(shuffled_original)})")
-            self.print_to_log_file(f"         Using all {len(shuffled_original)} original samples for tuning")
-            n_tuning = len(shuffled_original)
-        
-        self.tuning_keys = shuffled_original[:n_tuning]
-        remaining_original = shuffled_original[n_tuning:]
-        
-        self.print_to_log_file(f"\nTuning set: {len(self.tuning_keys)} cases (= test set size, from original samples only)")
-        self.print_to_log_file(f"  [Deterministic] Seed=12345+fold={12345 + self.fold}, sorted before shuffle")
+        if self._tuning_set_source == 'test':
+            # =====================================================================
+            # OPTION A: Tuning set = Test set (shared samples)
+            # =====================================================================
+            # Tuning samples come directly from test set - same samples used for both
+            # tuning evaluation and test evaluation. This means:
+            # - Tuning metrics will track test metrics directly
+            # - All original training samples remain available for training
+            # - No "held-out" tuning set carved from training data
+            self.tuning_keys = list(test_keys)  # Copy to avoid reference issues
+            remaining_original = original_keys  # ALL original samples available for training
+            
+            self.print_to_log_file(f"\n*** TUNING SET SOURCE: TEST SET ***")
+            self.print_to_log_file(f"Tuning set: {len(self.tuning_keys)} cases (SAME as test set)")
+            self.print_to_log_file(f"  → Tuning and test evaluations use IDENTICAL samples")
+            self.print_to_log_file(f"  → All {len(original_keys)} original training samples available for training")
+            
+        else:  # self._tuning_set_source == 'training'
+            # =====================================================================
+            # OPTION B: Tuning set carved from training set (current default)
+            # =====================================================================
+            # Tuning samples come from original training samples and are EXCLUDED
+            # from the training set. This provides:
+            # - Independent tuning evaluation (no data leakage to training)
+            # - Tuning size = test size for balanced evaluation
+            
+            # IMPORTANT: Sort original_keys first to ensure determinism
+            # (order from parent class may vary, but sorted order is always the same)
+            sorted_original = sorted(original_keys)
+            
+            # Shuffle with fixed seed for reproducible selection
+            shuffled_original = rng.permutation(sorted_original).tolist()
+            
+            # Tuning set size = test set size (instead of tuning_ratio)
+            # This ensures balanced evaluation between tuning and test
+            n_tuning = len(test_keys)
+            if n_tuning > len(shuffled_original):
+                self.print_to_log_file(f"WARNING: Test set size ({n_tuning}) > available original samples ({len(shuffled_original)})")
+                self.print_to_log_file(f"         Using all {len(shuffled_original)} original samples for tuning")
+                n_tuning = len(shuffled_original)
+            
+            self.tuning_keys = shuffled_original[:n_tuning]
+            remaining_original = shuffled_original[n_tuning:]
+            
+            self.print_to_log_file(f"\n*** TUNING SET SOURCE: TRAINING SET ***")
+            self.print_to_log_file(f"Tuning set: {len(self.tuning_keys)} cases (= test set size, from original samples only)")
+            self.print_to_log_file(f"  → These samples are EXCLUDED from training")
+            self.print_to_log_file(f"  [Deterministic] Seed=12345+fold={12345 + self.fold}, sorted before shuffle")
         
         # =====================================================================
         # STEP 7: WEIGHTED SAMPLING - Include ALL synthetic with probability weights
@@ -2410,7 +2456,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 pool_ratio = n_synthetic_in_train / len(train_keys) if len(train_keys) > 0 else 0
                 self.print_to_log_file(f"      Original:  {n_original_in_train} ({100*n_original_in_train/len(train_keys):.1f}%)")
                 self.print_to_log_file(f"      Synthetic: {n_synthetic_in_train} ({100*pool_ratio:.1f}%)")
-        self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases (100% original)")
+        if self._tuning_set_source == 'test':
+            self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases (= test set, SHARED)")
+        else:
+            self.print_to_log_file(f"  - Tuning:   {len(self.tuning_keys)} cases (from training, 100% original)")
         self.print_to_log_file(f"  - Test:     {len(test_keys)} cases (original val fold)")
         self.print_to_log_file("-" * 70 + "\n")
         
@@ -4112,6 +4161,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     'tuning_keys': self.tuning_keys,
                     'tuning_metrics': self.tuning_metrics,
                     'tuning_ratio': self.tuning_ratio,
+                    '_tuning_set_source': self._tuning_set_source,
                     # 3-way centering probabilities
                     'train_prob_random': self.train_prob_random,
                     'train_prob_anatomy': self.train_prob_anatomy,
@@ -4172,6 +4222,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             self.tuning_keys = checkpoint['tuning_keys']
             self.tuning_metrics = checkpoint.get('tuning_metrics', self.tuning_metrics)
             self.tuning_ratio = checkpoint.get('tuning_ratio', self.tuning_ratio)
+            self._tuning_set_source = checkpoint.get('_tuning_set_source', self._tuning_set_source)
             
             # Load centering probabilities if available
             self.train_prob_random = checkpoint.get('train_prob_random', self.train_prob_random)
@@ -4246,7 +4297,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             self._last_eval_results = checkpoint.get('_last_eval_results', self._last_eval_results)
             self._last_eval_epoch = checkpoint.get('_last_eval_epoch', self._last_eval_epoch)
             
-            self.print_to_log_file(f"Loaded tuning info: {len(self.tuning_keys)} tuning cases")
+            self.print_to_log_file(f"Loaded tuning info: {len(self.tuning_keys)} tuning cases (source: {self._tuning_set_source})")
             self.print_to_log_file(f"Loaded centering probs - Train: ({self.train_prob_random:.2f}/{self.train_prob_anatomy:.2f}/{self.train_prob_tumor:.2f})")
             self.print_to_log_file(f"Loaded eval modes: tuning={self.tuning_eval_mode}, test={self.test_eval_mode}")
             if self.pattern_original_samples:
