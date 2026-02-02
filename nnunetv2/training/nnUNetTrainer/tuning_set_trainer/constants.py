@@ -30,7 +30,7 @@ ASYNC_TEST_EVAL = True
 
 # Maximum concurrent evaluation subprocesses
 # Actual max is min(MAX_CONCURRENT_SUBPROCESSES, len(backup_gpu_ids))
-MAX_CONCURRENT_SUBPROCESSES = 3
+MAX_CONCURRENT_SUBPROCESSES = 10
 
 # Subprocess timeout (hours) - HARD limit, must complete ALL samples
 # If exceeded, subprocess terminates and reports failure

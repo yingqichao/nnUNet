@@ -28,6 +28,36 @@ VIS_MAX_SLICES_PER_SAMPLE = 8  # Max slices with tumor per sample
 VIS_TUMOR_LABEL = 2            # Label for tumor class
 
 
+def _convert_to_json_serializable(obj):
+    """
+    Recursively convert numpy types to Python native types for JSON serialization.
+    
+    Args:
+        obj: Object to convert (can be dict, list, numpy array/scalar, or primitive)
+        
+    Returns:
+        JSON-serializable version of the object
+    """
+    import numpy as np
+    
+    if isinstance(obj, dict):
+        return {k: _convert_to_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_to_json_serializable(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_convert_to_json_serializable(v) for v in obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
+
+
 @dataclass
 class SubprocessInfo:
     """Information about a running evaluation subprocess."""
@@ -373,7 +403,7 @@ def _async_test_eval_worker(
                         'timestamp': time.time(),
                     }
                     with open(result_path, 'w') as f:
-                        json.dump(result, f, indent=2)
+                        json.dump(_convert_to_json_serializable(result), f, indent=2)
                     return  # Exit subprocess
                 
                 try:
@@ -655,9 +685,9 @@ def _async_test_eval_worker(
                 'timestamp': time.time(),
             }
         
-        # Write result
+        # Write result (convert numpy types to native Python types for JSON serialization)
         with open(result_path, 'w') as f:
-            json.dump(result, f, indent=2)
+            json.dump(_convert_to_json_serializable(result), f, indent=2)
         
         _mp_log(f"Evaluation complete. Tumor Dice: {result.get('tumor_dice', 'N/A')}")
         
@@ -672,7 +702,7 @@ def _async_test_eval_worker(
             'timestamp': time_module.time(),
         }
         with open(result_path, 'w') as f:
-            json.dump(error_result, f, indent=2)
+            json.dump(_convert_to_json_serializable(error_result), f, indent=2)
         _mp_log(f"Evaluation FAILED: {e}")
 
 

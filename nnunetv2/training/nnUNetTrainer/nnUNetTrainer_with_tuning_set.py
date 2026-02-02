@@ -391,7 +391,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"Async test evaluation: {'ENABLED' if ASYNC_TEST_EVAL else 'DISABLED'}")
         if ASYNC_TEST_EVAL:
             # backup_gpu_ids will be set by run_training.py after __init__, so show placeholder
-            self.print_to_log_file(f"  → Backup GPUs: (set via --backup_gpu_ids, max {MAX_CONCURRENT_SUBPROCESSES} concurrent)")
+            self.print_to_log_file(f"  → Backup GPUs: (set via --backup_gpu_ids)")
+            self.print_to_log_file(f"  → Max subprocesses per GPU: {self.MAX_SUBPROCESSES_PER_GPU}")
+            self.print_to_log_file(f"  → Total max concurrent: min({MAX_CONCURRENT_SUBPROCESSES}, {self.MAX_SUBPROCESSES_PER_GPU} * num_gpus)")
             self.print_to_log_file(f"  → Subprocess timeout: {SUBPROCESS_TIMEOUT_HOURS} hours (must complete ALL samples)")
             self.print_to_log_file(f"  → Training continues while test eval runs in parallel")
         self.print_to_log_file(f"Pre-training evaluation:")
@@ -815,22 +817,33 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
     # MULTI-SUBPROCESS MANAGEMENT METHODS
     # =========================================================================
     
+    # Maximum number of test evaluation subprocesses per GPU
+    MAX_SUBPROCESSES_PER_GPU = 2
+    
     def _get_available_gpu(self) -> Optional[int]:
         """
-        Get an available GPU from backup_gpu_ids that is not currently in use.
+        Get an available GPU from backup_gpu_ids that has capacity for more subprocesses.
+        
+        Each GPU can host up to MAX_SUBPROCESSES_PER_GPU (default: 2) concurrent test 
+        evaluation subprocesses. This allows better GPU utilization when evaluation
+        is not fully saturating the GPU.
         
         Returns:
-            GPU ID if available, None if all GPUs are busy
+            GPU ID if available (has < MAX_SUBPROCESSES_PER_GPU subprocesses), 
+            None if all GPUs are at capacity
         """
         if not self.backup_gpu_ids:
             return None
         
-        # Get set of GPUs currently in use by running subprocesses
-        gpus_in_use = {sp.gpu_id for sp in self._running_subprocesses}
+        # Count subprocesses per GPU
+        gpu_subprocess_count = {}
+        for sp in self._running_subprocesses:
+            gpu_id = sp.gpu_id
+            gpu_subprocess_count[gpu_id] = gpu_subprocess_count.get(gpu_id, 0) + 1
         
-        # Find first available GPU
+        # Find first GPU with capacity (< MAX_SUBPROCESSES_PER_GPU subprocesses)
         for gpu_id in self.backup_gpu_ids:
-            if gpu_id not in gpus_in_use:
+            if gpu_subprocess_count.get(gpu_id, 0) < self.MAX_SUBPROCESSES_PER_GPU:
                 return gpu_id
         
         return None
@@ -924,6 +937,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # Clear pending queue if async eval is disabled
             self._pending_eval_checkpoints.clear()
             return 0
+        
+        # Dynamically update max concurrent subprocesses based on backup_gpu_ids
+        # Each GPU can host up to MAX_SUBPROCESSES_PER_GPU concurrent evaluations
+        if self.backup_gpu_ids:
+            self._max_concurrent_subprocesses = min(
+                MAX_CONCURRENT_SUBPROCESSES,
+                self.MAX_SUBPROCESSES_PER_GPU * len(self.backup_gpu_ids)
+            )
         
         spawned_count = 0
         
@@ -1282,7 +1303,12 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         """
         Spawn a subprocess for async test evaluation.
         
-        Supports multiple concurrent subprocesses (up to MAX_CONCURRENT_SUBPROCESSES).
+        Supports multiple concurrent subprocesses. The maximum is calculated as:
+        min(MAX_CONCURRENT_SUBPROCESSES, MAX_SUBPROCESSES_PER_GPU * len(backup_gpu_ids))
+        
+        Each backup GPU can host up to MAX_SUBPROCESSES_PER_GPU (default: 2) subprocesses,
+        allowing better GPU utilization when individual evaluations don't saturate the GPU.
+        
         If all slots are full, waits for a slot to become available.
         
         Args:
@@ -1305,6 +1331,13 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 "Alternatively, set ASYNC_TEST_EVAL = False in tuning_set_trainer/constants.py "
                 "to use synchronous evaluation (blocks training during test eval)."
             )
+        
+        # Dynamically update max concurrent subprocesses based on backup_gpu_ids
+        # Each GPU can host up to MAX_SUBPROCESSES_PER_GPU concurrent evaluations
+        self._max_concurrent_subprocesses = min(
+            MAX_CONCURRENT_SUBPROCESSES,
+            self.MAX_SUBPROCESSES_PER_GPU * len(self.backup_gpu_ids)
+        )
         
         # First, poll for any completed subprocesses and process their results
         completed_results = self._poll_running_subprocesses()
@@ -1438,8 +1471,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 if 'CUDA_VISIBLE_DEVICES' in os.environ:
                     del os.environ['CUDA_VISIBLE_DEVICES']
         
+        # Count subprocesses per GPU for logging
+        gpu_counts = {}
+        for sp in self._running_subprocesses:
+            gpu_counts[sp.gpu_id] = gpu_counts.get(sp.gpu_id, 0) + 1
+        gpu_usage_str = ", ".join([f"GPU{g}:{c}" for g, c in sorted(gpu_counts.items())])
+        
         self.print_to_log_file(f"[MP] Spawned test eval subprocess for epoch {epoch} (PID: {process.pid}, GPU: {subprocess_gpu_id})")
-        self.print_to_log_file(f"[MP] Currently {len(self._running_subprocesses)} subprocess(es) running")
+        self.print_to_log_file(f"[MP] Currently {len(self._running_subprocesses)}/{self._max_concurrent_subprocesses} subprocess(es) running [{gpu_usage_str}]")
         
         return True
     
