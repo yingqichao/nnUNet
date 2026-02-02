@@ -37,18 +37,44 @@ class nnUNetLogger(object):
 
         if self.verbose: print(f'logging {key}: {value} for epoch {epoch}')
 
-        if len(self.my_fantastic_logging[key]) < (epoch + 1):
-            self.my_fantastic_logging[key].append(value)
+        current_len = len(self.my_fantastic_logging[key])
+        if current_len < (epoch + 1):
+            # Need to add entry(ies) to reach the epoch
+            if current_len == epoch:
+                # Normal case: just append the next value
+                self.my_fantastic_logging[key].append(value)
+            else:
+                # Gap case: pad with last known value (or current value if empty) to maintain index alignment
+                # This handles cases where training was continued from checkpoint with eval_every_n_epochs
+                if current_len > 0:
+                    pad_value = self.my_fantastic_logging[key][-1]
+                else:
+                    pad_value = value
+                # Pad up to (epoch - 1), then append the actual value
+                for _ in range(epoch - current_len):
+                    self.my_fantastic_logging[key].append(pad_value)
+                self.my_fantastic_logging[key].append(value)
         else:
-            assert len(self.my_fantastic_logging[key]) == (epoch + 1), 'something went horribly wrong. My logging ' \
-                                                                       'lists length is off by more than 1'
+            assert current_len == (epoch + 1), 'something went horribly wrong. My logging ' \
+                                               'lists length is off by more than 1'
             print(f'maybe some logging issue!? logging {key} and {value}')
             self.my_fantastic_logging[key][epoch] = value
 
         # handle the ema_fg_dice special case! It is automatically logged when we add a new mean_fg_dice
         if key == 'mean_fg_dice':
-            new_ema_pseudo_dice = self.my_fantastic_logging['ema_fg_dice'][epoch - 1] * 0.9 + 0.1 * value \
-                if len(self.my_fantastic_logging['ema_fg_dice']) > 0 else value
+            # Check if previous epoch's EMA exists (need at least `epoch` entries to access [epoch-1])
+            # Also handle epoch=0 case (no previous EMA to use)
+            ema_list = self.my_fantastic_logging['ema_fg_dice']
+            if epoch > 0 and len(ema_list) >= epoch:
+                # Normal case: use previous EMA for smoothing
+                new_ema_pseudo_dice = ema_list[epoch - 1] * 0.9 + 0.1 * value
+            elif len(ema_list) > 0:
+                # Gap case: previous epoch doesn't exist, use last available EMA
+                # This handles cases where evaluations were skipped (eval_every_n_epochs)
+                new_ema_pseudo_dice = ema_list[-1] * 0.9 + 0.1 * value
+            else:
+                # First epoch or empty list: use current value directly
+                new_ema_pseudo_dice = value
             self.log('ema_fg_dice', new_ema_pseudo_dice, epoch)
 
     def plot_progress_png(self, output_folder):

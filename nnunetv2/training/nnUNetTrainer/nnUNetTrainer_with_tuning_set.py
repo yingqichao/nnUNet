@@ -4259,11 +4259,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 self.dynamic_sampling_strategy.p1_history = saved_history.get('p1_anatomy', [])
                 self.dynamic_sampling_strategy.p2_history = saved_history.get('p2_lesion', [])
                 self.dynamic_sampling_strategy.ema_history = saved_history.get('ema_lesion_dice', [])
+                self.dynamic_sampling_strategy.f1_ema_history = saved_history.get('ema_lesion_f1', [])
                 self.dynamic_sampling_strategy.recall_ema_history = saved_history.get('ema_lesion_recall', [])
                 self.dynamic_sampling_strategy.precision_ema_history = saved_history.get('ema_lesion_precision', [])
                 self.dynamic_sampling_strategy.epoch = len(self.dynamic_sampling_strategy.p1_history)
                 if self.dynamic_sampling_strategy.ema_history:
                     self.dynamic_sampling_strategy.ema_lesion_dice = self.dynamic_sampling_strategy.ema_history[-1]
+                if self.dynamic_sampling_strategy.f1_ema_history:
+                    self.dynamic_sampling_strategy.ema_lesion_f1 = self.dynamic_sampling_strategy.f1_ema_history[-1]
                 if self.dynamic_sampling_strategy.recall_ema_history:
                     self.dynamic_sampling_strategy.ema_lesion_recall = self.dynamic_sampling_strategy.recall_ema_history[-1]
                 if self.dynamic_sampling_strategy.precision_ema_history:

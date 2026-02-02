@@ -109,6 +109,7 @@ class DynamicSamplingStrategy:
         
         # History of EMAs for trend/convergence detection
         self.ema_history: List[float] = []  # Dice EMA history
+        self.f1_ema_history: List[float] = []  # F1 EMA history
         self.recall_ema_history: List[float] = []  # Recall EMA history for drop detection
         self.precision_ema_history: List[float] = []  # Precision EMA history for drop detection
         
@@ -241,6 +242,15 @@ class DynamicSamplingStrategy:
             self.ema_lesion_recall = lesion_recall
             self.ema_lesion_precision = lesion_precision
         else:
+            # Handle case where some EMAs are None (e.g., from old checkpoint)
+            # Initialize any None values to current metric before EMA update
+            if self.ema_lesion_f1 is None:
+                self.ema_lesion_f1 = lesion_f1
+            if self.ema_lesion_recall is None:
+                self.ema_lesion_recall = lesion_recall
+            if self.ema_lesion_precision is None:
+                self.ema_lesion_precision = lesion_precision
+            
             # Update with exponential smoothing: EMA_new = alpha * value + (1 - alpha) * EMA_old
             self.ema_lesion_dice = alpha * lesion_dice + (1 - alpha) * self.ema_lesion_dice
             self.ema_lesion_f1 = alpha * lesion_f1 + (1 - alpha) * self.ema_lesion_f1
@@ -249,6 +259,7 @@ class DynamicSamplingStrategy:
         
         # Store EMA history for trend detection
         self.ema_history.append(self.ema_lesion_dice)
+        self.f1_ema_history.append(self.ema_lesion_f1)
         self.recall_ema_history.append(self.ema_lesion_recall)
         self.precision_ema_history.append(self.ema_lesion_precision)
     
@@ -490,6 +501,7 @@ class DynamicSamplingStrategy:
             'p1_anatomy': self.p1_history,
             'p2_lesion': self.p2_history,
             'ema_lesion_dice': self.ema_history,
+            'ema_lesion_f1': self.f1_ema_history,
             'ema_lesion_recall': self.recall_ema_history,
             'ema_lesion_precision': self.precision_ema_history,
             # Best tracking info
