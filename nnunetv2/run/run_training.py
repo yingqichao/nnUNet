@@ -62,7 +62,14 @@ def get_trainer_from_args(dataset_name_or_id: Union[int, str],
 
     # initialize nnunet trainer
     preprocessed_dataset_folder_base = join(nnUNet_preprocessed, maybe_convert_to_dataset_name(dataset_name_or_id))
-    plans_file = join(preprocessed_dataset_folder_base, plans_identifier + '.json')
+    
+    # Support both plans identifier (e.g., "nnUNetPlans") and absolute path (e.g., "/path/to/plans.json")
+    # If "/" is in the plans_identifier, treat it as an absolute path
+    if '/' in plans_identifier:
+        plans_file = plans_identifier
+        print(f"Using absolute plans file path: {plans_file}")
+    else:
+        plans_file = join(preprocessed_dataset_folder_base, plans_identifier + '.json')
     plans = load_json(plans_file)
     dataset_json = load_json(join(preprocessed_dataset_folder_base, 'dataset.json'))
     nnunet_trainer = nnunet_trainer(plans=plans, configuration=configuration, fold=fold,
@@ -654,7 +661,8 @@ def run_training_entry():
     parser.add_argument('-tr', type=str, required=False, default='nnUNetTrainer',
                         help='[OPTIONAL] Use this flag to specify a custom trainer. Default: nnUNetTrainer')
     parser.add_argument('-p', type=str, required=False, default='nnUNetPlans',
-                        help='[OPTIONAL] Use this flag to specify a custom plans identifier. Default: nnUNetPlans')
+                        help='[OPTIONAL] Plans identifier (e.g., nnUNetPlans, nnUNetResEncUNetLPlans) or '
+                             'absolute path to plans JSON file (if contains "/"). Default: nnUNetPlans')
     parser.add_argument('-pretrained_weights', type=str, required=False, default=None,
                         help='[OPTIONAL] path to nnU-Net checkpoint file to be used as pretrained model. Will only '
                              'be used when actually training. Beta. Use with caution.')
