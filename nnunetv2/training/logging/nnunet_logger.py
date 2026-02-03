@@ -53,7 +53,7 @@ class nnUNetLogger(object):
                 # Pad up to (epoch - 1), then append the actual value
                 for _ in range(epoch - current_len):
                     self.my_fantastic_logging[key].append(pad_value)
-                self.my_fantastic_logging[key].append(value)
+            self.my_fantastic_logging[key].append(value)
         else:
             assert current_len == (epoch + 1), 'something went horribly wrong. My logging ' \
                                                'lists length is off by more than 1'

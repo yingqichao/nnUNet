@@ -329,18 +329,39 @@ def _async_test_eval_worker(
         num_input_channels = determine_num_input_channels(plans_manager, config_manager, dataset_json)
         num_output_channels = label_manager.num_segmentation_heads
         
-        # Build network using correct function signature
-        from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+        # Build network - supports both nnunet and swinunetr architectures
+        model_name = checkpoint.get('model_name', 'nnunet')  # Default to nnunet for backwards compatibility
         
-        network = get_network_from_plans(
-            arch_class_name=config_manager.network_arch_class_name,
-            arch_kwargs=config_manager.network_arch_init_kwargs,
-            arch_kwargs_req_import=config_manager.network_arch_init_kwargs_req_import,
-            input_channels=num_input_channels,
-            output_channels=num_output_channels,
-            allow_init=True,
-            deep_supervision=eval_config.get('enable_deep_supervision', True)
-        )
+        if model_name == 'swinunetr':
+            # Build SwinUNETR (deep supervision is always disabled)
+            from .swinunetr_builder import build_swinunetr
+            # Get feature_size from checkpoint (default to 48 for backwards compatibility)
+            swinunetr_feature_size = checkpoint.get('swinunetr_feature_size', 48)
+            _mp_log_fn(f"[Subprocess] Using SwinUNETR architecture (feature_size={swinunetr_feature_size}, deep supervision disabled)")
+            network = build_swinunetr(
+                num_input_channels=num_input_channels,
+                num_output_channels=num_output_channels,
+                patch_size=tuple(config_manager.patch_size),
+                feature_size=swinunetr_feature_size,
+                use_checkpoint=False,  # Don't need gradient checkpointing for inference
+                spatial_dims=3,
+            )
+            # Override enable_deep_supervision for SwinUNETR
+            eval_config['enable_deep_supervision'] = False
+        else:
+            # Build standard nnUNet network
+            from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+            
+            network = get_network_from_plans(
+                arch_class_name=config_manager.network_arch_class_name,
+                arch_kwargs=config_manager.network_arch_init_kwargs,
+                arch_kwargs_req_import=config_manager.network_arch_init_kwargs_req_import,
+                input_channels=num_input_channels,
+                output_channels=num_output_channels,
+                allow_init=True,
+                deep_supervision=eval_config.get('enable_deep_supervision', True)
+            )
+        
         network.load_state_dict(checkpoint['network_weights'])
         network = network.to(device)
         network.eval()
@@ -493,9 +514,11 @@ def _async_test_eval_worker(
                         patch = data_tensor[(slice(None),) + sl][None]
                         
                         # Forward pass (dynamo errors suppressed, will fall back to eager)
-                        pred = network(patch)[0]
-                        if enable_deep_supervision:
-                            pred = pred[0]
+                        pred = network(patch)
+                        # Handle deep supervision: output is list of tensors at different scales
+                        # For SwinUNETR or nnUNet without DS: output is single tensor
+                        if isinstance(pred, (list, tuple)):
+                            pred = pred[0]  # Get highest resolution output
                         
                         pred = pred * gaussian
                         predicted_logits[(slice(None),) + sl] += pred

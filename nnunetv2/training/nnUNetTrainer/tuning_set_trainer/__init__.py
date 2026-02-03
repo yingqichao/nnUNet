@@ -66,6 +66,14 @@ from .custom_dataloaders import (
     nnUNetDataLoaderDualCropEval,
 )
 
+# SwinUNETR builder (for --model_name swinunetr)
+from .swinunetr_builder import (
+    build_swinunetr,
+    validate_patch_size_for_swinunetr,
+    adjust_patch_size_for_swinunetr,
+    get_swinunetr_default_config,
+)
+
 
 __all__ = [
     # Constants
@@ -103,4 +111,9 @@ __all__ = [
     # Dataloaders
     'nnUNetDataLoader3WayCentering',
     'nnUNetDataLoaderDualCropEval',
+    # SwinUNETR builder
+    'build_swinunetr',
+    'validate_patch_size_for_swinunetr',
+    'adjust_patch_size_for_swinunetr',
+    'get_swinunetr_default_config',
 ]

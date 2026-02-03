@@ -129,6 +129,8 @@ from nnunetv2.training.nnUNetTrainer.tuning_set_trainer import (
     # Custom dataloaders
     nnUNetDataLoader3WayCentering,
     nnUNetDataLoaderDualCropEval,
+    # SwinUNETR builder
+    build_swinunetr,
 )
 
 
@@ -174,6 +176,16 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                  splits_file: str = None):
         super().__init__(plans, configuration, fold, dataset_json, device,
                          checkpoint_signature, splits_file)
+        
+        # =====================================================================
+        # MODEL ARCHITECTURE CONFIGURATION
+        # =====================================================================
+        # Network architecture to use: 'nnunet' (default) or 'swinunetr'
+        # Set via --model_name argument in run_training.py
+        # NOTE: SwinUNETR does NOT support deep supervision and torch.compile
+        # When swinunetr is used, output folder gets "_swinunetr" suffix
+        self.model_name: str = 'nnunet'  # Options: 'nnunet', 'swinunetr'
+        self._model_setup_done: bool = False  # Track if folder setup was done
         
         # Tuning set configuration
         # Note: tuning_ratio is kept for backward compatibility but NOT used
@@ -401,6 +413,220 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         self.print_to_log_file(f"  TEST:   {'ENABLED' if ENABLE_PRE_TRAINING_EVAL else 'DISABLED'}")
         self.print_to_log_file("=" * 70 + "\n")
     
+    # =========================================================================
+    # MODEL ARCHITECTURE METHODS (SwinUNETR Support)
+    # =========================================================================
+    
+    def _do_i_compile(self) -> bool:
+        """
+        Override to disable torch.compile for SwinUNETR.
+        
+        SwinUNETR uses transformers which may have dynamic shapes that
+        cause issues with torch.compile. Disable it for safety.
+        """
+        if self.model_name == 'swinunetr':
+            return False  # Disable compile for SwinUNETR
+        return super()._do_i_compile()
+    
+    def set_deep_supervision_enabled(self, enabled: bool):
+        """
+        Override to handle SwinUNETR which doesn't support deep supervision.
+        
+        SwinUNETR has a different architecture than nnUNet's default:
+        - No single 'decoder' object (has decoder1, decoder2, etc.)
+        - No 'deep_supervision' attribute
+        - Always returns single output tensor (no multi-scale outputs)
+        
+        For SwinUNETR, this method is a no-op since deep supervision
+        is always disabled and the network structure doesn't support it.
+        
+        For standard nnUNet, delegates to parent implementation.
+        """
+        if self.model_name == 'swinunetr':
+            # SwinUNETR doesn't support deep supervision - do nothing
+            # The network always outputs a single tensor regardless of this setting
+            return
+        # For standard nnUNet architecture, use parent implementation
+        super().set_deep_supervision_enabled(enabled)
+    
+    @staticmethod
+    def build_network_architecture(
+        architecture_class_name: str,
+        arch_init_kwargs: dict,
+        arch_init_kwargs_req_import,
+        num_input_channels: int,
+        num_output_channels: int,
+        enable_deep_supervision: bool = True,
+        model_name: str = 'nnunet',
+        patch_size: tuple = None,
+        swinunetr_feature_size: int = 48,
+    ):
+        """
+        Override to support SwinUNETR architecture.
+        
+        When model_name == 'swinunetr':
+        - Builds MONAI SwinUNETR instead of nnUNet default
+        - enable_deep_supervision is IGNORED (SwinUNETR doesn't support it)
+        - patch_size is REQUIRED for SwinUNETR
+        - swinunetr_feature_size controls model size (24=tiny, 36=small, 48=base)
+        
+        When model_name == 'nnunet':
+        - Uses standard nnUNet architecture from plans
+        - All parameters work as before
+        
+        Args:
+            architecture_class_name: Ignored for SwinUNETR
+            arch_init_kwargs: Ignored for SwinUNETR
+            arch_init_kwargs_req_import: Ignored for SwinUNETR
+            num_input_channels: Number of input channels
+            num_output_channels: Number of segmentation classes
+            enable_deep_supervision: Ignored for SwinUNETR (always False)
+            model_name: 'nnunet' (default) or 'swinunetr'
+            patch_size: Required for SwinUNETR, optional for nnunet
+            swinunetr_feature_size: Feature size for SwinUNETR (24, 36, or 48)
+            
+        Returns:
+            Network model (nn.Module)
+        """
+        if model_name == 'swinunetr':
+            if patch_size is None:
+                raise ValueError(
+                    "patch_size is required for SwinUNETR but was not provided. "
+                    "This should be set automatically from configuration_manager.patch_size"
+                )
+            
+            # Build SwinUNETR (deep supervision is always disabled)
+            # feature_size is dynamically determined based on patch volume
+            return build_swinunetr(
+                num_input_channels=num_input_channels,
+                num_output_channels=num_output_channels,
+                patch_size=patch_size,
+                feature_size=swinunetr_feature_size,
+                use_checkpoint=True,  # Save memory with gradient checkpointing
+                spatial_dims=3,
+            )
+        else:
+            # Default nnUNet architecture
+            from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+            return get_network_from_plans(
+                architecture_class_name,
+                arch_init_kwargs,
+                arch_init_kwargs_req_import,
+                num_input_channels,
+                num_output_channels,
+                allow_init=True,
+                deep_supervision=enable_deep_supervision,
+            )
+    
+    def initialize(self):
+        """
+        Override to handle SwinUNETR-specific initialization.
+        
+        For SwinUNETR:
+        - Force disable deep supervision
+        - Pass patch_size to build_network_architecture
+        - Log SwinUNETR-specific info
+        """
+        if not self.was_initialized:
+            # DDP batch size and oversampling can differ between workers
+            self._set_batch_size_and_oversample()
+            
+            from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+            self.num_input_channels = determine_num_input_channels(
+                self.plans_manager, self.configuration_manager, self.dataset_json
+            )
+            
+            # Force disable deep supervision for SwinUNETR and adjust patch size
+            if self.model_name == 'swinunetr':
+                self.enable_deep_supervision = False
+                
+                # SwinUNETR requires patch dimensions divisible by 32 (2^5)
+                # Adjust configuration_manager.patch_size if needed
+                from nnunetv2.training.nnUNetTrainer.tuning_set_trainer.swinunetr_builder import adjust_patch_size_for_swinunetr
+                original_patch_size = list(self.configuration_manager.patch_size)
+                adjusted_patch_size = adjust_patch_size_for_swinunetr(original_patch_size)
+                
+                if list(adjusted_patch_size) != original_patch_size:
+                    # Modify the configuration manager's patch size
+                    # This is a bit hacky but necessary for SwinUNETR compatibility
+                    self.configuration_manager.configuration['patch_size'] = list(adjusted_patch_size)
+                    self.print_to_log_file("\n" + "=" * 70)
+                    self.print_to_log_file("*** SwinUNETR PATCH SIZE ADJUSTMENT ***")
+                    self.print_to_log_file(f"  Original patch size: {original_patch_size}")
+                    self.print_to_log_file(f"  Adjusted patch size: {list(adjusted_patch_size)}")
+                    self.print_to_log_file("  (SwinUNETR requires dimensions divisible by 32)")
+                    self.print_to_log_file("=" * 70)
+                
+                # Calculate patch volume for memory estimation
+                patch_volume = 1
+                for dim in self.configuration_manager.patch_size:
+                    patch_volume *= dim
+                
+                # SwinUNETR feature_size selection based on patch volume
+                # Typical 96³ = 884,736 voxels works with feature_size=48
+                # Larger patches need smaller feature_size to fit in GPU memory
+                # Note: feature_size must be divisible by 12 (MONAI requirement)
+                # Options: 12 (micro), 24 (tiny), 36 (small), 48 (base)
+                if patch_volume > 4_000_000:  # Huge patches (>4M voxels, like 64x320x256)
+                    self._swinunetr_feature_size = 24  # "micro" model - minimum possible
+                    self.print_to_log_file(f"*** Huge patch volume ({patch_volume:,} voxels) → using feature_size=12 (micro)")
+                elif patch_volume > 2_000_000:  # Very large patches (2-4M voxels)
+                    self._swinunetr_feature_size = 36  # "tiny" model
+                    self.print_to_log_file(f"*** Large patch volume ({patch_volume:,} voxels) → using feature_size=24 (tiny)")
+                elif patch_volume > 1_000_000:  # Large patches (1-2M voxels)
+                    self._swinunetr_feature_size = 48  # "small" model
+                    self.print_to_log_file(f"*** Medium patch volume ({patch_volume:,} voxels) → using feature_size=36 (small)")
+                else:
+                    self._swinunetr_feature_size = 64  # "base" model (default)
+                
+                self.print_to_log_file("\n" + "=" * 70)
+                self.print_to_log_file("*** USING SwinUNETR ARCHITECTURE ***")
+                self.print_to_log_file("  Deep supervision: DISABLED (not supported)")
+                self.print_to_log_file("  torch.compile: DISABLED (transformer compatibility)")
+                self.print_to_log_file(f"  Patch size: {self.configuration_manager.patch_size}")
+                self.print_to_log_file(f"  Feature size: {self._swinunetr_feature_size}")
+                self.print_to_log_file(f"  Patch volume: {patch_volume:,} voxels")
+                self.print_to_log_file("=" * 70 + "\n")
+            
+            # Build network with model_name-aware method
+            # For SwinUNETR, pass the dynamically determined feature_size
+            swinunetr_feature_size = getattr(self, '_swinunetr_feature_size', 48)
+            self.network = self.build_network_architecture(
+                self.configuration_manager.network_arch_class_name,
+                self.configuration_manager.network_arch_init_kwargs,
+                self.configuration_manager.network_arch_init_kwargs_req_import,
+                self.num_input_channels,
+                self.label_manager.num_segmentation_heads,
+                self.enable_deep_supervision,
+                model_name=self.model_name,
+                patch_size=self.configuration_manager.patch_size,
+                swinunetr_feature_size=swinunetr_feature_size,
+            ).to(self.device)
+            
+            # Compile network for free speedup (disabled for SwinUNETR)
+            if self._do_i_compile():
+                self.print_to_log_file('Using torch.compile...')
+                self.network = torch.compile(self.network)
+            
+            self.optimizer, self.lr_scheduler = self.configure_optimizers()
+            
+            # If ddp, wrap in DDP wrapper
+            if self.is_ddp:
+                from torch.nn.parallel import DistributedDataParallel as DDP
+                self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
+                self.network = DDP(self.network, device_ids=[self.local_rank])
+            
+            self.loss = self._build_loss()
+            
+            from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+            self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
+            
+            self.was_initialized = True
+        else:
+            raise RuntimeError("You have called self.initialize even though the trainer was already initialized.")
+    
+    # =========================================================================
+    
     def _setup_integration_test_mode(self) -> None:
         """
         Setup integration test mode: modify output folder and create directory.
@@ -453,6 +679,51 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         print(f"  Val iterations per epoch: {self.num_val_iterations_per_epoch} (normally 50)")
         print(f"  Total epochs: {self.num_epochs} (normally 1000)")
         print(f"  Eval every: {self.eval_every_n_epochs} epochs")
+        print(f"  Output folder: {self.output_folder}")
+        print("=" * 70 + "\n")
+    
+    def _setup_swinunetr_mode(self) -> None:
+        """
+        Setup SwinUNETR mode: modify output folder to add "_swinunetr" suffix.
+        
+        This method MUST be called by run_training.py AFTER setting 
+        self.model_name = 'swinunetr' and BEFORE check_everything_before_training().
+        
+        Actions:
+        - Adds "_swinunetr" suffix to output folder (before any other suffixes)
+        - Creates the new output folder
+        - Re-initializes log file path
+        
+        Example folder names:
+        - Base: .../nnUNetTrainer_WithTuningSet__nnUNetResEncUNetLPlans__3d_fullres
+        - SwinUNETR: .../nnUNetTrainer_WithTuningSet__nnUNetResEncUNetLPlans__3d_fullres_swinunetr
+        - SwinUNETR + integration test: .../..._swinunetr_integration_test
+        """
+        if self.model_name != 'swinunetr':
+            return
+        
+        if self._model_setup_done:
+            return  # Already set up
+        
+        # Modify output folder to add "_swinunetr" suffix
+        # Check if it already has the suffix (e.g., from checkpoint loading)
+        if not self.output_folder.endswith("_swinunetr") and "_swinunetr" not in self.output_folder:
+            new_output_folder = self.output_folder + "_swinunetr"
+            
+            # Update output folder
+            self.output_folder = new_output_folder
+            maybe_mkdir_p(self.output_folder)
+            
+            # Re-initialize log file in new folder
+            self.log_file = join(self.output_folder, 'training_log.txt')
+        
+        self._model_setup_done = True
+        
+        print("\n" + "=" * 70)
+        print("*** SWINUNETR MODE ***")
+        print(f"  Model architecture: SwinUNETR (MONAI)")
+        print(f"  Deep supervision: DISABLED (not supported)")
+        print(f"  torch.compile: DISABLED (transformer compatibility)")
         print(f"  Output folder: {self.output_folder}")
         print("=" * 70 + "\n")
     
@@ -707,6 +978,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             # =========================================================
             # TUNING SET TRAINER CUSTOM DATA
             # =========================================================
+            # Model architecture
+            'model_name': self.model_name,
+            'swinunetr_feature_size': getattr(self, '_swinunetr_feature_size', 48),
+            # Tuning set
             'tuning_keys': self.tuning_keys,
             'tuning_metrics': self.tuning_metrics,
             'tuning_ratio': self.tuning_ratio,
@@ -1827,6 +2102,10 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             self.print_to_log_file("-" * 70)
             
             try:
+                # Clear GPU memory before evaluation (helps with large models like SwinUNETR)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 self.network.eval()
                 
                 # Limit samples for faster sanity check
@@ -2426,7 +2705,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             train_keys = remaining_original + synthetic_keys
             self.removed_synthetic_keys = []
             self.n_synthetic_removed = 0
-            
+        
             # Calculate sampling probabilities to achieve target ratio in expectation
             # Target: P(synthetic) = max_synthetic_ratio
             # If we have n_orig original and n_syn synthetic samples, and want ratio r:
@@ -2943,24 +3222,46 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         _dynamo.config.suppress_errors = True
         
         # Process ONLY foreground boxes
-        for box_idx in foreground_indices:
+        # Memory management: For SwinUNETR and large patches, we process one box at a time
+        # with explicit tensor deletion and periodic cache clearing to avoid GPU OOM
+        num_boxes = len(foreground_indices)
+        clear_cache_interval = max(1, num_boxes // 10)  # Clear cache every ~10% of boxes
+        
+        for i, box_idx in enumerate(foreground_indices):
             sl = box_slicers[box_idx]
             
             # Extract patch: sl is for spatial dims, need to add channel dim
             patch = data[(slice(None),) + sl][None]  # Add batch dim
             
             # Forward pass (dynamo errors suppressed, will fall back to eager)
-            pred = self.network(patch)[0]  # Remove batch dim
+            pred = self.network(patch)
             
-            if self.enable_deep_supervision:
-                pred = pred[0]  # Take first output (highest resolution)
+            # Free input patch immediately
+            del patch
             
-            # Apply Gaussian weighting
-            pred = pred * gaussian
+            # Handle deep supervision: output is list of tensors at different scales
+            # For SwinUNETR or nnUNet without DS: output is single tensor
+            if isinstance(pred, (list, tuple)):
+                pred = pred[0]  # Get highest resolution output
+            
+            # Remove batch dimension
+            pred = pred[0]
+            
+            # Apply Gaussian weighting and aggregate
+            weighted_pred = pred * gaussian
+            del pred  # Free unweighted prediction
             
             # Aggregate into full-volume arrays
-            predicted_logits[(slice(None),) + sl] += pred
+            predicted_logits[(slice(None),) + sl] += weighted_pred
             n_predictions[sl] += gaussian
+            
+            # Free weighted prediction
+            del weighted_pred
+            
+            # Periodically clear CUDA cache to prevent memory fragmentation
+            # This is especially important for large models like SwinUNETR
+            if (i + 1) % clear_cache_interval == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Create valid mask: regions where at least one box contributed
         valid_mask = n_predictions > 0
@@ -3327,9 +3628,15 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                             patch_tensor = torch.from_numpy(patch_data).float().to(self.device)[None]  # Add batch
                             
                             # Forward pass (dynamo errors suppressed, will fall back to eager)
-                            pred = self.network(patch_tensor)[0]  # Remove batch
-                            if self.enable_deep_supervision:
-                                pred = pred[0]
+                            pred = self.network(patch_tensor)
+                            
+                            # Handle deep supervision: output is list of tensors at different scales
+                            # For SwinUNETR or nnUNet without DS: output is single tensor
+                            if isinstance(pred, (list, tuple)):
+                                pred = pred[0]  # Get highest resolution output
+                            
+                            # Remove batch dimension
+                            pred = pred[0]
                             
                             # Get segmentation (argmax)
                             pred_seg = pred.argmax(0).cpu().numpy()  # (D, H, W)
@@ -3600,10 +3907,34 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         """
         Single forward pass on tuning batch to compute metrics.
         Mirrors validation_step logic.
+        
+        IMPORTANT: For dual-crop evaluation, the batch contains interleaved patches:
+        - Even indices (0, 2, 4, ...): Anatomy-centered patches
+        - Odd indices (1, 3, 5, ...): Tumor-centered patches
+        
+        To reduce GPU memory usage, we process anatomy and tumor crops SEQUENTIALLY
+        instead of batching them all together. This halves peak GPU memory usage.
         """
         data = batch['data']
         target = batch['target']
         
+        # Check if this is a dual-crop batch (even number of patches where half are anatomy, half are tumor)
+        # Dual-crop batches have interleaved anatomy/tumor patches
+        batch_size = data.shape[0]
+        is_dual_crop = batch_size >= 2 and batch_size % 2 == 0
+        
+        if is_dual_crop:
+            # Process anatomy and tumor crops SEQUENTIALLY to save GPU memory
+            return self._tuning_step_sequential_dual_crop(data, target)
+        else:
+            # Standard single-batch processing
+            return self._tuning_step_single_batch(data, target)
+    
+    def _tuning_step_single_batch(self, data: torch.Tensor, target) -> dict:
+        """
+        Process a single batch of patches through the network.
+        Used for non-dual-crop evaluation or as a helper for sequential processing.
+        """
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
@@ -3632,6 +3963,9 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             predicted_segmentation_onehot.scatter_(1, output_seg, 1)
             del output_seg
         
+        # Free output tensor
+        del output
+        
         if self.label_manager.has_ignore_label:
             if not self.label_manager.has_regions:
                 mask = (target != self.label_manager.ignore_label).float()
@@ -3647,10 +3981,18 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         tp, fp, fn, tn = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
         
+        # Free intermediate tensors
+        del predicted_segmentation_onehot, target
+        if mask is not None:
+            del mask
+        
         tp_hard = tp.detach().cpu().numpy()
         fp_hard = fp.detach().cpu().numpy()
         fn_hard = fn.detach().cpu().numpy()
         tn_hard = tn.detach().cpu().numpy()
+        
+        # Free GPU tensors
+        del tp, fp, fn, tn
         
         if not self.label_manager.has_regions:
             tp_hard = tp_hard[1:]
@@ -3660,6 +4002,70 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 
                 'fn_hard': fn_hard, 'tn_hard': tn_hard}
+    
+    def _tuning_step_sequential_dual_crop(self, data: torch.Tensor, target) -> dict:
+        """
+        Process dual-crop batch SEQUENTIALLY to reduce peak GPU memory.
+        
+        The batch contains interleaved patches:
+        - Even indices (0, 2, 4, ...): Anatomy-centered patches
+        - Odd indices (1, 3, 5, ...): Tumor-centered patches
+        
+        We process anatomy patches first, clear GPU memory, then process tumor patches.
+        This halves the peak GPU memory requirement compared to processing all at once.
+        """
+        batch_size = data.shape[0]
+        
+        # Split into anatomy (even indices) and tumor (odd indices) patches
+        anatomy_indices = list(range(0, batch_size, 2))  # [0, 2, 4, ...]
+        tumor_indices = list(range(1, batch_size, 2))     # [1, 3, 5, ...]
+        
+        data_anatomy = data[anatomy_indices]
+        data_tumor = data[tumor_indices]
+        
+        if isinstance(target, list):
+            target_anatomy = [t[anatomy_indices] for t in target]
+            target_tumor = [t[tumor_indices] for t in target]
+        else:
+            target_anatomy = target[anatomy_indices]
+            target_tumor = target[tumor_indices]
+        
+        # Free original data tensor
+        del data, target
+        
+        # ========== Process ANATOMY patches first ==========
+        result_anatomy = self._tuning_step_single_batch(data_anatomy, target_anatomy)
+        
+        # Free anatomy data and clear GPU cache BEFORE processing tumor
+        del data_anatomy, target_anatomy
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # ========== Process TUMOR patches ==========
+        result_tumor = self._tuning_step_single_batch(data_tumor, target_tumor)
+        
+        # Free tumor data
+        del data_tumor, target_tumor
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # ========== Combine results ==========
+        # Average loss across anatomy and tumor
+        combined_loss = (result_anatomy['loss'] + result_tumor['loss']) / 2
+        
+        # Sum TP/FP/FN/TN across both crop types (they evaluate different regions)
+        combined_tp = result_anatomy['tp_hard'] + result_tumor['tp_hard']
+        combined_fp = result_anatomy['fp_hard'] + result_tumor['fp_hard']
+        combined_fn = result_anatomy['fn_hard'] + result_tumor['fn_hard']
+        combined_tn = result_anatomy['tn_hard'] + result_tumor['tn_hard']
+        
+        return {
+            'loss': combined_loss,
+            'tp_hard': combined_tp,
+            'fp_hard': combined_fp,
+            'fn_hard': combined_fn,
+            'tn_hard': combined_tn
+        }
     
     def _should_run_evaluation(self) -> bool:
         """
@@ -4197,27 +4603,31 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     # =========================================================
                     # TUNING SET TRAINER CUSTOM DATA
                     # =========================================================
+                    # Model architecture
+                    'model_name': self.model_name,
+                    'swinunetr_feature_size': getattr(self, '_swinunetr_feature_size', 48),
+                    # Tuning set
                     'tuning_keys': self.tuning_keys,
-                    'tuning_metrics': self.tuning_metrics,
-                    'tuning_ratio': self.tuning_ratio,
+            'tuning_metrics': self.tuning_metrics,
+            'tuning_ratio': self.tuning_ratio,
                     '_tuning_set_source': self._tuning_set_source,
-                    # 3-way centering probabilities
-                    'train_prob_random': self.train_prob_random,
-                    'train_prob_anatomy': self.train_prob_anatomy,
-                    'train_prob_tumor': self.train_prob_tumor,
-                    'tuning_prob_random': self.tuning_prob_random,
-                    'tuning_prob_anatomy': self.tuning_prob_anatomy,
-                    'tuning_prob_tumor': self.tuning_prob_tumor,
-                    'test_prob_random': self.test_prob_random,
-                    'test_prob_anatomy': self.test_prob_anatomy,
-                    'test_prob_tumor': self.test_prob_tumor,
-                    # Original vs synthetic sample handling
-                    'pattern_original_samples': self.pattern_original_samples,
-                    'max_synthetic_ratio': self.max_synthetic_ratio,
-                    'n_original_total': self.n_original_total,
-                    'n_synthetic_total': self.n_synthetic_total,
-                    'n_synthetic_removed': self.n_synthetic_removed,
-                    'removed_synthetic_keys': self.removed_synthetic_keys,
+            # 3-way centering probabilities
+            'train_prob_random': self.train_prob_random,
+            'train_prob_anatomy': self.train_prob_anatomy,
+            'train_prob_tumor': self.train_prob_tumor,
+            'tuning_prob_random': self.tuning_prob_random,
+            'tuning_prob_anatomy': self.tuning_prob_anatomy,
+            'tuning_prob_tumor': self.tuning_prob_tumor,
+            'test_prob_random': self.test_prob_random,
+            'test_prob_anatomy': self.test_prob_anatomy,
+            'test_prob_tumor': self.test_prob_tumor,
+            # Original vs synthetic sample handling
+            'pattern_original_samples': self.pattern_original_samples,
+            'max_synthetic_ratio': self.max_synthetic_ratio,
+            'n_original_total': self.n_original_total,
+            'n_synthetic_total': self.n_synthetic_total,
+            'n_synthetic_removed': self.n_synthetic_removed,
+            'removed_synthetic_keys': self.removed_synthetic_keys,
                     'excluded_no_tumor_keys': self.excluded_no_tumor_keys,
                     # Dynamic sampling strategy state
                     'enable_dynamic_sampling': self.enable_dynamic_sampling,
@@ -4258,6 +4668,21 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             checkpoint = filename_or_checkpoint
         
         if 'tuning_keys' in checkpoint:
+            # Load model architecture name and SwinUNETR feature_size
+            loaded_model_name = checkpoint.get('model_name', self.model_name)
+            if loaded_model_name != self.model_name:
+                self.print_to_log_file(f"Loaded model_name from checkpoint: {loaded_model_name} (was: {self.model_name})")
+            self.model_name = loaded_model_name
+            
+            # Load SwinUNETR feature_size if available
+            if 'swinunetr_feature_size' in checkpoint:
+                self._swinunetr_feature_size = checkpoint['swinunetr_feature_size']
+            
+            # Ensure output folder has correct suffix if SwinUNETR was used
+            # (handles case where user forgot --model_name swinunetr on continue)
+            if self.model_name == 'swinunetr':
+                self._setup_swinunetr_mode()
+            
             self.tuning_keys = checkpoint['tuning_keys']
             self.tuning_metrics = checkpoint.get('tuning_metrics', self.tuning_metrics)
             self.tuning_ratio = checkpoint.get('tuning_ratio', self.tuning_ratio)
@@ -4339,6 +4764,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
             self._last_eval_results = checkpoint.get('_last_eval_results', self._last_eval_results)
             self._last_eval_epoch = checkpoint.get('_last_eval_epoch', self._last_eval_epoch)
             
+            self.print_to_log_file(f"Loaded model architecture: {self.model_name}")
             self.print_to_log_file(f"Loaded tuning info: {len(self.tuning_keys)} tuning cases (source: {self._tuning_set_source})")
             self.print_to_log_file(f"Loaded centering probs - Train: ({self.train_prob_random:.2f}/{self.train_prob_anatomy:.2f}/{self.train_prob_tumor:.2f})")
             self.print_to_log_file(f"Loaded eval modes: tuning={self.tuning_eval_mode}, test={self.test_eval_mode}")

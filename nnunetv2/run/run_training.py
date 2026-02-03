@@ -368,7 +368,8 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
             pretrained_weights, npz, val_with_best, world_size, checkpoint_signature=None, splits_file=None,
             checkpoint_path=None, skip_manual_confirm=False, pattern_original_samples=None,
             ignore_existing_best=False, skip_val=False, ignore_synthetic=False,
-            main_gpu_id=None, backup_gpu_ids=None, integration_test=False, specify_val_set_only=False):
+            main_gpu_id=None, backup_gpu_ids=None, integration_test=False, specify_val_set_only=False,
+            model_name='nnunet'):
     setup_ddp(rank, world_size)
     torch.cuda.set_device(torch.device('cuda', dist.get_rank()))
 
@@ -411,6 +412,16 @@ def run_ddp(rank, dataset_name_or_id, configuration, fold, tr, p, disable_checkp
         nnunet_trainer.specify_val_set_only = True
         if rank == 0:
             print(f"*** specify_val_set_only mode enabled: fold {fold}'s val set only, all other samples for training")
+    
+    # Set model name (used by nnUNetTrainer_WithTuningSet for SwinUNETR support)
+    # Must call _setup_swinunetr_mode() to modify output folder BEFORE confirmation
+    if hasattr(nnunet_trainer, 'model_name'):
+        nnunet_trainer.model_name = model_name
+        if rank == 0 and model_name != 'nnunet':
+            print(f"*** Using model architecture: {model_name}")
+            # Setup SwinUNETR mode (modifies output folder to add "_swinunetr" suffix)
+            if hasattr(nnunet_trainer, '_setup_swinunetr_mode'):
+                nnunet_trainer._setup_swinunetr_mode()
 
     assert not (c and val), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -491,7 +502,8 @@ def run_training(
     main_gpu_id: Optional[int] = None,               # args.main_gpu_id
     backup_gpu_ids: Optional[str] = None,            # args.backup_gpu_ids (comma-separated)
     integration_test: bool = False,                  # args.integration_test
-    specify_val_set_only: bool = False                   # args.specify_val_set_only
+    specify_val_set_only: bool = False,              # args.specify_val_set_only
+    model_name: str = 'nnunet',                      # args.model_name ('nnunet' or 'swinunetr')
 ):
     if plans_identifier == 'nnUNetPlans':
         print("\n############################\n"
@@ -544,7 +556,8 @@ def run_training(
                      main_gpu_id,
                      backup_gpu_ids,
                      integration_test,
-                     specify_val_set_only),
+                     specify_val_set_only,
+                     model_name),
                  nprocs=num_gpus,
                  join=True)
     else:
@@ -599,6 +612,16 @@ def run_training(
         if specify_val_set_only:
             nnunet_trainer.specify_val_set_only = True
             print(f"*** specify_val_set_only mode enabled: fold {fold}'s val set only, all other samples for training")
+        
+        # Set model name (used by nnUNetTrainer_WithTuningSet for SwinUNETR support)
+        # Must call _setup_swinunetr_mode() to modify output folder BEFORE confirmation
+        if hasattr(nnunet_trainer, 'model_name'):
+            nnunet_trainer.model_name = model_name
+            if model_name != 'nnunet':
+                print(f"*** Using model architecture: {model_name}")
+                # Setup SwinUNETR mode (modifies output folder to add "_swinunetr" suffix)
+                if hasattr(nnunet_trainer, '_setup_swinunetr_mode'):
+                    nnunet_trainer._setup_swinunetr_mode()
 
         assert not (continue_training and only_run_validation), f'Cannot set --c and --val flag at the same time. Dummy.'
 
@@ -737,6 +760,11 @@ def run_training_entry():
                         help='[OPTIONAL] Run integration test with minimal data (5 samples per split). '
                              'Only used by nnUNetTrainer_WithTuningSet. Output folder gets "_integration_test" suffix. '
                              'Existing integration test folder will be removed.')
+    parser.add_argument('--model_name', type=str, required=False, default='nnunet',
+                        choices=['nnunet', 'swinunetr'],
+                        help='[OPTIONAL] Network architecture to use. "nnunet" (default) uses the standard nnUNet '
+                             'architecture from plans. "swinunetr" uses MONAI SwinUNETR transformer architecture. '
+                             'Note: SwinUNETR disables deep supervision and torch.compile.')
     args = parser.parse_args()
 
     assert args.device in ['cpu', 'cuda', 'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
@@ -765,7 +793,8 @@ def run_training_entry():
                  main_gpu_id=args.main_gpu_id,
                  backup_gpu_ids=args.backup_gpu_ids,
                  integration_test=args.integration_test,
-                 specify_val_set_only=args.specify_val_set_only)
+                 specify_val_set_only=args.specify_val_set_only,
+                 model_name=args.model_name)
 
 
 if __name__ == '__main__':
