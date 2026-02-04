@@ -229,6 +229,265 @@ def _create_visualization_figures(
         return None
 
 
+def _async_sliding_window_smoke_test_worker(
+    temp_ckpt_path: str,
+    result_path: str,
+    preprocessed_folder: str,
+    sample_keys: List[str],
+    eval_config: dict,
+    gpu_id: Optional[int] = None,
+):
+    """
+    Subprocess worker for pre-training sliding window smoke test.
+    
+    This is a lightweight version of _async_test_eval_worker that:
+    1. Loads model from checkpoint
+    2. Runs sliding window inference on a few samples
+    3. Returns metrics (or error) via result JSON
+    
+    Purpose: Catch subprocess-specific errors early (imports, model building,
+    JSON serialization, CUDA OOM, etc.) before actual training begins.
+    
+    Args:
+        temp_ckpt_path: Path to temporary checkpoint with model weights
+        result_path: Path to write result JSON
+        preprocessed_folder: Path to preprocessed dataset
+        sample_keys: List of sample keys (typically 5 samples)
+        eval_config: Dict with evaluation configuration
+        gpu_id: GPU ID (for logging only - already set by parent)
+    """
+    import os
+    import sys
+    import json
+    import traceback
+    from datetime import datetime
+    import time as time_module
+    
+    def _mp_log(msg: str):
+        """Print with timestamp and [MP-SMOKE] prefix for subprocess logs."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print(f"{timestamp}: [MP-SMOKE] {msg}", flush=True)
+    
+    actual_gpu = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
+    _mp_log(f"CUDA_VISIBLE_DEVICES={actual_gpu}")
+    _mp_log(f"Starting sliding window smoke test with {len(sample_keys)} samples")
+    
+    try:
+        import torch
+        import torch._dynamo as _dynamo
+        import numpy as np
+        from tqdm import tqdm
+        from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+        from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
+        from nnunetv2.utilities.label_handling.label_handling import LabelManager
+        from nnunetv2.inference.sliding_window_prediction import compute_steps_for_sliding_window, compute_gaussian
+        from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
+        from nnunetv2.utilities.collate_outputs import collate_outputs
+        
+        _dynamo.config.suppress_errors = True
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        _mp_log(f"Using device: {device}")
+        
+        # Load checkpoint
+        checkpoint = torch.load(temp_ckpt_path, map_location='cpu', weights_only=False)
+        
+        # Reconstruct model from init_args
+        init_args = checkpoint['init_args']
+        plans = init_args['plans']
+        configuration = init_args['configuration']
+        dataset_json = init_args['dataset_json']
+        
+        plans_manager = PlansManager(plans)
+        config_manager = plans_manager.get_configuration(configuration)
+        label_manager = plans_manager.get_label_manager(dataset_json)
+        
+        from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+        num_input_channels = determine_num_input_channels(plans_manager, config_manager, dataset_json)
+        num_output_channels = label_manager.num_segmentation_heads
+        
+        # Build network - supports both nnunet and swinunetr
+        model_name = checkpoint.get('model_name', 'nnunet')
+        
+        if model_name == 'swinunetr':
+            from .swinunetr_builder import build_swinunetr
+            swinunetr_feature_size = checkpoint.get('swinunetr_feature_size', 48)
+            adjusted_patch_size = tuple(eval_config['patch_size'])
+            _mp_log(f"Building SwinUNETR (feature_size={swinunetr_feature_size}, patch_size={adjusted_patch_size})")
+            network = build_swinunetr(
+                num_input_channels=num_input_channels,
+                num_output_channels=num_output_channels,
+                patch_size=adjusted_patch_size,
+                feature_size=swinunetr_feature_size,
+                use_checkpoint=False,
+                spatial_dims=3,
+            )
+            eval_config['enable_deep_supervision'] = False
+        else:
+            from nnunetv2.utilities.get_network_from_plans import get_network_from_plans
+            _mp_log(f"Building nnUNet network")
+            network = get_network_from_plans(
+                arch_class_name=config_manager.network_arch_class_name,
+                arch_kwargs=config_manager.network_arch_init_kwargs,
+                arch_kwargs_req_import=config_manager.network_arch_init_kwargs_req_import,
+                input_channels=num_input_channels,
+                output_channels=num_output_channels,
+                allow_init=True,
+                deep_supervision=eval_config.get('enable_deep_supervision', True)
+            )
+        
+        network.load_state_dict(checkpoint['network_weights'])
+        network = network.to(device)
+        network.eval()
+        _mp_log(f"Network loaded and moved to {device}")
+        
+        # Create dataset
+        dataset_class = infer_dataset_class(preprocessed_folder)
+        test_dataset = dataset_class(preprocessed_folder, sample_keys, None)
+        
+        # Extract eval config
+        patch_size = tuple(eval_config['patch_size'])
+        step_size = eval_config['step_size']
+        num_classes = label_manager.num_segmentation_heads
+        enable_deep_supervision = eval_config.get('enable_deep_supervision', True)
+        
+        # Run sliding window evaluation
+        start_time = time_module.time()
+        all_outputs = []
+        
+        for i, key in enumerate(tqdm(sample_keys, desc="Smoke test SW eval")):
+            try:
+                data, seg, _, properties = test_dataset.load_case(key)
+                # Ensure data is a proper numpy array (load_case may return NDArray type)
+                data = torch.from_numpy(np.asarray(data)).unsqueeze(0).to(device)
+                
+                # Sliding window inference
+                with torch.no_grad():
+                    # Store original shape for cropping predictions back
+                    original_shape = data.shape[2:]
+                    
+                    # Pad data to at least patch_size in each dimension
+                    # This is required for SwinUNETR which needs dimensions divisible by 32
+                    pad_needed = [max(0, ps - ds) for ps, ds in zip(patch_size, original_shape)]
+                    if any(p > 0 for p in pad_needed):
+                        # Pad format for F.pad: (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
+                        # We pad only on the right/bottom side
+                        pad_tuple = (0, pad_needed[2], 0, pad_needed[1], 0, pad_needed[0])
+                        data = torch.nn.functional.pad(data, pad_tuple, mode='constant', value=0)
+                        _mp_log(f"Padded data from {original_shape} to {data.shape[2:]} for patch_size {patch_size}")
+                    
+                    padded_shape = data.shape[2:]
+                    
+                    steps = compute_steps_for_sliding_window(
+                        padded_shape,
+                        patch_size, step_size
+                    )
+                    
+                    # Compute Gaussian window
+                    gaussian_window = compute_gaussian(patch_size, sigma_scale=1./8, dtype=torch.float16, device=device)
+                    
+                    # Initialize prediction aggregation (on padded shape)
+                    pred_shape = (num_classes,) + padded_shape
+                    predicted_logits = torch.zeros(pred_shape, dtype=torch.float16, device=device)
+                    n_predictions = torch.zeros(pred_shape, dtype=torch.float16, device=device)
+                    
+                    # Process patches
+                    for sx in steps[0]:
+                        for sy in steps[1]:
+                            for sz in steps[2]:
+                                patch = data[:, :, sx:sx+patch_size[0], sy:sy+patch_size[1], sz:sz+patch_size[2]]
+                                pred = network(patch)
+                                
+                                if enable_deep_supervision and isinstance(pred, (list, tuple)):
+                                    pred = pred[0]
+                                
+                                pred = pred.half()
+                                predicted_logits[:, sx:sx+patch_size[0], sy:sy+patch_size[1], sz:sz+patch_size[2]] += pred[0] * gaussian_window
+                                n_predictions[:, sx:sx+patch_size[0], sy:sy+patch_size[1], sz:sz+patch_size[2]] += gaussian_window
+                                
+                                del patch, pred
+                    
+                    predicted_logits /= n_predictions.clamp(min=1e-6)
+                    predicted_probs = torch.softmax(predicted_logits.float(), dim=0)
+                    
+                    # Crop back to original shape before extracting segmentation
+                    predicted_probs = predicted_probs[:, :original_shape[0], :original_shape[1], :original_shape[2]]
+                    predicted_seg = predicted_probs.argmax(dim=0).cpu().numpy()
+                    
+                    del predicted_logits, n_predictions, predicted_probs
+                    torch.cuda.empty_cache()
+                
+                # Compute metrics (ensure seg is proper numpy array)
+                seg = np.asarray(seg)
+                seg_np = seg[0] if seg.ndim == 4 else seg
+                tp_per_class = np.zeros(num_classes)
+                fp_per_class = np.zeros(num_classes)
+                fn_per_class = np.zeros(num_classes)
+                
+                for c in range(num_classes):
+                    pred_c = (predicted_seg == c)
+                    gt_c = (seg_np == c)
+                    tp_per_class[c] = np.sum(pred_c & gt_c)
+                    fp_per_class[c] = np.sum(pred_c & ~gt_c)
+                    fn_per_class[c] = np.sum(~pred_c & gt_c)
+                
+                all_outputs.append({
+                    'tp_hard': tp_per_class,
+                    'fp_hard': fp_per_class,
+                    'fn_hard': fn_per_class,
+                })
+                
+                _mp_log(f"Sample {i+1}/{len(sample_keys)} ({key}) completed")
+                
+                del data, predicted_seg
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                _mp_log(f"Sample {key} failed: {e}")
+                raise
+        
+        # Compute aggregate metrics
+        elapsed_time = time_module.time() - start_time
+        
+        tp_hard = np.sum([o['tp_hard'] for o in all_outputs], axis=0)
+        fp_hard = np.sum([o['fp_hard'] for o in all_outputs], axis=0)
+        fn_hard = np.sum([o['fn_hard'] for o in all_outputs], axis=0)
+        
+        dice_per_class = 2 * tp_hard / (2 * tp_hard + fp_hard + fn_hard + 1e-8)
+        mean_fg_dice = np.mean(dice_per_class[1:])
+        tumor_dice = dice_per_class[2] if len(dice_per_class) > 2 else dice_per_class[1] if len(dice_per_class) > 1 else 0.0
+        
+        result = {
+            'success': True,
+            'test_type': 'sliding_window_smoke_test',
+            'num_samples': len(sample_keys),
+            'elapsed_seconds': elapsed_time,
+            'dice_per_class': dice_per_class.tolist(),
+            'mean_fg_dice': float(mean_fg_dice),
+            'tumor_dice': float(tumor_dice),
+            'model_name': model_name,
+            'patch_size': list(patch_size),
+            'timestamp': time_module.time(),
+        }
+        
+        with open(result_path, 'w') as f:
+            json.dump(_convert_to_json_serializable(result), f, indent=2)
+        
+        _mp_log(f"Smoke test complete! Mean FG Dice: {mean_fg_dice:.4f}, Tumor Dice: {tumor_dice:.4f}, Time: {elapsed_time:.1f}s")
+        
+    except Exception as e:
+        error_result = {
+            'success': False,
+            'test_type': 'sliding_window_smoke_test',
+            'error': str(e),
+            'traceback': traceback.format_exc(),
+            'timestamp': time_module.time(),
+        }
+        with open(result_path, 'w') as f:
+            json.dump(_convert_to_json_serializable(error_result), f, indent=2)
+        _mp_log(f"Smoke test FAILED: {e}")
+
+
 def _async_test_eval_worker(
     temp_ckpt_path: str,
     result_path: str,
@@ -337,11 +596,14 @@ def _async_test_eval_worker(
             from .swinunetr_builder import build_swinunetr
             # Get feature_size from checkpoint (default to 48 for backwards compatibility)
             swinunetr_feature_size = checkpoint.get('swinunetr_feature_size', 48)
-            _mp_log_fn(f"[Subprocess] Using SwinUNETR architecture (feature_size={swinunetr_feature_size}, deep supervision disabled)")
+            # Use patch_size from eval_config (already adjusted by trainer) instead of config_manager
+            # The trainer adjusts patch_size to be divisible by 32 for SwinUNETR
+            adjusted_patch_size = tuple(eval_config['patch_size'])
+            _mp_log(f"[Subprocess] Using SwinUNETR architecture (feature_size={swinunetr_feature_size}, patch_size={adjusted_patch_size}, deep supervision disabled)")
             network = build_swinunetr(
                 num_input_channels=num_input_channels,
                 num_output_channels=num_output_channels,
-                patch_size=tuple(config_manager.patch_size),
+                patch_size=adjusted_patch_size,
                 feature_size=swinunetr_feature_size,
                 use_checkpoint=False,  # Don't need gradient checkpointing for inference
                 spatial_dims=3,
@@ -516,9 +778,8 @@ def _async_test_eval_worker(
                         # Forward pass (dynamo errors suppressed, will fall back to eager)
                         pred = network(patch)
                         # Handle deep supervision: output is list of tensors at different scales
-                        # For SwinUNETR or nnUNet without DS: output is single tensor
-                        if isinstance(pred, (list, tuple)):
-                            pred = pred[0]  # Get highest resolution output
+                        # For SwinUNETR or nnUNet without DS: Remove batch dimension: (1, C, D, H, W) -> (C, D, H, W)
+                        pred = pred[0]
                         
                         pred = pred * gaussian
                         predicted_logits[(slice(None),) + sl] += pred

@@ -1051,6 +1051,192 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
     #             pass
     """DEPRECATED ALERT END"""
     
+    # =========================================================================
+    # PRE-TRAINING SMOKE TEST SUBPROCESS HELPERS
+    # =========================================================================
+    
+    def _launch_sliding_window_smoke_test_subprocess(
+        self,
+        sample_keys: List[str],
+    ) -> Optional[dict]:
+        """
+        Launch a subprocess for sliding-window smoke test.
+        
+        This runs in parallel with main process dual-crop evaluation to catch
+        subprocess-specific errors early (imports, model building, JSON serialization, etc.)
+        
+        Args:
+            sample_keys: List of sample keys for smoke test (typically 5)
+            
+        Returns:
+            Dictionary with subprocess handle info, or None if subprocess launch is skipped
+        """
+        # Check if we have backup GPUs available
+        if not self.backup_gpu_ids:
+            self.print_to_log_file("  WARNING: No backup GPUs available, skipping subprocess smoke test")
+            self.print_to_log_file("  (Set --backup_gpu_ids to enable subprocess validation)")
+            return None
+        
+        # Save temporary checkpoint for subprocess
+        temp_ckpt_path = join(self.output_folder, "temp_smoke_test_ckpt.pth")
+        
+        # Build checkpoint with minimal data needed for smoke test
+        if self.is_ddp:
+            mod = self.network.module
+        else:
+            mod = self.network
+        if isinstance(mod, OptimizedModule):
+            mod = mod._orig_mod
+        
+        checkpoint = {
+            'network_weights': mod.state_dict(),
+            'init_args': self.my_init_kwargs,
+            'model_name': self.model_name,
+            'swinunetr_feature_size': getattr(self, '_swinunetr_feature_size', 48),
+        }
+        torch.save(checkpoint, temp_ckpt_path)
+        self.print_to_log_file(f"  Saved smoke test checkpoint: {os.path.basename(temp_ckpt_path)}")
+        
+        # Prepare result path
+        result_path = join(self.output_folder, "smoke_test_sw_result.json")
+        if isfile(result_path):
+            os.remove(result_path)
+        
+        # Prepare eval config
+        eval_config = {
+            'patch_size': list(self.configuration_manager.patch_size),
+            'step_size': self.sliding_window_step_size,
+            'enable_deep_supervision': self.enable_deep_supervision,
+        }
+        
+        # Select GPU (first backup GPU)
+        gpu_id = self.backup_gpu_ids[0]
+        
+        # Import subprocess worker
+        from nnunetv2.training.nnUNetTrainer.tuning_set_trainer.multiprocess_eval import (
+            _async_sliding_window_smoke_test_worker
+        )
+        
+        # Spawn subprocess
+        ctx = mp.get_context('spawn')
+        
+        # Save and set CUDA_VISIBLE_DEVICES for subprocess
+        original_cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', None)
+        
+        try:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+            self.print_to_log_file(f"  Subprocess will use GPU {gpu_id}")
+            
+            process = ctx.Process(
+                target=_async_sliding_window_smoke_test_worker,
+                kwargs={
+                    'temp_ckpt_path': temp_ckpt_path,
+                    'result_path': result_path,
+                    'preprocessed_folder': self.preprocessed_dataset_folder,
+                    'sample_keys': list(sample_keys),
+                    'eval_config': eval_config,
+                    'gpu_id': gpu_id,
+                },
+                daemon=True
+            )
+            process.start()
+            
+        finally:
+            # Restore parent's CUDA_VISIBLE_DEVICES
+            if original_cuda_visible is not None:
+                os.environ['CUDA_VISIBLE_DEVICES'] = original_cuda_visible
+            elif 'CUDA_VISIBLE_DEVICES' in os.environ:
+                del os.environ['CUDA_VISIBLE_DEVICES']
+        
+        return {
+            'process': process,
+            'result_path': result_path,
+            'temp_ckpt_path': temp_ckpt_path,
+            'start_time': time(),
+        }
+    
+    def _wait_for_smoke_test_subprocess(
+        self,
+        subprocess_handle: dict,
+        timeout_minutes: float = 30,
+    ) -> Optional[dict]:
+        """
+        Wait for smoke test subprocess to complete and return results.
+        
+        Args:
+            subprocess_handle: Dictionary from _launch_sliding_window_smoke_test_subprocess
+            timeout_minutes: Maximum time to wait
+            
+        Returns:
+            Dictionary with metrics if successful
+            
+        Raises:
+            RuntimeError: If subprocess fails or times out
+        """
+        process = subprocess_handle['process']
+        result_path = subprocess_handle['result_path']
+        temp_ckpt_path = subprocess_handle['temp_ckpt_path']
+        start_time = subprocess_handle['start_time']
+        
+        timeout_seconds = timeout_minutes * 60
+        
+        # Wait for subprocess with polling
+        while process.is_alive():
+            elapsed = time() - start_time
+            if elapsed > timeout_seconds:
+                process.terminate()
+                process.join(timeout=5)
+                self._cleanup_smoke_test_files(temp_ckpt_path, result_path)
+                raise RuntimeError(
+                    f"Sliding-window smoke test subprocess timed out after {timeout_minutes:.0f} minutes.\n"
+                    f"This may indicate a very slow GPU or an infinite loop in the evaluation code."
+                )
+            
+            # Poll every second
+            process.join(timeout=1)
+        
+        # Process finished - check result
+        elapsed = time() - start_time
+        self.print_to_log_file(f"  Subprocess completed in {elapsed:.1f}s (exit code: {process.exitcode})")
+        
+        # Read result file
+        if not isfile(result_path):
+            self._cleanup_smoke_test_files(temp_ckpt_path, result_path)
+            raise RuntimeError(
+                f"Sliding-window smoke test subprocess did not write result file.\n"
+                f"Exit code: {process.exitcode}\n"
+                f"This usually indicates a crash before the subprocess could write results.\n"
+                f"Check the subprocess logs above for error messages."
+            )
+        
+        with open(result_path, 'r') as f:
+            result = json.load(f)
+        
+        # Cleanup temp files
+        self._cleanup_smoke_test_files(temp_ckpt_path, result_path)
+        
+        # Check for errors
+        if not result.get('success', False):
+            error_msg = result.get('error', 'Unknown error')
+            traceback_str = result.get('traceback', '')
+            raise RuntimeError(
+                f"Sliding-window smoke test FAILED in subprocess!\n"
+                f"Error: {error_msg}\n"
+                f"Traceback from subprocess:\n{traceback_str}\n"
+                f"Fix the error above before training."
+            )
+        
+        return result
+    
+    def _cleanup_smoke_test_files(self, temp_ckpt_path: str, result_path: str) -> None:
+        """Clean up smoke test temporary files."""
+        for path in [temp_ckpt_path, result_path]:
+            if isfile(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+    
     def _cleanup_orphaned_temp_files(self) -> None:
         """
         Clean up any orphaned temp checkpoints, result files, and vis folders from previous runs.
@@ -2092,64 +2278,89 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
         
         # ---------------------------------------------------------------------
         # TUNING SET PRE-TRAINING EVALUATION (fast, for adaptive strategy)
+        # Uses PARALLEL execution:
+        #   1. Launch subprocess for sliding-window smoke test
+        #   2. Main process runs dual-crop smoke test
+        #   3. Wait for subprocess result
+        # This catches subprocess-specific errors early (imports, model building, etc.)
         # ---------------------------------------------------------------------
         if ENABLE_PRE_TRAINING_EVAL_ON_TUNING_SET:
             self.print_to_log_file("\n" + "=" * 70)
-            self.print_to_log_file("PRE-TRAINING TUNING SET EVALUATION (before epoch 0)")
+            self.print_to_log_file("PRE-TRAINING SMOKE TESTS (before epoch 0)")
             self.print_to_log_file("=" * 70)
-            self.print_to_log_file("Purpose: Verify tuning evaluation works correctly")
-            self.print_to_log_file("         and establish baseline metrics for adaptive strategy")
+            self.print_to_log_file("Purpose: Verify both evaluation modes work correctly")
+            self.print_to_log_file("         and catch subprocess-specific errors early")
             self.print_to_log_file("-" * 70)
             
             try:
-                # Clear GPU memory before evaluation (helps with large models like SwinUNETR)
+                # Clear GPU memory before evaluation
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
                 self.network.eval()
                 
-                # Limit samples for faster sanity check
-                tuning_keys_for_pretraining = self.tuning_keys
-                if PRE_TRAINING_EVAL_MAX_SAMPLES is not None and len(self.tuning_keys) > PRE_TRAINING_EVAL_MAX_SAMPLES:
-                    rng = np.random.default_rng(seed=42)  # Deterministic for reproducibility
-                    tuning_keys_for_pretraining = rng.choice(
-                        self.tuning_keys, size=PRE_TRAINING_EVAL_MAX_SAMPLES, replace=False
-                    ).tolist()
-                    self.print_to_log_file(f"  Limiting to {PRE_TRAINING_EVAL_MAX_SAMPLES}/{len(self.tuning_keys)} random samples for sanity check")
+                # Select random samples for smoke tests
+                rng = np.random.default_rng(seed=None)  # Different samples each run
+                num_smoke_samples = min(PRE_TRAINING_EVAL_MAX_SAMPLES or 5, len(self.tuning_keys))
                 
-                if self.tuning_eval_mode == 'sliding_window':
-                    self.print_to_log_file(f"Running sliding window evaluation on {len(tuning_keys_for_pretraining)} tuning samples...")
-                    self.print_to_log_file(f"  Max patches per sample: {self.tuning_max_patches_per_sample or 'ALL'}")
-                    pre_train_tuning_metrics = self.compute_metrics_sliding_window(
-                        self.tuning_dataset,
-                        tuning_keys_for_pretraining,
-                        num_samples=None,
-                        max_patches_per_sample=self.tuning_max_patches_per_sample,
-                        progress_desc="Pre-train Tuning SW Eval"
-                    )
+                # === Step 1: Launch subprocess for sliding-window smoke test ===
+                self.print_to_log_file(f"\n[Step 1/3] Launching SUBPROCESS for sliding-window smoke test...")
+                
+                # Select samples for sliding-window (random)
+                sw_sample_keys = rng.choice(
+                    self.tuning_keys, size=num_smoke_samples, replace=False
+                ).tolist()
+                self.print_to_log_file(f"  Sliding-window samples: {sw_sample_keys}")
+                
+                subprocess_handle = self._launch_sliding_window_smoke_test_subprocess(
+                    sample_keys=sw_sample_keys
+                )
+                
+                if subprocess_handle is not None:
+                    self.print_to_log_file(f"  Subprocess launched (PID: {subprocess_handle['process'].pid})")
                 else:
-                    # For pre-training sanity check, limit batches (not specific samples)
-                    # ~3 batches covers roughly 5-6 samples with typical batch_size=2
-                    max_batches_for_pretraining = max(1, (PRE_TRAINING_EVAL_MAX_SAMPLES * 2 + self.batch_size - 1) // self.batch_size)
-                    self.print_to_log_file(f"Running dual-crop evaluation ({max_batches_for_pretraining} batches, batch_size={self.batch_size})...")
-                    pre_train_tuning_metrics = self._compute_tuning_metrics_dual_crop(max_batches=max_batches_for_pretraining)
+                    self.print_to_log_file(f"  Subprocess launch skipped (no backup GPU or disabled)")
                 
-                # Log the metrics
-                self.print_to_log_file("\nPre-training tuning set metrics:")
-                self.print_to_log_file(f"  Dice per class: {[np.round(d, 4) for d in pre_train_tuning_metrics['dice_per_class']]}")
-                self.print_to_log_file(f"  Mean FG Dice: {np.round(pre_train_tuning_metrics['mean_fg_dice'], 4)}")
+                # === Step 2: Main process runs dual-crop smoke test ===
+                self.print_to_log_file(f"\n[Step 2/3] Running DUAL-CROP smoke test in main process...")
                 
-                if len(pre_train_tuning_metrics['dice_per_class']) > 1:
-                    tumor_dice = pre_train_tuning_metrics['dice_per_class'][1]
-                    self.print_to_log_file(f"  Tumor Dice: {np.round(tumor_dice, 4)}")
+                # Calculate batches for dual-crop (roughly num_smoke_samples samples)
+                max_batches_for_pretraining = max(1, (num_smoke_samples * 2 + self.batch_size - 1) // self.batch_size)
+                self.print_to_log_file(f"  Dual-crop: {max_batches_for_pretraining} batches, batch_size={self.batch_size}")
                 
-                if 'recall_per_class' in pre_train_tuning_metrics:
-                    self.print_to_log_file(f"  Recall (%): {[np.round(r, 2) for r in pre_train_tuning_metrics['recall_per_class']]}")
-                    self.print_to_log_file(f"  Precision (%): {[np.round(p, 2) for p in pre_train_tuning_metrics['precision_per_class']]}")
+                dual_crop_metrics = self._compute_tuning_metrics_dual_crop(max_batches=max_batches_for_pretraining)
                 
-                self.print_to_log_file("-" * 70)
-                self.print_to_log_file("✓ Pre-training TUNING evaluation completed successfully!")
-                self.print_to_log_file(f"  {self.tuning_eval_mode.upper()} evaluation is working correctly.")
+                self.print_to_log_file(f"\n  Dual-crop smoke test COMPLETE:")
+                self.print_to_log_file(f"    Dice per class: {[np.round(d, 4) for d in dual_crop_metrics['dice_per_class']]}")
+                self.print_to_log_file(f"    Mean FG Dice: {np.round(dual_crop_metrics['mean_fg_dice'], 4)}")
+                
+                # === Step 3: Wait for subprocess result ===
+                sliding_window_metrics = None
+                if subprocess_handle is not None:
+                    self.print_to_log_file(f"\n[Step 3/3] Waiting for sliding-window subprocess...")
+                    
+                    sliding_window_metrics = self._wait_for_smoke_test_subprocess(
+                        subprocess_handle,
+                        timeout_minutes=30
+                    )
+                    
+                    if sliding_window_metrics is not None:
+                        self.print_to_log_file(f"\n  Sliding-window smoke test COMPLETE:")
+                        self.print_to_log_file(f"    Dice per class: {[np.round(d, 4) for d in sliding_window_metrics['dice_per_class']]}")
+                        self.print_to_log_file(f"    Mean FG Dice: {np.round(sliding_window_metrics['mean_fg_dice'], 4)}")
+                        self.print_to_log_file(f"    Time: {sliding_window_metrics.get('elapsed_seconds', 0):.1f}s")
+                else:
+                    self.print_to_log_file(f"\n[Step 3/3] Skipped (no subprocess)")
+                
+                # Use dual-crop metrics as the main pre-training metrics
+                pre_train_tuning_metrics = dual_crop_metrics
+                
+                # Log summary
+                self.print_to_log_file("\n" + "-" * 70)
+                self.print_to_log_file("✓ Pre-training smoke tests PASSED!")
+                self.print_to_log_file("  ✓ Dual-crop (main process): Working")
+                if subprocess_handle is not None:
+                    self.print_to_log_file("  ✓ Sliding-window (subprocess): Working")
                 self.print_to_log_file("=" * 70 + "\n")
                 
                 # Store pre-training tuning metrics
@@ -2157,12 +2368,14 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                 
             except Exception as e:
                 self.print_to_log_file("-" * 70)
-                self.print_to_log_file(f"✗ PRE-TRAINING TUNING EVALUATION FAILED!")
+                self.print_to_log_file(f"✗ PRE-TRAINING SMOKE TEST FAILED!")
                 self.print_to_log_file(f"  Error: {e}")
+                import traceback
+                self.print_to_log_file(f"  Traceback:\n{traceback.format_exc()}")
                 self.print_to_log_file("-" * 70)
                 self.print_to_log_file("Please fix the issue before proceeding with training.")
                 self.print_to_log_file("=" * 70 + "\n")
-                raise RuntimeError(f"Pre-training tuning evaluation failed: {e}") from e
+                raise RuntimeError(f"Pre-training smoke test failed: {e}") from e
             
             finally:
                 self.network.train()
@@ -2279,9 +2492,22 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
 
             with torch.no_grad():
                 self.on_validation_epoch_start()
-                val_outputs = []
-                for batch_id in range(self.num_val_iterations_per_epoch):
-                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                
+                # Skip standard validation loop when test_eval_mode is sliding_window
+                # In sliding_window mode (async or sync), val_outputs are NOT used:
+                # - Async: subprocess handles test evaluation
+                # - Sync: compute_metrics_sliding_window() is called directly
+                # Only dual_crop mode actually uses val_outputs from validation_step()
+                # Skipping also avoids SwinUNETR compatibility issues in validation_step()
+                if self.test_eval_mode == 'sliding_window':
+                    val_outputs = []  # Empty - not used in sliding_window mode
+                    self.print_to_log_file("  [Skipping standard validation loop - sliding-window handles test eval]")
+                else:
+                    # dual_crop mode - need val_outputs from validation_step()
+                    val_outputs = []
+                    for batch_id in range(self.num_val_iterations_per_epoch):
+                        val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                
                 self.on_validation_epoch_end(val_outputs)
 
             self.on_epoch_end()
@@ -4607,7 +4833,7 @@ class nnUNetTrainer_WithTuningSet(nnUNetTrainer):
                     'model_name': self.model_name,
                     'swinunetr_feature_size': getattr(self, '_swinunetr_feature_size', 48),
                     # Tuning set
-                    'tuning_keys': self.tuning_keys,
+            'tuning_keys': self.tuning_keys,
             'tuning_metrics': self.tuning_metrics,
             'tuning_ratio': self.tuning_ratio,
                     '_tuning_set_source': self._tuning_set_source,

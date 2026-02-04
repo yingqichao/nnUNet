@@ -175,15 +175,23 @@ def build_swinunetr(
             "  pip install 'monai[all]'"
         ) from e
     
-    # Verify patch size is compatible (should already be adjusted by trainer)
-    # Just do a final check here - don't auto-adjust since trainer handles it
-    for i, dim in enumerate(patch_size):
+    # Verify patch size is compatible - auto-adjust if needed as safety net
+    # (trainer should already have adjusted, but this handles edge cases like subprocess loading)
+    adjusted_patch_size = list(patch_size)
+    needs_adjustment = False
+    for i, dim in enumerate(adjusted_patch_size):
         if dim % 32 != 0:
-            raise ValueError(
-                f"SwinUNETR requires patch dimensions divisible by 32. "
-                f"Got patch_size[{i}] = {dim}. "
-                f"The trainer should have auto-adjusted this. Check initialize() method."
-            )
+            # Round to nearest multiple of 32
+            adjusted_patch_size[i] = max(32, round(dim / 32) * 32)
+            needs_adjustment = True
+    
+    if needs_adjustment:
+        import warnings
+        warnings.warn(
+            f"SwinUNETR: Auto-adjusting patch_size from {patch_size} to {tuple(adjusted_patch_size)} "
+            f"(must be divisible by 32)"
+        )
+        patch_size = tuple(adjusted_patch_size)
     
     # Build the model
     # Note: SwinUNETR in this MONAI version does NOT take img_size parameter.
